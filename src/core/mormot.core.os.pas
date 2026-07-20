@@ -160,6 +160,8 @@ const
   HTTP_LENGTHREQUIRED = 411;
   /// HTTP Status Code for "Payload Too Large"
   HTTP_PAYLOADTOOLARGE = 413;
+  /// HTTP Status Code for "Unsupported Media Type"
+  HTTP_UNSUPPORTEDMEDIATYPE = 415;
   /// HTTP Status Code for "Range Not Satisfiable"
   HTTP_RANGENOTSATISFIABLE = 416;
   /// HTTP Status Code for "I'm a teapot"
@@ -233,7 +235,7 @@ const
   HTML_CONTENT_TYPE_HEADER = HEADER_CONTENT_TYPE + HTML_CONTENT_TYPE;
 
   /// MIME content type used for UTF-8 encoded XML
-  XML_CONTENT_TYPE = 'text/xml';
+  XML_CONTENT_TYPE = 'application/xml; charset=utf-8';
 
   /// HTTP header for MIME content type used for UTF-8 encoded XML
   XML_CONTENT_TYPE_HEADER = HEADER_CONTENT_TYPE + XML_CONTENT_TYPE;
@@ -287,13 +289,6 @@ const
   // - can be used e.g. in logs, or anything accepting a ShortString
   BOOL_STR: array[boolean] of TShort7 = (
     'false', 'true');
-
-  /// the JavaScript-like values of non-number IEEE constants
-  // - as recognized by ShortToFloatNan, and used by TTextWriter.Add()
-  // when serializing such single/double/extended floating-point values
-  // - GetExtended() should also detect those values
-  JSON_NAN: array[TFloatNan] of TShort15 = (
-    '0', '"NaN"', '"Infinity"', '"-Infinity"');
 
 var
   /// MIME content type used for JSON communication
@@ -456,6 +451,16 @@ type
     osLinux: (
       utsrelease: array[0..2] of byte);
   end;
+
+  /// Windows specific detected context e.g. WOW64 translation, PRISM or Wine
+  TWindowsSpecs = set of (
+   wsWow64,
+   wsWow64Emulation,
+   wsPrism,
+   wsWine,
+   wsFavorFewThreads,
+   wsWeakDpApi,
+   wsWeakHttpApi);
 
   /// notable Linux distributions, organized by their package management system
   TLinuxDistribution = (
@@ -722,7 +727,7 @@ var
   OSVersionText: RawUtf8;
   /// some addition system information as text, e.g. 'Wine 1.1.5' or 'Prism'
   // - also always appended to OSVersionText high-level description
-  // - use if PosEx('Wine', OSVersionInfoEx) > 0 then to check for Wine presence
+  // - rather use wsWine/wsPrism in WindowsSpecs to check for the running context
   OSVersionInfoEx: RawUtf8;
   /// the current Operating System version, as retrieved for the current process
   // and computed by ToTextOSU(OSVersionInt32)
@@ -1587,7 +1592,7 @@ type
     // - the very same executable on the very same computer run by the very
     // same user on the same OS should always have the same Hash value
     // - is computed from the crc32c of this TExecutable fields: c0 from
-    // Version32, CpuFeatures and Host, c1 from User, c2 from ProgramFullSpec
+    // Version32 + CpuFeatures + Host, c1 from User, c2 from ProgramFullSpec
     // and c3 from InstanceFileName
     // - may be used as an entropy seed, or to identify a process execution
     Hash: THash128Rec;
@@ -1634,7 +1639,10 @@ var
   IsWow64: boolean;
   /// is set to TRUE if the current process running through a software emulation
   // - e.g. a Win32/Win64 Intel application running via Prism on Windows for Arm
+  // - consider WindowsSpecs more precise set of flags
   IsWow64Emulation: boolean;
+  /// a set of flags to identify the Windows "flavor" for the current process
+  WindowsSpecs: TWindowsSpecs;
   /// low-level Operating System information, as retrieved for the current process
   OSVersionInfo: TOSVersionInfoEx;
   /// on Windows, the ready-to-be-displayed text version of the system
@@ -1864,7 +1872,7 @@ type
   /// the text fields stored by GetSmbios/DecodeSmbios functions
   TSmbiosBasicInfos = array[TSmbiosBasicInfo] of RawUtf8;
 
-/// check if a string value should be ignored when parsed e.g. from SMBIOS fields
+/// check if string matches 'Default string' when parsed e.g. from SMBIOS fields
 function IsDefaultString(p: pointer; l: PtrInt): boolean;
 
 /// decode basic SMBIOS information as text from a TRawSmbiosInfo binary blob
@@ -1987,11 +1995,13 @@ type
     // - on success (returned true), Close method should be eventually called or
     // you can set closefirst = true on a consecutive ReadOpen() call
     function ReadOpen(root: TWinRegistryRoot; const keyname: RawUtf8;
-      closefirst: boolean = false): boolean; overload;
-    /// start low-level read access to a Windows Registry node
-    // - overloaded to ReadOpen() allowing Join() keynames concatenation
-    function ReadOpen(root: TWinRegistryRoot; const keynames: array of RawByteString;
-      closefirst: boolean = false): boolean; overload;
+      closefirst: boolean = false): boolean;
+    /// start low-level read access to a Windows Registry node but not enumerate
+    function ReadOpenValue(root: TWinRegistryRoot; keyname: PWideChar): boolean;
+    /// start low-level read access to a Windows Registry node after ReadOpen()
+    // - overload to ReadOpen(closefirst=true) with Join() keynames concatenation
+    function ReadReOpen(root: TWinRegistryRoot; const keynames: array of RawByteString;
+      closefirst: boolean = true): boolean;
     /// finalize low-level read access to the Windows Registry after ReadOpen()
     procedure Close;
     /// read a UTF-8 string from the Windows Registry after ReadOpen()
@@ -2005,6 +2015,8 @@ type
     /// read one or several UTF-8 string from the Windows Registry after ReadOpen()
     // - will properly decode REG_MULTI_SZ values, but also plain REG_SZ
     function ReadStrings(entry: PWideChar; andtrim: boolean = true): TRawUtf8DynArray;
+    /// read a RTL string from the Windows Registry after ReadOpen()
+    function ReadFileName(entry: PWideChar): TFileName;
     /// read a Windows Registry content after ReadOpen()
     // - works with any kind of key, but was designed for REG_BINARY
     function ReadData(entry: PWideChar): RawByteString;
@@ -2050,9 +2062,13 @@ function IsUacVirtualFolder(const Folder: TFileName): boolean;
 function IsUacVirtualizationEnabled: boolean;
   {$ifdef CPU64} inline; {$endif}
 
-/// quickly retrieve a Text value from Registry
-// - could be used if TWinRegistry is not needed, e.g. for a single value
-function ReadRegString(Key: THandle; const Path, Value: string): string;
+/// quickly retrieve a RTL string/TFileName value (not RawUtf8) from Registry
+// - could be used if TWinRegistry is overkill, e.g. for a single value
+function ReadRegString(Root: TWinRegistryRoot; Path, Value: PWideChar): string;
+
+/// quickly retrieve a 32-bit integer value from Registry
+// - could be used if TWinRegistry is overkill, e.g. for a single value
+function ReadRegDWord(Root: TWinRegistryRoot; Path, Value: PWideChar): cardinal;
 
 /// convenient late-binding of any external library function
 // - thread-safe wrapper around LoadLibray + GetProcAddress once over a pointer
@@ -4181,8 +4197,8 @@ procedure LoadProcFileTrimed(fn: PAnsiChar; var result: RawUtf8); overload;
 /// low-level function returning some random binary from the Operating System
 // - Windows version calling the CryptGenRandom API is in mormot.core.os.security
 // - on POSIX, only up to 256 bytes (2048-bits) are retrieved from /dev/urandom
-// or /dev/random as stated by "man urandom" Usage - then padded with our shared
-// gsl_rng_taus2 "L'Ecuyer" random generator
+// or /dev/random (or Linux getrandom syscall) as stated by "man urandom" Usage -
+// then padded with our shared gsl_rng_taus2 "L'Ecuyer" random generator
 // - so you may consider that the output Buffer is always filled with random
 // - you should not have to call this low-level procedure, but faster and safer
 // TAesPrng from mormot.crypt.core - also consider the TSystemPrng class
@@ -4260,7 +4276,7 @@ type
     /// cross-platform resolution of a function entry in this library
     // - if RaiseExceptionOnFailure is set, missing entry will call FreeLib then raise it
     // - ProcName can be a space-separated list of procedure names, to try
-    // alternate API names (e.g. for OpenSSL 1.1.1/3.x compatibility)
+    // alternate API names (e.g. for OpenSSL 1.1.1/3.x/4.x compatibility)
     // - if ProcName starts with '?' then RaiseExceptionOnFailure = nil is set
     function Resolve(const Prefix: RawUtf8; ProcName: PAnsiChar; Entry: PPointer;
       RaiseExceptionOnFailure: ExceptionClass = nil; SilentError: PString = nil): boolean;
@@ -9501,9 +9517,13 @@ begin
     Command.Parse;
   end;
   AfterExecutableInfoChanged; // set Executable.ProgramFullSpec+Hash
-  // finalize SystemEntropy.Startup and setup SharedRandom instance
+  // finalize SystemEntropy and setup SharedRandom instance
   rnd := @SystemEntropy.Startup;
   crcblocks(rnd, @BaseEntropy, SizeOf(BaseEntropy) shr 4); // cpuid+rdrand+rdtsc
+  {$ifndef CPUINTEL}
+  if SystemEntropy.LiveFeed.c0 = 0 then // may happen on BSD and MAC ARM
+    SystemEntropy.LiveFeed.c := rnd^;   // put something here
+  {$endif CPUINTEL}
   PBlock128(@SharedRandom.Generator)^ := rnd^;
   SharedRandom.Generator.SeedGenerator; // we have enough entropy yet
   crcblock(rnd, @Executable.Hash);
@@ -10580,7 +10600,7 @@ begin // single pass efficient decoding
             len := StrLen(s);
             if (len <> 0) and
                (info[sbiOem] = '') and // keep only the first
-               not IsDefaultString(s, len) then
+               not IsDefaultString(s, len) then // skip 'Default string'
               FastSetString(info[sbiOem], s, len);
             s := @s[len + 1]; // next string
           until s[0] = 0;

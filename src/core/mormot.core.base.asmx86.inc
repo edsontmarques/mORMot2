@@ -1764,13 +1764,13 @@ asm
         je      @0
         test    eax, edx
         jz      @maynil
-@f:     mov     cl, byte ptr [eax] // first char comparison (quicksort speedup)
+@f:     mov     cl, byte ptr [eax] // first char comparison (QuickSort speedup)
         mov     ch, byte ptr [edx]
         cmp     cl, ch
         je      @s
         movzx   eax, cl
         movzx   edx, ch
-        sub     eax, edx            // branchless execution on Quicksort/ReHash
+        sub     eax, edx            // branchless execution on QuickSort
         ret
 @0:     xor     eax, eax
         ret
@@ -2621,8 +2621,8 @@ end;
 function GetExtended(P: PUtf8Char; out err: integer): TSynExtended;
 const
   _Ten:  double = 10.0;
-  _NaN:  double = Nan;
-  _Inf:  double = Infinity;
+  _NaN:  double = 0.0 / 0.0;
+  _Inf:  double = 1.0 / 0.0;
 asm
         // in: eax=text, edx=@err  out: st(0)=result
         push    ebx                 // save used registers

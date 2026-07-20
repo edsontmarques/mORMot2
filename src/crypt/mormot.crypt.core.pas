@@ -1695,6 +1695,9 @@ type
     // - this method is thread-safe, and its AES process is non blocking
     function FillRandom(Len: integer): RawByteString; overload;
     /// returns a binary buffer filled with some pseudorandom data
+    // - defined as procedure to ensure RefCnt=1 so that FillZero(Buffer) works
+    procedure FillRandomVar(var Buffer: RawByteString; Len: integer);
+    /// returns a binary buffer filled with some pseudorandom data
     // - this method is thread-safe, and its AES process is non blocking
     function FillRandomBytes(Len: integer): TBytes;
     /// returns an hexa-encoded binary buffer filled with some pseudorandom data
@@ -1716,6 +1719,7 @@ type
     // is cryptographic secure - probably pointless for a 32-bit value
     // - returns a value in range 0 <= Random32(max) < max
     function Random32(max: cardinal): cardinal; overload;
+      {$ifdef HASINLINE} inline; {$endif}
     /// returns a 64-bit unsigned random number
     function Random64: QWord;
     /// returns a floating-point random number in range [0..1]
@@ -1724,7 +1728,7 @@ type
     function RandomDouble: double;
     /// returns a contemporary date/time, starting from Jan 14, 2004
     function RandomDateTime: TDateTime;
-    /// computes a random ASCII password
+    /// computes a random ASCII password following proper common safety rules
     // - will contain uppercase/lower letters, digits and $.:()?%!-+*/@#
     // excluding ;,= to allow direct use in CSV content
     // - won't return the letters O and I to avoid confusion with digits 0 and 1
@@ -1852,6 +1856,7 @@ type
     fSeeding: boolean;
   public
     /// initialize the internal secret key, using Operating System entropy
+    // - never call this constructor directly, but use the Main class function
     constructor Create; overload; override;
     /// initialize the internal secret key, using Operating System entropy
     // - entropy is gathered from the OS, using GetEntropy() method
@@ -1931,7 +1936,6 @@ type
     class function Main: TAesPrngAbstract; override;
   end;
 
-
 {$ifndef PUREMORMOT2}
 type
   /// most Operating System PRNG are very unlikely AES based - confusing
@@ -1951,6 +1955,11 @@ var
 
   /// global flag set by mormot.crypt.openssl when the OpenSSL engine is used
   HasOpenSsl: boolean;
+
+/// low-level function as called by TAesPrngAbstract.RandomPassword()
+// - for length>4, reduce to uppercase/lower letters, digits and $.:()?%!-+*/@#
+// excluding ;,= to allow direct use in CSV content and OI against 01 confusion
+function MakeStrongPassWord(var Rnd: SpiUtf8): boolean;
 
 /// low-level TKS1 anti-forensic diffusion of a memory buffer using SHA-256
 // - shuffle in-place buf[size] using rnd[size] as reference material
@@ -5567,26 +5576,24 @@ var
   len, enclen: cardinal;
   pcd: PMacAndCryptData absolute Data;
   rcd: PMacAndCryptData absolute result;
-  nonce: THash256;
+  nonce: THash256Rec;
   P: PByteArray;
 begin
   FastAssignNew(result); // e.g. MacSetNonce not supported
   // our non-standard mCfc/mOfc/mCtc modes with 256-bit crc32c
   if Encrypt then
   begin
-    SharedRandom.Fill(@nonce, SizeOf(nonce)); // TLecuyer is enough with crc32c
-    if not MacSetNonce({encrypt=}true, nonce, Associated) then
-      // leave ASAP if this class doesn't support AEAD process
-      exit;
-    // inlined EncryptPkcs7() + RecordSave()
-    len := length(Data);
+    Random128(@nonce.Lo, @nonce.Hi); // safer than TLecuyer, not really slower
+    if not MacSetNonce({encrypt=}true, nonce.b, Associated) then
+      exit; // leave ASAP if this class doesn't support AEAD process
+    len := length(Data); // inlined EncryptPkcs7() + RecordSave()
     enclen := EncryptPkcs7Length(len, IVAtBeginning);
     rcd := FastNewString(SIZ + ToVarUInt32Length(enclen) + enclen + EndingSize);
     P := pointer(ToVarUInt32(enclen, @rcd^.data));
     if EncryptPkcs7Buffer(pointer(Data), P, len, enclen, IVAtBeginning) and
-       MacEncryptGetTag(rcd.mac) then
+       MacEncryptGetTag(rcd.mac) then // hi=crc(encrypted) lo=aes(crc(plain))
     begin
-      rcd.nonce := nonce;
+      rcd.nonce := nonce.b;
       rcd.crc := crc32c(VERSION, @rcd.nonce, CRCSIZ);
     end
     else
@@ -5594,21 +5601,17 @@ begin
   end
   else
   begin
-    // decrypt: validate header
-    enclen := cardinal(length(Data)) - EndingSize;
+    enclen := cardinal(length(Data)) - EndingSize; // decrypt: validate header
     if (enclen <= SIZ) or
        (pcd^.crc <> crc32c(VERSION, @pcd.nonce, CRCSIZ)) then
       exit;
-    // inlined RecordLoad() for paranoid safety
-    P := @pcd^.data;
+    P := @pcd^.data; // inlined RecordLoad() for paranoid safety
     len := FromVarUInt32(PByte(P));
     if enclen - len <> PtrUInt(PAnsiChar(P) - pointer(Data)) then
-      // to avoid buffer overflow
-      exit;
-    // decrypt and check MAC
+      exit; // avoid buffer overflow
     if MacSetNonce({encrypt=}false, pcd^.nonce, Associated) then
       DecryptPkcs7Var(P, len, IVAtBeginning, result);
-    if result <> '' then
+    if result <> '' then // decrypt and check MAC
       if not MacDecryptCheckTag(pcd^.mac) then
       begin
         FillZero(result);
@@ -6931,11 +6934,10 @@ constructor TAesPkcs7Writer.Create(outStream: TStream; const key;
 begin
   inherited Create(outStream, key, keySizeBits, aesMode, IV, bufferSize);
   SetLength(fBuf, fBufAvailable + SizeOf(TAesBlock)); // space for padding
-  if IV = nil then // not supplied by caller
-  begin
-    Random128(@fAes.fIV); // unpredictable
-    fStream.WriteBuffer(fAes.fIV, SizeOf(fAes.fIV)); // stream starts with IV
-  end;
+  if IV <> nil then
+    exit; // IV supplied by caller: don't include here
+  Random128(@fAes.fIV); // unpredictable
+  fStream.WriteBuffer(fAes.fIV, SizeOf(fAes.fIV)); // stream starts with IV
 end;
 
 destructor TAesPkcs7Writer.Destroy;
@@ -7376,7 +7378,13 @@ end;
 
 function TAesPrngAbstract.FillRandom(Len: integer): RawByteString;
 begin
-  FillRandom(FastNewRawByteString(result, Len), Len);
+  FillRandomVar(result, Len);
+end;
+
+procedure TAesPrngAbstract.FillRandomVar(var Buffer: RawByteString; Len: integer);
+begin
+  FillZero(Buffer);
+  FillRandom(FastNewRawByteString(Buffer, Len), Len);
 end;
 
 function TAesPrngAbstract.FillRandomBytes(Len: integer): TBytes;
@@ -7464,7 +7472,7 @@ begin
   result := 38000 + Int64(Random32) / (maxInt shr 12);
 end;
 
-function TAesPrngAbstract.RandomPassword(Len: integer): SpiUtf8;
+function MakeStrongPassWord(var Rnd: SpiUtf8): boolean;
 const
   CHARS: array[0..127] of AnsiChar =
     'abcdefghijklmnopqrstuvwxyzABCDEFGH[JKLMN0PQRSTUVWXYZ0123456789' +
@@ -7474,21 +7482,29 @@ var
   haspunct: boolean;
   P: PAnsiChar;
 begin
+  result := true;
+  if Rnd = '' then
+    exit;
+  haspunct := false;
+  P := UniqueRawUtf8(RawUtf8(Rnd)); // Rnd is likely to have been just allocated
+  for i := 1 to length(Rnd) do
+  begin
+    P^ := CHARS[ord(P^) and 127];
+    if not haspunct and
+       not (tcWord in TEXT_BYTES[ord(P^)]) then // not 0..9 a..z A..Z
+      haspunct := true;
+    inc(P);
+  end;
+  FakeCodePage(RawByteString(Rnd), CP_UTF8);
+  if length(Rnd) > 4 then
+    result := haspunct and (not (IsUpper(Rnd) or IsLower(Rnd)));
+end;
+
+function TAesPrngAbstract.RandomPassword(Len: integer): SpiUtf8;
+begin
   repeat
-    result := FillRandom(Len);
-    haspunct := false;
-    P := pointer(result);
-    for i := 1 to Len do
-    begin
-      P^ := CHARS[ord(P^) and 127];
-      if not haspunct and
-         not (ord(P^) in [ord('A')..ord('Z'), ord('a')..ord('z'), ord('0')..ord('9')]) then
-        haspunct := true;
-      inc(P);
-    end;
-  until (Len <= 4) or
-        (haspunct and
-         (LowerCase(result) <> result));
+    FillRandomVar(RawByteString(result), Len);
+  until MakeStrongPassword(result);
 end;
 
 function TAesPrngAbstract.RandomSalt(var bin, b64: RawByteString;
@@ -7602,7 +7618,7 @@ end;
 
 class function TAesPrngAbstract.Fill(Len: integer): RawByteString;
 begin
-  result := Main.FillRandom(Len);
+  Main.FillRandomVar(result, Len);
 end;
 
 class function TAesPrngAbstract.Bytes(Len: integer): TBytes;
@@ -7734,6 +7750,7 @@ begin
       fAes.Done;                                  // anti-forensic + set IV = 0
       fAes.EncryptInit(key, fAesKeySize);         // from PBKDF2-SHA-256 output
       TAesContext(fAes).iv.L := PQWord(entropy)^; // keep CTR = zero
+      fBytesSinceSeed := 0;                       // reset counter for next Seed
       fSeeding := false;
     finally
       fSafe.UnLock;
@@ -7845,7 +7862,7 @@ end;
 { TSystemPrng }
 
 procedure TSystemPrng.FillRandom(Buffer: pointer; Len: PtrInt);
-begin
+begin // call mormot.core.os[.security] function
   inc(fTotalBytes, Len);
   FillSystemRandom(Buffer, Len, {allowblocking=}false);
 end;
@@ -7901,7 +7918,7 @@ begin
     {$ifdef OSWINDOWS}
     // Windows is case insensitive, so mORMot 1 Base64-URI file name may collide
     fn := FormatString('%syn_%', [usrdata, BinToHexLower(@k256, 15)]);
-    if IsWow64Emulation then // inconsistent CryptDataForCurrentUserDPAPI()
+    if wsWeakDpApi in WindowsSpecs then // inconsistent CryptProtectData() API
       fn := fn + '_prism';   // another encryption of local key for PRISM
     if not FileExists(fn) then
     begin
@@ -10532,7 +10549,7 @@ begin
   {$endif ASMX64NOTPIC}
   {$ifdef USEAESNIHASH}
   {$ifdef OSWINDOWS}
-  if not IsWow64Emulation then // PRISM seems inconsistent with only few aesenc
+  if not (wsPrism in WindowsSpecs) then // seems inconsistent with only few aesenc
   {$endif OSWINDOWS}
   if (cfAesNi in CpuFeatures) and   // AES-NI
      (cfSSE3 in CpuFeatures) then   // PSHUFB

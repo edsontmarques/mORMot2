@@ -4570,11 +4570,15 @@ begin
     // mainly for HTTP/1.0: https://www.rfc-editor.org/rfc/rfc7230#section-3.3.3
     if Assigned(OnLog) then
       OnLog(sllTrace, 'GetBody deprecated loop', [], self);
-    repeat
-      chunk := SockReceiveString; // rough process
-      Append(RawUtf8(Http.Content), chunk);
-    until chunk = '';
+    // first consume any body bytes already buffered in SockIn
+    len := SockInPending(-1); // aTimeOutMS=-1 to check only the buffer
+    if len > 0 then
+      Http.Content := SockInRead(len, {UseOnlySockIn=}true);
     CloseSockIn; // we have hfConnectionClose anyway
+    // reads the raw socket directly until the socket is closed
+    while SockReceiveStringAppend(Http.Content) do
+      if length(Http.Content) > MaxHttpInMemSize then // 1GB in memory max
+        EHttpSocket.RaiseUtf8('%.GetBody: 1.0 Content mem overflow', [self]);
     Http.ContentLength := length(Http.Content); // update Content-Length
     if DestStream <> nil then
     begin
@@ -4611,13 +4615,12 @@ end;
 
 procedure THttpSocket.HeadersPrepare(const aRemoteIP: RawUtf8);
 begin
-  if (aRemoteIP <> '') and
-     not (hfHasRemoteIP in Http.HeaderFlags) then
-  begin
-    // Http.ParseHeaderFinalize did reserve 40 bytes for fast realloc
-    AppendLine(Http.Headers, ['RemoteIP: ', aRemoteIP]);
-    include(Http.HeaderFlags, hfHasRemoteIP);
-  end;
+  if (aRemoteIP = '') or
+     (hfHasRemoteIP in Http.HeaderFlags) then
+    exit;
+  // Http.ParseHeaderFinalize did reserve 40 bytes for fast realloc
+  AppendLine(Http.Headers, ['RemoteIP: ', aRemoteIP]);
+  include(Http.HeaderFlags, hfHasRemoteIP);
 end;
 
 function THttpSocket.HeaderGetValue(const aUpperName: RawUtf8): RawUtf8;
