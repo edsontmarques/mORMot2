@@ -700,7 +700,7 @@ var
   id: RawUtf8;
   s: string;
   methods: TPublishedMethodInfoDynArray;
-  i: integer;
+  i: PtrInt;
 begin
   inherited Create; // may have been overriden
   if Ident <> '' then
@@ -1555,7 +1555,7 @@ var
 begin
   result := true;
   if Executable.Command.Option('multithread')
-     {$ifdef OSWINDOWS} and not IsWow64Emulation {$endif} then
+     {$ifdef OSWINDOWS} and not (wsFavorFewThreads in WindowsSpecs) {$endif} then
     fMultiThread := CpuThreads > 2; // enabled with 3 cores
   if Executable.Command.Option('&methods') then
   begin

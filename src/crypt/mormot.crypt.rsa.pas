@@ -1660,10 +1660,6 @@ begin
   end;
 end;
 
-const
-  // ensure generated number is at least (nbits - 1) + 0.5 bits
-  FIPS_MIN = $b504f334;
-
 function FipsMinIterations(bits: integer): integer;
 begin
   // ensure 2^-112 error probability - see FIPS 186-5 appendix B.3 table B.1
@@ -1677,30 +1673,31 @@ begin
     result := 51; // never used in practice for RSA
 end;
 
+const
+  // FIPS 186: require p >= 2^(nbits - 0.5) = sqrt(2) * 2^(nbits - 1)
+  FIPS_MIN = $b504f334; // = ceil(sqrt(2) * 2^31) for the top 32-bit dword
+  FIPS_RANGE = high(cardinal) - FIPS_MIN + 1; // allowed top-dword interval size
+
 procedure TBigInt.XorStrongRandom(last32: PCardinal);
 var
   min: integer;
 begin
-  min := 16;
+  min := 4; // paranoid
   repeat
     TAesPrng.Main.XorRandom(Value, Size * HALF_BYTES);
-    if GetBitsCount(Value^, Size * HALF_BITS) < Size * (HALF_BITS div 3) then
+    // CSPRNG sanity check (no RSA requirement): half the bits are set on average
+    if GetBitsCount(Value^, Size * HALF_BITS) > Size * (HALF_BITS div 3) then
     begin
-      // one CSPRNG iteration is usually enough to reach 1/3 of the bits set
-      // - with our TAesPrng, it never occurred after 1,000,000,000 trials
-      dec(min);
-      if min = 0 then // paranoid
-        ERsaException.RaiseU('TBigInt.FillPrime: weak CSPRNG');
-      continue;
+      // should be a big enough odd number
+      Value[0] := Value[0] or 1;  // set lower bit to ensure it is an odd number
+      if last32^ < FIPS_MIN then  // FIPS 186 range requirement
+        last32^ := FIPS_MIN + TAesPrng.Main.Random32(FIPS_RANGE);
+      if last32^ >= FIPS_MIN then // paranoid
+        exit;                     // correct random number
     end;
-    // should be a big enough odd number
-    Value[0] := Value[0] or 1; // set lower bit to ensure it is an odd number
-    if last32^ < FIPS_MIN then
-      last32^ := last32^ or $b5050000; // let's grow up
-    if (Value[Size - 1] or (RSA_RADIX shr 1) <> 0) and // absolute big enough
-       (last32^ >= FIPS_MIN) then
-      exit;
-    ERsaException.RaiseU('TBigInt.FillPrime FIPS_MIN'); // paranoid
+    dec(min); // with our TAesPrng, it never occurred after 1,000,000,000 trials
+    if min = 0 then // paranoid
+      ERsaException.RaiseU('TBigInt.FillPrime: weak');
   until false;
 end;
 
@@ -3305,7 +3302,7 @@ begin
   bits := ModulusBits - 1;
   len := (bits + 7) shr 3; // could be one less than ModulusLen
   // RFC 8017 9.1.1 encoding operation with saltlen = hashlen
-  SharedRandom.Fill(@salt, hlen); // TLecuyer is good enough for public salt
+  TAesPrng.Main.Fill(@salt, hlen); // public salt requires unpredictable CSPRNG
   RsaPssComputeSaltedHash(Hash, @salt, HashAlgo, hlen, h);
   pslen := len - (hlen * 2 + 2);
   if pslen < 0 then

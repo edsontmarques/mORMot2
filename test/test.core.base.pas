@@ -41,11 +41,7 @@ uses
   mormot.rest.client;
 
 const
-  {$ifdef OSWINDOWS}
-  HTTP_DEFAULTPORT = '888';
-  {$else}
-  HTTP_DEFAULTPORT = '8888'; // under Linux, port<1024 needs root user
-  {$endif OSWINDOWS}
+  HTTP_DEFAULTPORT = '8888'; // under Linux/Wine port<1024 needs root user
 
 
 {$ifdef FPC_EXTRECORDRTTI}
@@ -1105,6 +1101,32 @@ var
   sl: TStrings;
   timer: TPrecisionTimer;
 
+  procedure TestSort;
+  begin
+    L.Clear;
+    Check(L.Count = 0);
+    Check(L.IndexOf('5') < 0);
+    Check(L.Add('toto') = 0);
+    Check(L.Count = 1);
+    Check(L.IndexOf('titi') < 0);
+    Check(L.IndexOf('toto') = 0);
+    CheckEqual(L.Text, 'toto');
+    L.Sort;
+    CheckEqual(L.Text, 'toto');
+    Check(L.AddObject('titi', TObject.Create) = 1);
+    CheckEqual(L.IndexOf('toto'), 0);
+    CheckEqual(L.IndexOf('titi'), 1);
+    Check(L.Objects[0] = nil);
+    Check(L.Objects[1] <> nil);
+    CheckEqual(L.GetText(','), 'toto,titi');
+    L.Sort;
+    CheckEqual(L.GetText(','), 'titi,toto');
+    Check(L.Objects[0] <> nil);
+    Check(L.Objects[1] = nil);
+    CheckEqual(L.IndexOf('toto'), 1);
+    CheckEqual(L.IndexOf('titi'), 0);
+  end;
+
   procedure TestBinDictionary;
   var
     i, len: PtrInt; // @len = PPtrInt
@@ -1169,13 +1191,7 @@ begin
     Check(L.IndexOf('6') < 0);
     Check(L.Exists('5'));
     Check(not L.Exists('6'));
-    L.Clear;
-    Check(L.Count = 0);
-    Check(L.IndexOf('5') < 0);
-    Check(L.Add('toto') = 0);
-    Check(L.Count = 1);
-    Check(L.IndexOf('titi') < 0);
-    Check(L.IndexOf('toto') = 0);
+    TestSort;
   finally
     L.Free;
   end;
@@ -1217,17 +1233,7 @@ begin
     for i := 1 to MAX do
       Check((L.IndexOf(v[i]) >= 0) = (i and 127 <> 0));
     DeleteFile(WorkDir + 'utf8list.txt');
-    L.Clear;
-    Check(L.Count = 0);
-    Check(L.Add('toto') = 0);
-    Check(L.Count = 1);
-    Check(L.IndexOf('titi') < 0);
-    Check(L.IndexOf('toto') = 0);
-    Check(L.IndexOf('') < 0);
-    Check(L.Add('') = 1);
-    Check(L.Count = 2);
-    Check(L.IndexOf('') = 1);
-    Check(L.IndexOf('toto') = 0);
+    TestSort;
   finally
     L.Free;
   end;
@@ -5020,6 +5026,38 @@ begin
   CheckEqualShort(TwoDigits(0.0551), '0.06');
   CheckEqualShort(TwoDigits(0.0015), '0');
   CheckEqualShort(TwoDigits(0.0055), '0.01');
+  UInt32DigitsToUtf8(94287082, 10, s);
+  CheckEqual(s, '0094287082');
+  UInt32DigitsToUtf8(94287082, 8, s);
+  CheckEqual(s, '94287082');
+  UInt32DigitsToUtf8(94287082, 6, s);
+  CheckEqual(s, '287082');
+  UInt32DigitsToUtf8(94287082, 4, s);
+  CheckEqual(s, '7082');
+  for i := 0 to 8 do
+  begin
+    UInt32DigitsToUtf8(i, 0, s);
+    CheckEqual(s, '');
+    UInt32DigitsToUtf8(111111111, i, s);
+    CheckEqual(length(s), i);
+    for j := 1 to i do
+      Check(s[i] = '1');
+    UInt32DigitsToUtf8(7, i, s);
+    CheckEqual(length(s), i);
+    if i = 0 then
+      continue;
+    for j := 1 to i - 1 do
+      Check(s[j] = '0');
+    Check(s[i] = '7');
+  end;
+  UInt32DigitsToUtf8(7, 20, s);
+  CheckEqual(s, '00000000000000000007');
+  UInt32DigitsToUtf8(7, 23, s);
+  CheckEqual(s, '00000000000000000000007');
+  UInt32DigitsToUtf8(7, 24, s);
+  CheckEqual(s, '00000000000000000000007');
+  UInt32DigitsToUtf8(7, 25, s);
+  CheckEqual(s, '00000000000000000000007');
   n := 100000;
   Timer.Start;
   crc := 0;
@@ -7395,7 +7433,8 @@ procedure TTestCoreBase.Charsets;
     {$endif HASCODEPAGE}
     {$ifdef OSWINDOWS}
     // skip old Windows (XP/Vista/Seven) which may miss some/most encodings
-    if OSVersion < wTen then
+    if (OSVersion < wTen) or
+       (wsWine in WindowsSpecs) then // Wine/ICU also behind
       exit; // seems not available without a specific language pack
     {$endif OSWINDOWS}
     // validate mORMot conversion
@@ -8357,10 +8396,10 @@ begin
   {$ifndef POSIXDELPHI} // SystemTimeToDateTime() not available on Delphi POSIX
   CheckSameTime(SystemTimeToDateTime(st), SystemTimeToDateTime(stl), 'UnixTimeToLocal');
   {$endif POSIXDELPHI}
-  {$ifdef FPC}
+  {$ifdef VER3_2_4}
   CheckSameTime(LocalTimeToUniversal(dtl), dt, 'LocalTimeToUniversal');
   CheckSameTime(UniversalTimeToLocal(dt), dtl, 'UniversalTimeToLocal');
-  {$endif FPC}
+  {$endif VER3_2_4}
   endtix := GetTickCount64 + 100; // 16ms resolution at worst on Windows
   repeat
     sleep(10); // likely to be executed in a background thread
@@ -9070,8 +9109,11 @@ begin
     Check(SecurityDescriptorToText(bin, u), 'sdtt1');
     CheckEqual(u, SD_TXT[i]);
     {$ifdef OSWINDOWS} // validate against the OS API
-    Check(CryptoApi.SecurityDescriptorToText(pointer(bin), u), 'winapi1');
-    CheckEqual(u, SD_TXT[i], 'winapi2');
+    if not (wsWine in WindowsSpecs) then
+    begin
+      Check(CryptoApi.SecurityDescriptorToText(pointer(bin), u), 'winapi1');
+      CheckEqual(u, SD_TXT[i], 'winapi2');
+    end;
     {$endif OSWINDOWS}
     // TSecurityDescriptor binary load and export as SDDL or binary
     sd.Clear;
@@ -9089,8 +9131,11 @@ begin
     Check(SecurityDescriptorToText(saved, u), 'sdtt2');
     CheckEqual(u, SD_TXT[i]);
     {$ifdef OSWINDOWS}
-    Check(CryptoApi.SecurityDescriptorToText(pointer(saved), u), 'winapi3');
-    CheckEqual(u, SD_TXT[i], 'winapi4');
+    if not (wsWine in WindowsSpecs) then
+    begin
+      Check(CryptoApi.SecurityDescriptorToText(pointer(saved), u), 'winapi3');
+      CheckEqual(u, SD_TXT[i], 'winapi4');
+    end;
     {$endif OSWINDOWS}
     if i in [1, 2, 8] then
       // serialization offsets are not consistent between XP or later
@@ -9702,11 +9747,14 @@ begin
   for i := 1 to 100 do
   begin
     s := DateTimeToIso8601(Now / 20 + rnd.NextDouble * 20, true);
-    t := UrlEncode(s);
+    t := UrlEncode(s); // e.g. '1906-05-18T02%3A02%3A22'
     CheckEqual(UrlDecode(t), s);
     d := 'seleCT=' + t + '&where=' + Int32ToUtf8(i);
     Check(UrlDecodeNeedParameters(pointer(d), 'where,select'));
     Check(not UrlDecodeNeedParameters(pointer(d), 'foo,select'));
+    Check(not UrlDecodeNeedParameters(pointer(d), 'wher,select'));
+    Check(not UrlDecodeNeedParameters(pointer(d), 'where,selected'));
+    Check(not UrlDecodeNeedParameters(pointer(d), 'wheres,select'));
     Check(UrlDecodeValue(pointer(d), 'SELECT=', t, @U));
     CheckEqual(t, s, 'UrlDecodeValue');
     Check(IdemPChar(U, 'WHERE='), 'Where');
@@ -10057,6 +10105,7 @@ begin
   Check(not IsContentTypeJsonU('application/vnd.mysoft.v1+'));
   Check(IsContentTypeJsonU('application/+json'));
   Check(not IsContentTypeJsonU('application/xml'));
+  Check(not IsContentTypeJsonU(XML_CONTENT_TYPE));
   Check(IsContentTypeJsonU('anything/json'));
   Check(IsContentTypeJsonU('something/JSON'));
   Check(not IsContentTypeJsonU('something/SON'));
@@ -10069,6 +10118,7 @@ begin
   Check(IsContentTypeTextU('application/json'));
   Check(IsContentTypeTextU('APPLICATION/JSON'));
   Check(IsContentTypeTextU('application/xml'));
+  Check(IsContentTypeTextU(XML_CONTENT_TYPE));
   Check(not IsContentTypeTextU('application/octet-stream'));
   Check(IsContentTypeTextU('application/javascript'));
   Check(IsContentTypeTextU('application/VND.API+JSON'));
@@ -10932,7 +10982,8 @@ begin
     json := dict.SaveToJson;
     Check(IsValidUtf8(json));
     Check(IsValidJson(json));
-    CheckHash(json, $F67B5FA8, 'dict.savetojson');
+    if MAX = 10000 then
+      CheckHash(json, $F67B5FA8, 'dict.savetojson');
     for i := 1 to MAX do
     begin
       i64 := i;
@@ -10945,7 +10996,8 @@ begin
   dict := TSynDictionary.Create(TypeInfo(TInt64DynArray), TypeInfo(tvalues));
   try
     check(dict.LoadFromJson(json));
-    CheckHash(json, $F67B5FA8, 'untouched after loadfromjson');
+    if MAX = 10000 then
+      CheckHash(json, $F67B5FA8, 'untouched after loadfromjson');
     checkEqual(json, dict.SaveToJson);
     for i := 1 to MAX do
     begin

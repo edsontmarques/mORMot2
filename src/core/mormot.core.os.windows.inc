@@ -3156,12 +3156,18 @@ begin
   if closefirst then
     Close;
   key := 0;
-  result := RegOpenKeyExW(_HKEY[root],
-              Utf8ToWin32PWideChar(keyname, tmp), 0, KEY_READ, key) = NO_ERROR;
+  result := RegOpenKeyExW(_HKEY[root], Utf8ToWin32PWideChar(keyname, tmp), 0,
+              KEY_READ, key) = NO_ERROR;
   tmp.Done;
 end;
 
-function TWinRegistry.ReadOpen(root: TWinRegistryRoot;
+function TWinRegistry.ReadOpenValue(root: TWinRegistryRoot; keyname: PWideChar): boolean;
+begin
+  key := 0;
+  result := RegOpenKeyExW(_HKEY[root], keyname, 0, KEY_QUERY_VALUE, key) = NO_ERROR;
+end;
+
+function TWinRegistry.ReadReOpen(root: TWinRegistryRoot;
   const keynames: array of RawByteString; closefirst: boolean): boolean;
 var
   name: RawUtf8;
@@ -3195,6 +3201,8 @@ var
   k: TWinRegistryKind;
 begin
   result := false;
+  if key = 0 then
+    exit;
   rsize := {%H-}data.Init; // most of the time, a single call is enough
   rtype := 0;
   res := RegQueryValueExW(key, entry, nil, @rtype, data.buf, @rsize);
@@ -3210,10 +3218,10 @@ begin
   if res = NO_ERROR then
   begin
     PCardinal(data.BufEnd)^ := 0; // ensure is #0#0 terminated: the string might
-    if kind <> nil then
-      kind^ := k;
     // NOT have been stored with the proper terminating null characters
     // https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regqueryvalueexw
+    if kind <> nil then
+      kind^ := k;
     result := true;
   end
   else
@@ -3286,6 +3294,17 @@ begin
   tmp.Done;
 end;
 
+function TWinRegistry.ReadFileName(entry: PWideChar): TFileName;
+var
+  tmp: TSynTempBuffer;
+begin
+  result := '';
+  if not ReadTempBuffer(entry, tmp, wrkStrings) then
+    exit;
+  Win32PWideCharToFileName(tmp.buf, result); // use StrLenW()
+  tmp.Done;
+end;
+
 function TWinRegistry.ReadData(entry: PWideChar): RawByteString;
 var
   rsize: DWord;
@@ -3329,7 +3348,8 @@ var
   rtype: DWord;
 begin
   rtype := 0;
-  result := RegQueryValueExW(key, entry, nil, @rtype, data, @datalen) = NO_ERROR;
+  result := (key <> 0) and
+            (RegQueryValueExW(key, entry, nil, @rtype, data, @datalen) = NO_ERROR);
   if result then
     SetWinRegistryKind(kind, rtype);
 end;
@@ -3545,20 +3565,22 @@ begin
   end;
 end;
 
-function ReadRegString(Key: THandle; const Path, Value: string): string;
+function ReadRegString(Root: TWinRegistryRoot; Path, Value: PWideChar): string;
 var
-  siz, typ: DWord;
-  tmp: array[byte] of char;
-  k: HKey;
+  reg: TWinRegistry;
 begin
-  result := '';
-  if RegOpenKeyEx(Key, pointer(Path), 0, KEY_QUERY_VALUE, k) <> ERROR_SUCCESS then
-    exit;
-  siz := 250;
-  typ := REG_SZ;
-  if RegQueryValueEx(k, pointer(Value), nil, @typ, @tmp, @siz) = ERROR_SUCCESS then
-    result := tmp;
-  RegCloseKey(k);
+  reg.ReadOpenValue(Root, Path);
+  result := reg.ReadFileName(Value); // return '' if not found
+  reg.Close;
+end;
+
+function ReadRegDWord(Root: TWinRegistryRoot; Path, Value: PWideChar): cardinal;
+var
+  reg: TWinRegistry;
+begin
+  reg.ReadOpenValue(Root, Path);
+  result := reg.ReadDword(Value); // return 0 if not found
+  reg.Close;
 end;
 
 function SearchSmbios(const mem: RawByteString; var info: TRawSmbiosInfo): PtrUInt;
@@ -3633,9 +3655,9 @@ end;
 procedure CoUninit;
 begin
   if CoInitCounter <= 0 then
-    raise EOleSysError.Create('You should call TOleDBConnection.Free from the same ' +
-      'thread which called its Create: i.e. call MyProps.EndCurrentThread from an ' +
-      'THttpServerGeneric.OnHttpThreadTerminate event - see ticket 213544b2f5');
+    raise EOleSysError.Create('Should call TOleDBConnection.Free/CoUninit from ' +
+      'the same thread which called Create: i.e. call MyProps.EndCurrentThread ' +
+      'from an THttpServerGeneric.OnHttpThreadTerminate event');
   dec(CoInitCounter);
   if CoInitCounter = 0 then
     CoUninitialize;
@@ -5045,7 +5067,7 @@ var
   process, machine: word;
   P: pointer;
   Vers: TWindowsVersion;
-  cpu, manuf, prod, prodver: RawUtf8;
+  cpu: RawUtf8;
   reg: TWinRegistry;
   rnd: PHash128;
   proc: array of TSystemLogicalProcessorInformation;
@@ -5088,8 +5110,11 @@ begin
              IsWow64Process(GetCurrentProcess, res) and
              res;
   if IsWow64 then
+  begin
     // see http://msdn.microsoft.com/en-us/library/ms724381(v=VS.85).aspx
-    GetNativeSystemInfo := LibraryResolve(h, 'GetNativeSystemInfo')
+    GetNativeSystemInfo := LibraryResolve(h, 'GetNativeSystemInfo');
+    include(WindowsSpecs, wsWow64);
+  end
   else
     @GetNativeSystemInfo := nil;
   // see https://learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation
@@ -5102,6 +5127,9 @@ begin
     {$ifdef CPUINTEL} not {$endif} // detecting PRISM is enough by now
     ((machine = IMAGE_FILE_MACHINE_I386) or
      (machine = IMAGE_FILE_MACHINE_AMD64));
+  if IsWow64Emulation then
+    WindowsSpecs := WindowsSpecs + // adapt to PRISM limitations at runtime
+      [wsWow64Emulation, wsPrism, wsFavorFewThreads, wsWeakDpAPI, wsWeakHttpApi];
   // Vista+ kernel32.dll APIs
   GetTickCount64 := LibraryResolve(h, 'GetTickCount64'); // Vista+
   if not Assigned(GetTickCount64) then
@@ -5214,19 +5242,20 @@ begin
     if Assigned(wine_get_version) then
     begin
       OSVersionInfoEx := wine_get_version;
-      OSVersionInfoEx := TrimU('Wine ' + TrimU(OSVersionInfoEx));
+      OSVersionInfoEx := TrimU(Join(['Wine ', TrimU(OSVersionInfoEx)]));
+      WindowsSpecs := WindowsSpecs + [wsWine, wsWeakDpAPI, wsWeakHttpApi];
     end
     {$ifdef CPUINTEL}
     else if IsWow64Emulation then
-       OSVersionInfoEx := 'Prism'
+      OSVersionInfoEx := 'Prism'
     {$endif CPUINTEL};
     RtlIpv6StringToAddress := LibraryResolve(h, 'RtlIpv6StringToAddressA');
   end;
   // 4. retrieve Software/Hardware information from Registry
   if reg.ReadOpen(wrLocalMachine, 'Software\Microsoft\Windows NT\CurrentVersion') then
   begin
-    WindowsUbr := reg.ReadDword('UBR');
-    WindowsProductName := reg.ReadString('ProductName');
+    WindowsUbr            := reg.ReadDword('UBR');
+    WindowsProductName    := reg.ReadString('ProductName');
     WindowsDisplayVersion := reg.ReadString('DisplayVersion');
   end;
   with OSVersionInfo do
@@ -5240,10 +5269,10 @@ begin
   if WindowsUbr <> 0 then
     insert(_fmt('.%d', [WindowsUbr]), OSVersionText, length(OSVersionText));
   if WindowsDisplayVersion <> '' then // append e.g. '25H2'
-    insert(WindowsDisplayVersion + ' ', OSVersionText,
+    insert(Join([WindowsDisplayVersion, ' ']), OSVersionText,
       PosExChar('(', OSVersionText));
   if OSVersionInfoEx <> '' then
-    OSVersionText := OSVersionText + ' - ' + OSVersionInfoEx;
+    OSVersionText := Join([OSVersionText, ' - ', OSVersionInfoEx]);
   if reg.ReadOpen(wrLocalMachine,
        'Hardware\Description\System\CentralProcessor\0', {closefirst=}true) then
   begin
@@ -5253,29 +5282,29 @@ begin
   end;
   if reg.ReadOpen(wrLocalMachine, 'Hardware\Description\System\BIOS', true) then
   begin
-    manuf := reg.ReadString('SystemManufacturer');
-    if manuf <> '' then
-      manuf := manuf + ' ';
-    prod := reg.ReadString('SystemProductName');
-    prodver := reg.ReadString('SystemVersion');
-    if prodver = '' then
-      prodver := reg.ReadString('BIOSVersion');
+    _Smbios[sbiManufacturer]      := reg.ReadString('SystemManufacturer');
+    _Smbios[sbiProductName]       := reg.ReadString('SystemProductName');
+    _Smbios[sbiVersion]           := reg.ReadString('SystemVersion');
+    _Smbios[sbiBiosVersion]       := reg.ReadString('BIOSVersion');
+    _Smbios[sbiBiosVendor]        := reg.ReadString('BIOSVendor');
+    _Smbios[sbiBiosDate]          := reg.ReadString('BIOSReleaseDate');
+    _Smbios[sbiSku]               := reg.ReadString('SystemSKU');
+    _Smbios[sbiBoardManufacturer] := reg.ReadString('BaseBoardManufacturer');
+    _Smbios[sbiBoardProductName]  := reg.ReadString('BaseBoardProduct');
+    _Smbios[sbiBoardVersion]      := reg.ReadString('BaseBoardVersion');
   end;
-  if ({%H-}prod = '') or
-     ({%H-}prodver = '') then
-  begin
+  if (_Smbios[sbiProductName] = '') or
+     (_Smbios[sbiBiosVersion] = '') then // e.g. XP has no System\BIOS entry
     if reg.ReadOpen(wrLocalMachine, 'Hardware\Description\System', true) then
     begin
-      if prod = '' then
-        prod := reg.ReadString('SystemBiosVersion');
-      if prodver = '' then
-        prodver := reg.ReadString('VideoBiosVersion');
+      if _Smbios[sbiProductName] = '' then
+        _Smbios[sbiProductName] := reg.ReadString('SystemBiosVersion');
+      if _Smbios[sbiBiosVersion] = '' then
+        _Smbios[sbiBiosVersion] := reg.ReadString('VideoBiosVersion');
     end;
-  end;
   reg.Close;
-  BiosInfoText := manuf{%H-} + prod;
-  if prodver <> '' then
-    BiosInfoText := BiosInfoText + ' ' + prodver;
+  Join([_Smbios[sbiManufacturer], ' ', _Smbios[sbiProductName], ' ',
+        _Smbios[sbiBiosVersion]], BiosInfoText);
   if {%H-}cpu = '' then
    cpu := GetSystemEnv('PROCESSOR_IDENTIFIER');
   siz := 0;

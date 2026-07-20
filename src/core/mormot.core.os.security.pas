@@ -2318,7 +2318,7 @@ function AsnDump(const Value: TAsnObject): RawUtf8;
 
 type
   /// identify the (Windows) system certificate stores for GetSystemStoreAsPem()
-  // - ignored on POSIX systems, in which the main cacert.pem file is used
+  // - as used by GetSystemStoreAsPem() and GetOneSystemStoreAsPem() functions
   // - scsCA contains known Certification Authority certificates, i.e. from
   // entities entrusted to issue certificates that assert that the recipient
   // individual, computer, or organization requesting the certificate fulfills
@@ -2387,6 +2387,16 @@ const
   SHA_HI  = ord('S') + ord('H') shl 8 + ord('A') shl 16;
   SHA_LO  = ord('s') + ord('h') shl 8 + ord('a') shl 16;
   NTLM_LO = ord('n') + ord('t') shl 8 + ord('l') shl 16 + ord('m') shl 24;
+
+/// simple symmetric obfuscation scheme using a 32-bit key and crc32c lookup tables
+// - used e.g. by TObjectWithPassword and mormot.db.proxy from mormot.crypt.secure
+//  to obfuscate password or content - so it is not a real encryption
+// - fast, but not cryptographically secure, since naively xor data bytes with
+// crc32ctab[]: consider using mormot.crypt.core proven algorithms instead
+procedure SymmetricEncrypt(key: cardinal; var data: RawByteString); overload;
+
+/// simple symmetric obfuscation scheme using a 32-bit key and crc32c lookup tables
+procedure SymmetricEncrypt(key: PtrUInt; data: PCardinal; len: PtrInt); overload;
 
 
 { ****************** Windows API Specific Security Types and Functions }
@@ -3139,6 +3149,12 @@ function SetSystemSecurityDescriptor(const fn: TFileName;
   const dest: TSecurityDescriptor; info: TSecurityDescriptorInfos = [];
   kind: TNamedResourceType = nrtFile;
   privileges: TWinSystemPrivileges = [wspSecurity]): boolean;
+
+/// check the Windows registry to see if AIA automatic retrieval has been disabled
+// - in HKLM:Software\Policies\Microsoft\SystemCertificates\ChainEngine\Config as documented in
+// https://learn.microsoft.com/en-us/windows-server/security/authority-information-access-retrieval
+function IsAiaDisabledInWindowsRegistry: boolean;
+
 
 {$endif OSWINDOWS}
 
@@ -7693,6 +7709,33 @@ begin
       end;
 end;
 
+procedure SymmetricEncrypt(key: cardinal; var data: RawByteString);
+begin
+  if data = '' then
+    exit; // nothing to cypher
+  {$ifdef FPC}
+  UniqueString(data); // @data[1] won't call UniqueString() under FPC :(
+  {$endif FPC}
+  SymmetricEncrypt(key, @data[1], length(data));
+end;
+
+procedure SymmetricEncrypt(key: PtrUInt; data: PCardinal; len: PtrInt); overload;
+var
+  i: PtrInt;
+  tab: PCardinalArray;
+begin
+  tab := pointer(crc32ctab); // use first 4KB of this lazy-generated table
+  key := key xor PtrUInt(len);
+  for i := 0 to (len shr 2) - 1 do
+  begin
+    key := key xor tab[(PtrUInt(i) xor key) and 1023];
+    data^ := data^ xor key; // 32-bit loop
+    inc(data);
+  end;
+  for i := 0 to (len and 3) - 1 do // trailing 1..3 bytes from tab[17..136]
+    PByteArray(data)^[i] := PByteArray(data)^[i] xor key xor tab[17 shl i];
+end;
+
 
 { ****************** Windows API Specific Security Types and Functions }
 
@@ -7824,7 +7867,7 @@ var
   e: PDATA_BLOB;
   ok: boolean;
 begin
-  if IsWow64Emulation then // PRISM seems inconsistent about these API calls
+  if wsWeakDpApi in WindowsSpecs then // PRISM/Wine seem inconsistent about it
   begin
     result := Data;
     SymmetricEncrypt(crc32cHash(AppSecret), result); // weak but consistent
@@ -8932,6 +8975,12 @@ begin
     priv.Done; // restore initial privileges ASAP
   if not result then
     SetLastError(bak); // so that WinLastError / RaiseLastError would work
+end;
+
+function IsAiaDisabledInWindowsRegistry: boolean;
+begin
+  result := ReadRegDWord(wrLocalMachine,
+    'Software\Policies\Microsoft\SystemCertificates\ChainEngine', 'Config') = 2;
 end;
 
 

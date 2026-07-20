@@ -1482,6 +1482,7 @@ type
     /// compare a TTDocVariantData object property with a given text value
     function CompareText(const aName, aValue: RawUtf8;
       aCaseInsensitive: boolean = false): integer;
+      {$ifdef HASSAFEINLINE}inline;{$endif}
     /// low-level method called internally to reserve place for new values
     // - returns the index of the newly created item in Values[]/Names[] arrays
     // - you should not have to use it, unless you want to add some items
@@ -1592,10 +1593,9 @@ type
     // - can be unserialized using the InitArrayFromResults() method
     function ToNonExpandedJson: RawUtf8;
     /// save a document as an array of UTF-8 encoded JSON
-    // - will expect the document to be a dvArray - otherwise, will raise a
-    // EDocVariant exception
-    // - will use VariantToUtf8() to populate the result array: as a consequence,
-    // any nested custom variant types (e.g. TDocVariant) will be stored as JSON
+    // - accept the document to be either dvArray or dvObject
+    // - will use VariantToUtf8() to populate the result from Values[]: any
+    // nested custom variant types (e.g. TDocVariant) will be stored as JSON
     procedure ToRawUtf8DynArray(out Result: TRawUtf8DynArray); overload;
     /// save a document as an array of UTF-8 encoded JSON
     // - will expect the document to be a dvArray - otherwise, will raise a
@@ -1607,11 +1607,10 @@ type
     /// save a document into a TStrings list of encoded JSON
     procedure ToStrings(Dest: TStrings; ClearDest: boolean = false);
     /// save a document as an CSV of UTF-8 encoded JSON
-    // - will expect the document to be a dvArray - otherwise, will raise a
-    // EDocVariant exception
-    // - will use VariantToUtf8() to populate the result array: as a consequence,
-    // any nested custom variant types (e.g. TDocVariant) will be stored as JSON
-    function ToCsv(const Separator: RawUtf8 = ','): RawUtf8;
+    // - a dvArray document would return the CSV of VariantToUtf8(Values[]), so
+    // nested TDocVariant would be stored as JSON in the result
+    // - a dvObject document would return the CSV of its Names[]
+    function ToCsv(const Separator: RawUtf8 = ','; DoReverse: boolean = false): RawUtf8;
     /// save a document as UTF-8 encoded Name=Value pairs
     // - will follow by default the .INI format, but you can specify your
     // own expected layout
@@ -1830,8 +1829,10 @@ type
     // - this method will only handle nested TDocVariant values: use the
     // slightly slower GetValueByPath() overloaded methods, if any nested object
     // may be of another type (e.g. a TBsonVariant)
-    function GetPVariantByPath(const aPath: RawUtf8;
-      aPathDelim: AnsiChar = '.'): PVariant;
+    function GetPVariantByPath(const aPath: RawUtf8; aPathDelim: AnsiChar = '.'): PVariant;
+    /// low-level PUtf8Char function called from GetPVariantByPath()
+    function GetPVariantByPathP(csv: PUtf8Char; delim: AnsiChar = '.'): PVariant;
+      {$ifdef HASINLINE}inline;{$endif}
     /// retrieve a reference to a value, given its path
     // - if the supplied aPath does not match any object, it will follow
     // dvoReturnNullForUnknownProperty option
@@ -2209,34 +2210,39 @@ type
       aMatch: TCompareOperator; aCompare: TVariantCompare; aLimit: integer;
       aPathDelim: AnsiChar; var result: TDocVariantData); overload;
     /// create a TDocVariant array, from the values of a single property of the
-    // objects of this document array, specified by name
+    // objects of this document values, specified by name
     // - you can optionally apply an additional filter to each reduced item
     procedure ReduceAsArray(const aPropName: RawUtf8;
-      var result: TDocVariantData; const OnReduce: TOnReducePerItem = nil); overload;
+      var result: TDocVariantData; const OnReduce: TOnReducePerItem); overload;
     /// create a TDocVariant array, from the values of a single property of the
-    // objects of this document array, specified by name
+    // objects of this document value, specified by name
     // - always returns a TDocVariantData, even if no property name did match
     // (in this case, it is dvUndefined)
     // - you can optionally apply an additional filter to each reduced item
     function ReduceAsArray(const aPropName: RawUtf8;
-      const OnReduce: TOnReducePerItem = nil): variant; overload;
+      const OnReduce: TOnReducePerItem): variant; overload;
     /// create a TDocVariant array, from the values of a single property of the
-    // objects of this document array, specified by name
+    // objects of this document values, specified by name
     // - this overloaded method accepts an additional filter to each reduced item
     procedure ReduceAsArray(const aPropName: RawUtf8;
-      var result: TDocVariantData; const OnReduce: TOnReducePerValue); overload;
+      var result: TDocVariantData; const OnReduce: TOnReducePerValue = nil); overload;
     /// create a TDocVariant array, from the values of a single property of the
-    // objects of this document array, specified by name
+    // objects of this document values, specified by name
     // - always returns a TDocVariantData, even if no property name did match
     // (in this case, it is dvUndefined)
     // - this overloaded method accepts an additional filter to each reduced item
     function ReduceAsArray(const aPropName: RawUtf8;
-      const OnReduce: TOnReducePerValue): variant; overload;
+      const OnReduce: TOnReducePerValue = nil): variant; overload;
     /// return the variant values of a single property of the objects of this
-    // document array, specified by name
-    // - returns nil if the document is not a dvArray
+    // document values, specified by name
     function ReduceAsVariantArray(const aPropName: RawUtf8;
       aDuplicates: TSearchDuplicate = sdNone): TVariantDynArray;
+    // return the RawUf8 values of a named property of the objects of this document
+    function ReduceAsRawUtf8Array(const aPropName: RawUtf8;
+      const OnReduce: TOnReducePerItem = nil): TRawUtf8DynArray;
+    // return the values of a named property of the objects of this document as CSV
+    function ReduceAsCsv(const aPropName: RawUtf8; const aSeparator: RawUtf8 = ',';
+      const OnReduce: TOnReducePerItem = nil; Flags: TVariantToTempUtf8Flags = []): RawUtf8;
     /// rename some properties of a TDocVariant object
     // - returns the number of property names modified
     function Rename(const aFromPropName, aToPropName: TRawUtf8DynArray): integer;
@@ -8824,8 +8830,7 @@ var
 begin
   result.Init(VOptions, dvArray); // same options than the main document
   if (VCount = 0) or
-     (aPropName = '') or
-     not Has(dvoIsArray) then
+     (aPropName = '') then // reduce both dvArray or dvObject Values[]
     exit;
   prev := -1; // optimistic search aPropName at the previous field position
   for ndx := 0 to VCount - 1 do
@@ -8852,8 +8857,7 @@ var
 begin
   result.Init(VOptions, dvArray); // same options than the main document
   if (VCount = 0) or
-     (aPropName = '') or
-     not Has(dvoIsArray) then
+     (aPropName = '') then // reduce both dvArray or dvObject Values[]
     exit;
   prev := -1; // optimistic search aPropName at the previous field position
   for ndx := 0 to VCount - 1 do
@@ -8885,8 +8889,7 @@ var
 begin
   result := nil;
   if (VCount = 0) or
-     (aPropName = '') or
-     not Has(dvoIsArray) then
+     (aPropName = '') then // reduce both dvArray or dvObject Values[]
     exit;
   prev := -1; // optimistic search aPropName at the previous field position
   n := 0;
@@ -8902,6 +8905,64 @@ begin
       end;
   if n <> 0 then
     DynArrayFakeLength(result, n);
+end;
+
+function TDocVariantData.ReduceAsRawUtf8Array(const aPropName: RawUtf8;
+  const OnReduce: TOnReducePerItem): TRawUtf8DynArray;
+var
+  ndx, n: PtrInt;
+  prev: integer; // not PtrInt
+  wasString: boolean;
+  item: PDocVariantData;
+  v: PVariant;
+begin
+  result := nil;
+  if (VCount = 0) or
+     (aPropName = '') then // reduce both dvArray or dvObject Values[]
+    exit;
+  n := 0;
+  prev := -1; // optimistic search aPropName at the previous field position
+  for ndx := 0 to VCount - 1 do
+    if _Safe(VValue[ndx], item) and
+       {%H-}item^.GetObjectProp(aPropName, v, @prev) then
+      if (not Assigned(OnReduce)) or
+         OnReduce(item) then
+      begin
+        if length(result) = n then
+          SetLength(result, NextGrow(n));
+        VariantToUtf8(v^, result[n], wasString);
+        inc(n);
+      end;
+  if n <> 0 then
+    DynArrayFakeLength(result, n);
+end;
+
+function TDocVariantData.ReduceAsCsv(const aPropName, aSeparator: RawUtf8;
+  const OnReduce: TOnReducePerItem; Flags: TVariantToTempUtf8Flags): RawUtf8;
+var
+  ndx: PtrInt;
+  prev: integer; // not PtrInt
+  item: PDocVariantData;
+  v: PVariant;
+  tmp: TSynTempAdder;
+begin
+  FastAssignNew(result);
+  if (VCount = 0) or
+     (aPropName = '') then // reduce both dvArray or dvObject Values[]
+    exit;
+  tmp.Init;
+  prev := -1; // optimistic search aPropName at the previous field position
+  for ndx := 0 to VCount - 1 do
+    if _Safe(VValue[ndx], item) and
+       {%H-}item^.GetObjectProp(aPropName, v, @prev) then
+      if (not Assigned(OnReduce)) or
+         OnReduce(item) then
+      begin
+        if tmp.Size <> 0 then
+          tmp.Add(aSeparator);
+        VariantToAdder(tmp, v^, Flags); // use TTempUtf8
+      end;
+  tmp.Done(result);
 end;
 
 function TDocVariantData.Rename(
@@ -9571,15 +9632,18 @@ end;
 
 function TDocVariantData.GetPVariantByPath(const aPath: RawUtf8;
   aPathDelim: AnsiChar): PVariant;
+begin
+  result := GetPVariantByPathP(pointer(aPath), aPathDelim);
+end;
+
+function TDocVariantData.GetPVariantByPathP(csv: PUtf8Char; delim: AnsiChar): PVariant;
 var
   ndx, len: PtrInt;
   vt: cardinal;
-  csv: PUtf8Char;
 begin
   result := @self;
-  csv := pointer(aPath);
   if (result <> nil) and
-     (aPath <> '') then
+     (csv <> nil) then
     repeat
       repeat
         vt := PVarData(result)^.VType; // inlined dv := _Safe(result^)
@@ -9589,14 +9653,14 @@ begin
       until false;
       if vt <> DocVariantVType then
         break;
-      ndx := PDocVariantData(result)^.InternalNextPath(csv, aPathDelim, len);
+      ndx := PDocVariantData(result)^.InternalNextPath(csv, delim, len);
       if ndx < 0 then
-        break; // this nested level in path does not exist
+        break;  // this nested level in path does not exist
       inc(csv, len);
       result := @PDocVariantData(result)^.VValue[ndx];
       if csv^ = #0 then
-        exit; // exhausted whole path, so result is the found item
-      inc(csv); // aPathDelim
+        exit;   // exhausted whole path, so result is the found item
+      inc(csv); // delim
     until false;
   result := nil;
 end;
@@ -10076,12 +10140,9 @@ begin
   {$ifdef FPC}
   Result := nil;
   {$endif FPC}
-  if cardinal(VType) <> DocVariantVType then
+  if (cardinal(VType) <> DocVariantVType) or
+     (VCount = 0) then
     exit;
-  if Has(dvoIsObject) then
-    EDocVariant.RaiseU('ToRawUtf8DynArray expects a dvArray');
-  if not Has(dvoIsArray) then
-    exit; // undefined
   SetLength(Result, VCount);
   for ndx := 0 to VCount - 1 do
     VariantToUtf8(VValue[ndx], Result[ndx], wasString);
@@ -10098,12 +10159,15 @@ begin
     AddRawUtf8ToStringList(ToRawUtf8DynArray, Dest, ClearDest);
 end;
 
-function TDocVariantData.ToCsv(const Separator: RawUtf8): RawUtf8;
-var
-  tmp: TRawUtf8DynArray; // fast enough in practice
+function TDocVariantData.ToCsv(const Separator: RawUtf8; DoReverse: boolean): RawUtf8;
 begin
-  ToRawUtf8DynArray(tmp);
-  RawUtf8ArrayToCsvVar(tmp, result, Separator);
+  FastAssignNew(result);
+  if (cardinal(VType) = DocVariantVType) and
+     (VCount <> 0) then
+    if Has(dvoIsArray) then
+      PVariantToCsv(pointer(VValue), VCount, Separator, DoReverse, result)
+    else if Has(dvoIsObject) then
+      PRawUtf8ToCsv(pointer(VName), VCount, Separator, DoReverse, result);
 end;
 
 procedure TDocVariantData.ToTextPairsVar(out Result: RawUtf8;
@@ -11049,7 +11113,7 @@ var
   c: AnsiChar;
   flags: set of (fNeg, fNegExp, fValid);
   v64: Int64; // allows 64-bit resolution for the digits (match 80-bit extended)
-  d, d64: double;
+  d: double;
 begin
   // 1. parse input text as number into v64, frac, digit, exp
   result := nil; // return nil to indicate parsing error
@@ -11159,7 +11223,6 @@ begin
   else if AllowVarDouble and
           (frac > -324) then // 5.0 x 10^-324 .. 1.7 x 10^308
   begin // convert into a double value
-    d64 := v64;
     {$ifdef CPUX86NOTPIC}
     f := frac;
     if f >= -31 then
@@ -11178,7 +11241,7 @@ begin
     exp := PtrUInt(@POW10);
     if frac >= -31 then
       if frac <= 31 then
-        d := PPow10(exp)[frac] // -31 .. + 31
+        d := PPow10(exp)[frac] // -31 .. + 31 is the most common case
       else if (18 - remdigit) + integer(frac) >= 308 then
         exit                   // +308 ..
       else                     // +32 .. +307
@@ -11189,7 +11252,7 @@ begin
       d := PPow10(exp)[(frac and not 31) shr 5 + 45] / PPow10(exp)[frac and 31];
     end;
     {$endif CPUX86NOTPIC}
-    Value.VDouble := d * d64;
+    Value.VDouble := d * v64;
     TSynVarData(Value).VType := varDouble;
   end
   else

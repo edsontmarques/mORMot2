@@ -31,6 +31,7 @@ uses
   variants,
   mormot.core.base,
   mormot.core.os,
+  mormot.core.os.security, // for SymmetricEncrypt()
   mormot.core.buffers,
   mormot.core.unicode,
   mormot.core.text,
@@ -3550,8 +3551,8 @@ begin
   end;
   if TServiceFactoryServer(Service).ResultAsXMLObjectIfAcceptOnlyXML and
      FindNameValue(Call^.InHead, 'ACCEPT:', fTemp) and
-     (PropNameEquals(fTemp, 'application/xml') or
-      PropNameEquals(fTemp, 'text/xml')) then
+     (IdemPChar(pointer(fTemp), 'APPLICATION/XML') or
+      IdemPChar(pointer(fTemp), 'TEXT/XML')) then
     ForceServiceResultAsXMLObject := true;
   try
     InternalExecuteSoaByInterfaceComputeResult;

@@ -1842,6 +1842,15 @@ type
     lcbDigest,
     lcbKerberos);
 
+  /// how TLdapClient Kerberos "sign and seal" is negotiated with the server
+  // - lksDefault follows server expectations, e.g sometimes disable it over TLS
+  // - on Windows, lksOsPolicy will follow LDAPClientIntegrity in OS Registry
+  // - lksForced will always force "sign and seal" even over TLS
+  TLdapKerberosSignSeal = (
+    lksDefault,
+    lksOsPolicy,
+    lksForced);
+
   /// define possible values for TLdapClient.SearchSDFlags
   // - LDAP_SERVER_SD_FLAGS_OID control
   TLdapSearchSDFlags = set of (
@@ -1866,6 +1875,7 @@ type
     fTls: boolean;
     fAllowUnsafePasswordBind: boolean;
     fKerberosDisableChannelBinding: boolean;
+    fKerberosSignSeal: TLdapKerberosSignSeal;
     fAutoReconnect: boolean;
     fAutoBind: TLdapClientBound;
     function GetTargetUri: RawUtf8;
@@ -1981,6 +1991,9 @@ type
     // $ ldap server require strong auth = allow_sasl_without_tls_channel_bindings
     property KerberosDisableChannelBinding: boolean
       read fKerberosDisableChannelBinding write fKerberosDisableChannelBinding;
+    /// option to force "sign and seal" on Kerberos even over TLS
+    property KerberosSignSeal: TLdapKerberosSignSeal
+      read fKerberosSignSeal write fKerberosSignSeal;
   end;
 
   TLdapClient = class;
@@ -2612,6 +2625,7 @@ const
 
 function ToText(mode: TLdapClientBound): PShortString; overload;
 function ToText(lct: TLdapClientTransmission): PShortString; overload;
+function ToText(lks: TLdapKerberosSignSeal): PShortString; overload;
 
 
 { **************** Dedicated TLdapCheckMember Class }
@@ -6707,15 +6721,14 @@ var
     pos: integer;
   begin
     pos := 1;
-    if (AsnNext(pos, t, @datain) = ASN1_CTC7) and  // CTX PRI 07 CTR
-       (AsnNext(pos, t) = ASN1_CTC3) and           // CTX PRI 04 CTR
-       (AsnNext(pos, t) = ASN1_OCTSTR) then
-    begin
-      // MS AD seems to encapsulate the binary in a non-standard shape
-      AsnNext(pos, t, @datain);
-      // MS AD seems to require frames encryption once bound
-      needencrypt := true;
-    end;
+    if (AsnNext(pos, t, @datain) <> ASN1_CTC7) or  // CTX PRI 07 CTR
+       (AsnNext(pos, t) <> ASN1_CTC3) or           // CTX PRI 04 CTR
+       (AsnNext(pos, t) <> ASN1_OCTSTR) then
+      exit;
+    // MS AD seems to encapsulate the binary in a non-standard shape
+    AsnNext(pos, t, @datain);
+    // MS AD seems to require frames encryption once bound
+    needencrypt := true;
   end;
 
 begin
@@ -6723,12 +6736,14 @@ begin
   if fBound or
      not Connect then
     exit;
-  // initiate GSSAPI bind request
+  // initialize the needed SSPI/GSSAPI library
   if not InitializeDomainAuth then
   begin
-    SetUnknownError('Kerberos: Error initializing the library');
+    SetUnknownError('Kerberos: Error initializing the library [%]',
+      [GssApi_LastLoadError]);
     exit;
   end;
+  // compute the client-side connection parameters
   if fSettings.KerberosSpn = '' then
   begin
     // default SPN for the LDAP service - even with no SPN yet
@@ -6738,9 +6753,20 @@ begin
         '@', UpperCase(fSettings.KerberosDN)]);
     // if KerberosDN is not set, it would be taken from the UserName or keytab
   end;
-  fLog.EnterLocal(log, 'BindSaslKerberos(%) on %',
-    [fSettings.UserName, fSettings.KerberosSpn], self);
-  needencrypt := false;
+  needencrypt := false; // for lksDefault
+  case fSettings.KerberosSignSeal of
+    {$ifdef OSWINDOWS}
+    lksOsPolicy:
+      needencrypt := ReadRegDWord(wrLocalMachine,
+        'SYSTEM\CurrentControlSet\Services\LDAP', 'LDAPClientIntegrity') = 2;
+    {$endif OSWINDOWS}
+    lksForced:
+      needencrypt := true;
+  end;
+  // initiate GSSAPI bind request
+  fLog.EnterLocal(log, 'BindSaslKerberos(%) on % (%=%)',
+    [fSettings.UserName, fSettings.KerberosSpn,
+     ToText(fSettings.KerberosSignSeal)^, BOOL_STR[needencrypt]], self);
   try
     req1 := Asn(LDAP_ASN1_BIND_REQUEST, [
               Asn(fVersion),
@@ -6836,7 +6862,7 @@ begin
           end
           else
           // if we reached here, the server asked for signing+sealing
-          if needencrypt or             // from MS AD
+          if needencrypt or             // from MS AD or KerberosSignSeal option
              not fSock.TLS.Enabled then // ldap_require_strong_auth on OpenLDAP
           begin
             // return the supported algorithm, with a 64KB maximum message size
@@ -6871,7 +6897,7 @@ begin
       fBoundAs := lcbKerberos;
       fBoundKerberosAuthIdentify := AuthIdentify;
       if needencrypt then
-        include(fFlags, fSecContextEncrypt);
+        include(fFlags, fSecContextEncrypt); // sign and seal
       result := true;
     finally
       if not result then
@@ -8086,6 +8112,11 @@ end;
 function ToText(lct: TLdapClientTransmission): PShortString;
 begin
   result := GetEnumName(TypeInfo(TLdapClientTransmission), ord(lct));
+end;
+
+function ToText(lks: TLdapKerberosSignSeal): PShortString;
+begin
+  result := GetEnumName(TypeInfo(TLdapKerberosSignSeal), ord(lks));
 end;
 
 

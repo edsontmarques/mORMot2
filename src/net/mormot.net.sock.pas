@@ -1177,7 +1177,7 @@ type
     /// check if there are some input data within the TLS buffers
     // - may be the case even with no data any more at TCP/socket level
     // - returns -1 if there is no TLS connection opened
-    // - returns the number of bytes in the internal buffer
+    // - returns the number of bytes in the internal TLS buffer
     // - returns 0 if the internal buffer is void - but there may be some
     // data ready to be unciphered at socket level
     function ReceivePending: integer;
@@ -2176,7 +2176,8 @@ type
     function SockInReadLn(Buffer: PAnsiChar; Size: PtrInt): PtrInt;
     /// returns the number of bytes in SockIn^.Buffer or pending in the OS stack
     // - it first checks and quickly returns any length pending in SockIn^.Buffer
-    // - if buffer is void, will call InputSock to fill it or check the socket API
+    // - if buffer is void, will call InputSock to fill the buffer or check the
+    // socket API within aTimeOutMS - SockInPending(-1) will only check the buffer
     // - returns -1/-2 in case of a socket error (e.g. broken/closed connection)
     // - returns the number of bytes available in input buffers (SockIn or TLS):
     // there may be more waiting at the socket level
@@ -2243,13 +2244,19 @@ type
     function SockReceivePending(TimeOutMS: integer;
       loerr: PNetErrorInt = nil): TCrtSocketPending;
     /// return how many pending bytes are in the receiving socket or INetTls queue
-    // - returns 0 if no data is available, or if the connection is broken: call
-    // SockReceivePending() to check for the actual state of the connection
+    // - returns 0 if no data is available, or if the connection is broken
+    // - on TLS use rather SockReceivePending() to check also the socket state
     function SockReceiveHasData: integer;
-    /// returns the socket input stream as a string
+    /// returns the socket input stream as a RawByteString
     // - returns up to 64KB from the OS or TLS buffers within TimeOut
+    // - returns '' on nrTimeout or nrClosed
     function SockReceiveString(NetResult: PNetResult = nil;
       RawError: PNetErrorInt = nil): RawByteString;
+    /// append the socket input stream to a RawByteString Buffer
+    // - append up to 64KB from the OS or TLS buffers within TimeOut
+    // - returns false on nrTimeout or nrClosed, or true on success
+    function SockReceiveStringAppend(var Buffer: RawByteString;
+      NetResult: PNetResult = nil; RawError: PNetErrorInt = nil): boolean;
     /// fill the Buffer with Length bytes
     // - use TimeOut milliseconds wait for incoming data
     // - bypass the SockIn^.Buffer
@@ -7281,14 +7288,13 @@ function TCrtSocket.SockInPending(aTimeOutMS: integer): integer;
 var
   backup: PtrInt;
 begin
-  if aTimeOutMS < 0 then
-    DoRaise('SockInPending(-1)');
   // first try in SockIn^.Buffer
   result := 0;
   if SockIn <> nil then
     with PTextRec(SockIn)^ do
       result := BufEnd - BufPos;
-  if result <> 0 then
+  if (result <> 0) or
+     (aTimeOutMS < 0) then // SockInPending(-1) to check only SockIn^.Buffer
     exit;
   // no data in SockIn^.Buffer, so try if some pending at socket/TLS level
   case SockReceivePending(aTimeOutMS) of // check both TLS and socket levels
@@ -7669,6 +7675,18 @@ begin
     FastSetRawByteString(result, @tmp, read)
   else
     FastAssignNew(result);
+end;
+
+function TCrtSocket.SockReceiveStringAppend(var Buffer: RawByteString;
+  NetResult: PNetResult; RawError: PNetErrorInt): boolean;
+var
+  read: integer;
+  tmp: TBuffer64K; // big enough for INetTls or the socket API
+begin
+  read := SizeOf(tmp);
+  result := TrySockRecv(@tmp, read, {StopBeforeLength=}true, NetResult, RawError);
+  if result then
+    AppendBufferToUtf8(@tmp, read, RawUtf8(Buffer));
 end;
 
 function TCrtSocket.TrySockRecv(Buffer: pointer; var Length: integer;

@@ -850,24 +850,8 @@ end;
 
 {$ifdef FPC} // if not in mormot.core.os.delphi.pas
 
-{$ifdef OSANDROID} // fallback to TZSeconds i.e. libc localtime() on Android
-
-function ToLocalTime(const utc: TDateTime): TDateTime; inline;
-begin
-  result := utc + TZSeconds * SecsPerDate;
-end;
-
-function ToUtcTime(const local: TDateTime): TDateTime; inline;
-begin
-  result := local - TZSeconds * SecsPerDate;
-end;
-
-function EpochToLocal(I64: TUnixTime): TUnixTime; inline;
-begin
-  result := I64 + TZSeconds;
-end;
-
-{$else} // TTZInfo is the native FPC way of handling time zones on POSIX
+{$if declared(TTZInfo)}
+// TTZInfo is the new native FPC way of handling time zones on POSIX
 
 function GetLocalBias(I64: TUnixTime): PtrInt; inline;
 var
@@ -894,7 +878,26 @@ begin
   result := I64 + GetLocalBias(I64);
 end;
 
-{$endif OSANDROID}
+{$else}
+
+// fallback to TZSeconds i.e. libc localtime() on Android or FPC 3.2.0/3.2.2
+
+function ToLocalTime(const utc: TDateTime): TDateTime; inline;
+begin
+  result := utc + TZSeconds * SecsPerDate;
+end;
+
+function ToUtcTime(const local: TDateTime): TDateTime; inline;
+begin
+  result := local - TZSeconds * SecsPerDate;
+end;
+
+function EpochToLocal(I64: TUnixTime): TUnixTime; inline;
+begin
+  result := I64 + TZSeconds;
+end;
+
+{$ifend declared(TTZInfo)}
 
 {$endif FPC}
 
@@ -3699,7 +3702,7 @@ begin
         (p[l - 1] <= ' ') do // trim right
     dec(l);
   if IsDefaultString(p, l) then
-    l := 0; // e.g. on ProxMox containers or VMs
+    l := 0; // 'Default string' e.g. on ProxMox containers or VMs
   FastSetString(result, p, l);
 end;
 
@@ -4168,12 +4171,7 @@ begin
   crcblock(@e.l, @SystemEntropy.LiveFeed); // obfuscate
   RetrieveSysInfo(si); // at least uptime + cpu load + free mem on all OS
   DefaultHasher128(@e.h, @si, SizeOf(si)); // maybe AesNiHash128
-  {$ifndef CPUINTEL}
-  if SystemEntropy.LiveFeed.c0 = 0 then       // may happen on BSD and MAC ARM
-    crcblocks(@SystemEntropy.LiveFeed, @e, 2) // put something here
-  else
-  {$endif CPUINTEL}
-    crcblock(@e.h, @SystemEntropy.Startup);  // obfuscate
+  crcblock(@e.h, @SystemEntropy.Startup);  // obfuscate
 end;
 
 const
@@ -4193,7 +4191,7 @@ begin
   result := false;
   if Len <= 0 then
     exit;
-  // retrieve up to MAXFROMOS=256 bytes max
+  // retrieve up to MAXFROMOS=256 bytes max - as required by "man urandom"
   rd := MinPtrInt(Len, MAXFROMOS);
   {$ifdef HASGETRANDOM} // a single syscall to rule them all on Linux
   result := LinuxGetRandom(Buffer, rd);
