@@ -713,9 +713,9 @@ begin
     WinError(error, 0, @dest, nil); // fallback to FormatMessageW
 end;
 
-procedure OsErrorShort(Code: cardinal; Dest: PShortString; NoInt: boolean);
+procedure OsErrorShortVar(Code: cardinal; var Dest: ShortString; NoInt: boolean);
 begin
-  WinErrorShort(Code, Dest, NoInt);
+  WinErrorShortVar(Code, Dest, NoInt);
 end;
 
 procedure RaiseLastModuleError(const Context: ShortString; Lib: HMODULE;
@@ -2830,24 +2830,25 @@ end;
 function TFileVersion.RetrieveInformationFromFileName: boolean;
 var
   siz, siz2: DWord;
-  pt: pointer;
   trans: PWordArray;
   lngnfo: RawUtf8;
+  pt: RawByteString;
   nfo: ^TVSFixedFileInfo;
-  ft: TFILETIME;
-  st: TSYSTEMTIME;
   tmp: TW32Temp;
 
-  procedure ReadResourceByName(const From: RawUtf8; out Res: RawUtf8);
+  procedure ReadResourceByName(const From: RawUtf8; var Res: RawUtf8);
   var
     str: pointer;
     sz: DWord;
     u: TSynTempBuffer;
   begin
     sz := 0;
-    if VerQueryValueW(pt, Utf8ToWin32PWideChar(Join([lngnfo, From]), u), str, sz) and
+    if VerQueryValueW(pointer(pt),
+         Utf8ToWin32PWideChar(Join([lngnfo, From]), u), str, sz) and
        (sz > 0) then
-      Win32PWideCharToUtf8(str, Res);
+      Win32PWideCharToUtf8(str, Res)
+    else
+      FastAssignNew(Res);
     u.Done;
   end;
 
@@ -2858,49 +2859,29 @@ begin
   // GetFileVersionInfo() modifies the filename parameter data while parsing
   // -> copy the FileName into local tmp buffer to create a writable copy
   siz := GetFileVersionInfoSizeW(W32(fFileName, tmp, {copy=}true), siz2);
-  if siz > 0 then
-  begin
-    GetMem(pt, siz);
-    try
-      if GetFileVersionInfoW(W32(fFileName, tmp, {copy=}true), 0, siz, pt) then
-      begin
-        if VerQueryValueW(pt, '\', pointer(nfo), siz2) then
-          with nfo^ do
-          begin
-            SetVersion({major=}   dwFileVersionMS shr 16,
-                       {minor=}   dwFileVersionMS and 65535,
-                       {release=} dwFileVersionLS shr 16,
-                       {build=}   dwFileVersionLS and 65535);
-            if (dwFileDateLS <> 0) and
-               (dwFileDateMS <> 0) then
-            begin
-              ft.dwLowDateTime  := dwFileDateLS; // built date from version nfo
-              ft.dwHighDateTime := dwFileDateMS;
-              FileTimeToSystemTime(ft, st);
-              fBuildDateTime := EncodeDate(st.wYear, st.wMonth, st.wDay);
-              fBuildDateTimeString := '';
-            end;
-          end;
-        if VerQueryValueW(pt, '\VarFileInfo\Translation', pointer(trans), siz2) and
-           (siz2 >= 4) then
-        begin
-          _fmt('\StringFileInfo\%4.4x%4.4x\', [trans^[0], trans^[1]], lngnfo);
-          ReadResourceByName('CompanyName',      CompanyName);
-          ReadResourceByName('FileDescription',  FileDescription);
-          ReadResourceByName('FileVersion',      FileVersion);
-          ReadResourceByName('InternalName',     InternalName);
-          ReadResourceByName('LegalCopyright',   LegalCopyright);
-          ReadResourceByName('OriginalFilename', OriginalFilename);
-          ReadResourceByName('ProductName',      ProductName);
-          ReadResourceByName('ProductVersion',   ProductVersion);
-          ReadResourceByName('Comments',         Comments);
-        end;
-        result := true;
-      end;
-    finally
-      FreeMem(pt);
-    end;
-  end;
+  if siz <= 0 then
+    exit;
+  FastNewRawByteString(pt, siz);
+  if not GetFileVersionInfoW(W32(fFileName, tmp, {copy=}true), 0, siz, pointer(pt)) then
+    exit;
+  result := true;
+  if VerQueryValueW(pointer(pt), '\', pointer(nfo), siz2) and
+     (siz2 >= SizeOf(nfo^))  then
+    SetVersionRaw(nfo^.dwFileVersionMS, nfo^.dwFileVersionLS,
+                  nfo^.dwFileDateMS,    nfo^.dwFileDateLS);
+  if not VerQueryValueW(pointer(pt), '\VarFileInfo\Translation', pointer(trans), siz2) or
+     (siz2 < 4) then
+    exit;
+  _fmt('\StringFileInfo\%4.4x%4.4x\', [trans^[0], trans^[1]], lngnfo);
+  ReadResourceByName('CompanyName',      CompanyName);
+  ReadResourceByName('FileDescription',  FileDescription);
+  ReadResourceByName('FileVersion',      FileVersion);
+  ReadResourceByName('InternalName',     InternalName);
+  ReadResourceByName('LegalCopyright',   LegalCopyright);
+  ReadResourceByName('OriginalFilename', OriginalFilename);
+  ReadResourceByName('ProductName',      ProductName);
+  ReadResourceByName('ProductVersion',   ProductVersion);
+  ReadResourceByName('Comments',         Comments);
 end;
 
 procedure GetUserHost(out User, Host: RawUtf8);
@@ -5072,7 +5053,7 @@ var
   rnd: PHash128;
   proc: array of TSystemLogicalProcessorInformation;
   pi: ^TSystemLogicalProcessorInformation;
-  i, n: PtrInt;
+  n: PtrInt;
   siz: DWord;
 begin
   // 1. minimal fallback to support of very old 32-bit CPU without SSE2
@@ -5273,13 +5254,19 @@ begin
       PosExChar('(', OSVersionText));
   if OSVersionInfoEx <> '' then
     OSVersionText := Join([OSVersionText, ' - ', OSVersionInfoEx]);
-  if reg.ReadOpen(wrLocalMachine,
-       'Hardware\Description\System\CentralProcessor\0', {closefirst=}true) then
-  begin
-    cpu := reg.ReadString('ProcessorNameString');
-    if cpu = '' then
-      cpu := reg.ReadString('Identifier');
-  end;
+  {$ifdef ASMINTEL}  // from CPUID
+  cpu := IntelBrand;
+  if cpu = '' then
+  {$endif ASMINTEL}
+    if reg.ReadOpen(wrLocalMachine,
+      'Hardware\Description\System\CentralProcessor\0', {close=}true) then
+    begin
+      cpu := reg.ReadString('ProcessorNameString');
+      if cpu = '' then
+        cpu := reg.ReadString('Identifier');
+    end;
+  if {%H-}cpu = '' then
+    cpu := GetSystemEnv('PROCESSOR_IDENTIFIER');
   if reg.ReadOpen(wrLocalMachine, 'Hardware\Description\System\BIOS', true) then
   begin
     _Smbios[sbiManufacturer]      := reg.ReadString('SystemManufacturer');
@@ -5305,8 +5292,6 @@ begin
   reg.Close;
   Join([_Smbios[sbiManufacturer], ' ', _Smbios[sbiProductName], ' ',
         _Smbios[sbiBiosVersion]], BiosInfoText);
-  if {%H-}cpu = '' then
-   cpu := GetSystemEnv('PROCESSOR_IDENTIFIER');
   siz := 0;
   if Assigned(GetLogicalProcessorInformation) and
      not GetLogicalProcessorInformation(nil, siz) and
@@ -5343,33 +5328,9 @@ begin
           inc(pi);
           dec(n);
         until n = 0;
-        for i := high(CpuCache) downto low(CpuCache) do
-        begin
-          CpuCacheSize := CpuCache[i].Size;
-          if CpuCacheSize = 0 then // append the highest level Cache size
-            continue;
-          cpu := _fmt('%s [%s]', [cpu, KBNoSpace(CpuCacheSize)]);
-          break;
-        end;
-        for i := low(CpuCache) to high(CpuCache) do
-          with CpuCache[i] do
-            if Count <> 0 then
-              if Count = 1 then
-                CpuCacheText := _fmt('%s L%d=%s ',
-                  [CpuCacheText, i, KBNoSpace(Size)])
-              else
-                CpuCacheText := _fmt('%s L%d=%d*%s ',
-                  [CpuCacheText, i, Count, KBNoSpace(Size)]);
-        TrimSelf(CpuCacheText);
       end;
     end;
   end;
-  CpuThreads := SystemInfo.dwNumberOfProcessors;
-  if CpuSockets = 0 then
-    CpuSockets := 1; // e.g. on XP prior to SP3
-  if CpuCores = 0 then
-    CpuCores := CpuThreads;
-  _fmt('%d x %s (' + CPU_ARCH_TEXT + ')', [CpuThreads, cpu], CpuInfoText);
   // 5. compute some minimal entropy using the just retrieved info
   rnd := @SystemEntropy.Startup;
   CoCreateGuid(rnd^); // very fast and unique (but not strong)
