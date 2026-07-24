@@ -1998,7 +1998,7 @@ type
 
   TLdapClient = class;
 
-  /// callback signature used e.g. for TLdapClient.OnDisconnect event
+  /// callback signature used for TLdapClient.OnDisconnect/OnSearchPage
   TOnLdapClientEvent = procedure(Sender: TLdapClient) of object;
 
   /// implementation of LDAP client version 2 and 3
@@ -2020,7 +2020,8 @@ type
     fBoundAs: TLdapClientBound;
     fBoundDigestAlgo: TDigestAlgo; // for Reconnect
     fFlags: set of (
-      fSecContextEncrypt, fRetrieveRootDseInfo, fRetrievedDefaultDNInfo);
+      fSecContextEncrypt, fRetrieveRootDseInfo, fRetrievedDefaultDNInfo,
+      fAborted);
     fResultError: TLdapError;
     fSearchScope: TLdapSearchScope;
     fSearchAliases: TLdapSearchAliases;
@@ -2048,6 +2049,7 @@ type
     fLastPingTix: cardinal;
     fLog: TSynLogClass;
     fOnDisconnect: TOnLdapClientEvent;
+    fOnSearchPage: TOnLdapClientEvent;
     fWellKnownObjects: TLdapKnownCommonNames;
     fExtWhoAmI: TAsnObject;
     // protocol methods
@@ -2354,6 +2356,8 @@ type
       const BaseDN: RawUtf8 = ''; MaxCount: integer = 0): boolean; 
     /// determine whether a given entry has a specified attribute value
     function Compare(const Obj, AttrName, AttrValue: RawUtf8): boolean;
+    /// set an internal flag to abort a SearchAll/SearchAllDoc paged request
+    procedure SearchAllAbort;
 
     { write methods }
 
@@ -2613,6 +2617,12 @@ type
     // - if not defined, will follow Settings.AutoReconnect property
     property OnDisconnect: TOnLdapClientEvent
       read fOnDisconnect write fOnDisconnect;
+    /// callback raised if paging is enabled during each TLdapClient.Search
+    // - called once for SearchBegin then for each Search()
+    // - see SearchResult SearchPageSize SearchPageCount and SearchCookie fields
+    // - you can call Sender.SearchAllAbort to stop the search
+    property OnSearchPage: TOnLdapClientEvent
+      read fOnSearchPage write fOnSearchPage;
   end;
 
 const
@@ -6693,8 +6703,8 @@ type
   // see https://www.rfc-editor.org/rfc/rfc4752#section-3.3
   TKerbSecLayer = set of (
     kslNone,
-    kslIntegrity,
-    kslConfidentiality);
+    kslIntegrity,         // sign only
+    kslConfidentiality);  // sign and seal
 
 const
   /// the bit-mask of the security layer to be used (if any wanted by the server)
@@ -7095,6 +7105,8 @@ begin
   AddInteger(fSearchBeginBak, fSearchBeginCount, fSearchPageSize);
   fSearchPageSize := PageSize;
   fSearchPageCount := 0;
+  if Assigned(fOnSearchPage) then
+    fOnSearchPage(self);
 end;
 
 procedure TLdapClient.SearchEnd;
@@ -7224,12 +7236,16 @@ begin
     if result and
        (fSearchRange <> nil) then // within SearchRangeBegin .. SearchRangeEnd
       fSearchRange.ExtractPagedAttributes(fSearchResult);
-    if fSearchBeginCount <> 0 then
-      inc(fSearchPageCount, fSearchResult.Count);
     QueryPerformanceMicroSeconds(stop);
     fSearchResult.fMicroSec := stop - start;
     fSearchResult.fIn := fSock.BytesIn - bytesIn;
     fSearchResult.fOut := fSock.BytesOut - bytesOut;
+    if fSearchBeginCount <> 0 then
+    begin
+      inc(fSearchPageCount, fSearchResult.Count);
+      if Assigned(fOnSearchPage) then
+        fOnSearchPage(self);
+    end;
   finally
     if Assigned(fLog) then
       if result then
@@ -7437,6 +7453,11 @@ begin
   end;
 end;
 
+procedure TLdapClient.SearchAllAbort;
+begin
+  include(fFlags, fAborted);
+end;
+
 function TLdapClient.SearchAllDocRaw(out Dest: TDocVariantData;
   const BaseDN, Filter: RawUtf8; const Attributes: array of RawUtf8;
   Options: TLdapResultOptions; const ObjectAttributeField: RawUtf8;
@@ -7463,6 +7484,7 @@ begin
     SearchRangeBegin;
   if PerPage <= 100 then
     PerPage := 100;
+  exclude(fFlags, fAborted);
   SearchBegin(PerPage); // force pagination for the loop below
   try
     // retrieve all result pages
@@ -7473,13 +7495,20 @@ begin
       inc(n, fSearchResult.Count);
       inc(recv, fSearchResult.Recv);
     until (SearchCookie = '') or
+          (fAborted in fFlags) or
           ((MaxCount > 0) and
            (n > MaxCount));
     result := fResultCode = LDAP_RES_SUCCESS;
   finally
     SearchEnd;
-    // additional requests to fill any "paging attributes" auto-range results
-    if fSearchRange <> nil then
+    if fAborted in fFlags then
+    begin
+      SetUnknownError('Stopped by SearchAllAbort');
+      result := false;
+      exclude(fFlags, fAborted);
+    end
+    else if fSearchRange <> nil then
+      // additional requests to fill any "paging attributes" auto-range results
       SearchRangeEnd(Dest, Options, ObjectAttributeField); // as TDocVariant
   end;
   if Assigned(ilog) then
