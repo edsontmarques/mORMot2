@@ -498,17 +498,15 @@ type
   protected
     fOwner: TAsyncConnections;
     fProcess: TAsyncConnectionsThreadProcess;
-    fWaitForReadPending: boolean;
-    fWakeUpFromSlowProcess: boolean;
     fExecuteState: THttpServerExecuteState;
+    fWakeUp: set of (wuPossible, wuFromSlowProcess); // for atpReadPending
     fIndex: integer;
     fCustomObject: TObject;
     {$ifndef USE_WINIOCP}
     fEvent: TSynEvent;
     fThreadPollingLastWakeUpTix: integer;
-    fThreadPollingLastWakeUpCount: integer;
+    fThreadPollingLastWakeUpEvents: integer;
     function GetNextRead(out notif: TPollSocketResult): boolean;
-    procedure ReleaseEvent; {$ifdef HASINLINE} inline; {$endif}
     {$endif USE_WINIOCP}
     procedure DoExecute; override;
   public
@@ -1002,7 +1000,10 @@ type
     // handle ifProcessing flag
     procedure OnClose; override;
     // quickly reject incorrect requests (payload/timeout/OnBeforeBody)
-    function DoReject(status: integer): TPollAsyncSocketOnReadWrite;
+    function DoReject(status: integer;
+      const ExtraHeader: RawUtf8 = ''): TPollAsyncSocketOnReadWrite;
+    // implement fServer.OnBodyDownload event - may reject as 415
+    function DoBodyDownload: TPollAsyncSocketOnReadWrite; virtual;
     function DecodeHeaders: integer; virtual; // e.g. hfConnectionUpgrade override
     function DoHeaders: TPollAsyncSocketOnReadWrite;
     function DoRequest: TPollAsyncSocketOnReadWrite;
@@ -1245,7 +1246,7 @@ type
   public
     /// setup the default values of this URL
     constructor Create; override;
-    /// allow to customize the processing options in a fluid calling interface
+    /// allow to customize the processing options in a fluent calling interface
     function SetOptions(aOptions: THttpProxyUrlOptions): THttpProxyUrlSettings;
     /// optional event handler when a remote URI connection is instantiated
     property OnRemoteClient: TOnHttpProxyUrlClient
@@ -2662,15 +2663,6 @@ end;
 
 {$ifndef USE_WINIOCP}
 
-procedure TAsyncConnectionsThread.ReleaseEvent;
-begin
-  if fWaitForReadPending then
-  begin
-    fWaitForReadPending := false; // set event once
-    fEvent.SetEvent;
-  end;
-end;
-
 function TAsyncConnectionsThread.GetNextRead(
   out notif: TPollSocketResult): boolean;
 begin
@@ -2679,13 +2671,13 @@ begin
   if result then
     if (acoThreadSmooting in fOwner.Options) and
        (fThreadPollingLastWakeUpTix <> fOwner.fThreadPollingLastWakeUpTix) and
-       not fWakeUpFromSlowProcess then
+       not (wuFromSlowProcess in fWakeUp) then
     begin
       // ProcessRead() did take some time: wake up another thread
       // - slow down a little bit the wrk RPS
       // - but seems to reduce the wrk max latency
-      fWakeUpFromSlowProcess := true; // do it once per Execute loop
-      fOwner.ThreadPollingWakeup(1); // one thread is enough
+      include(fWakeUp, wuFromSlowProcess); // do it once per Execute loop
+      fOwner.ThreadPollingWakeup(1);       // one thread is enough
     end;
 end;
 
@@ -2762,7 +2754,6 @@ begin
           // main thread will just fill pending events from socket polls
           // (no process because a faulty service would delay all reading)
           begin
-            fWaitForReadPending := false;
             new := fOwner.fSockets.fRead.PollForPendingEvents(ms);
             if Terminated then
               break;
@@ -2770,45 +2761,35 @@ begin
                (fOwner.fSockets.fRead.fPending.Count <> 0) then
               new := 1; // wake up one thread if some reads are still pending
             fEvent.ResetEvent;
-            fWaitForReadPending := true; // to be set before wakeup
             if new <> 0 then
               fOwner.ThreadPollingWakeup(new);
             // wait for the sub-threads to wake up this one
             if Terminated then
               break;
-            if (fEvent.IsEventFD and
-                (fOwner.fThreadPollingAwakeCount > 2)) or
-               ((fOwner.fSockets.fRead.fPending.Count = 0) and
-                (fOwner.fSockets.fRead.Count = 0)) then
-              // 1) avoid poll(eventfd) syscall on heavy loaded server
-              // 2) there is no connection any more: wait for next accept
-            begin
-              fWaitForReadPending := true; // better safe than sorry
-              fEvent.WaitForEver;
-            end
+            if (fOwner.fSockets.fRead.fPending.Count = 0) and
+               (fOwner.fSockets.fRead.Count = 0) then
+              // there is no connection any more: wait for next accept
+              fEvent.WaitForEver
             else
-            begin
               // always release current thread to avoid CPU burning
               // (any condition makes stability and performance worse)
-              fWaitForReadPending := true;
               fEvent.WaitFor(1);
-            end;
           end;
         atpReadPending:
           // secondary threads wait, then read and process pending events
           begin
             fEvent.ResetEvent;
-            fWaitForReadPending := true; // to be set just before WaitForEver
+            include(fWakeUp, wuPossible); // to be set before WaitForEver
             fEvent.WaitForEver;
             if Terminated then
               break;
             LockedInc32(@fOwner.fThreadPollingAwakeCount);
-            fWakeUpFromSlowProcess := false;
+            exclude(fWakeUp, wuFromSlowProcess);
             while GetNextRead(notif) do
               fOwner.fSockets.ProcessRead(self, notif);
             fThreadPollingLastWakeUpTix := 0; // will now need to wakeup
             LockedDec32(@fOwner.fThreadPollingAwakeCount);
-            fOwner.fThreadReadPoll.ReleaseEvent; // atpReadPoll lock above
+            fOwner.fThreadReadPoll.fEvent.SetEvent; // atpReadPoll lock above
           end;
       else
         EAsyncConnections.RaiseUtf8('%.Execute: unexpected fProcess=%',
@@ -2852,7 +2833,7 @@ begin
   {$ifndef USE_WINIOCP}
   fThreadPollingWakeupLoad := (cardinal(aThreadPoolCount) div CpuThreads) * 8;
   if fThreadPollingWakeupLoad < 4 then
-    fThreadPollingWakeupLoad := 4; // below 4, the whole algorithm seems pointless
+    fThreadPollingWakeupLoad := 4; // below 4, this algorithm seems pointless
   {$endif USE_WINIOCP}
   // setup internal variables
   fLastOperationReleaseMemorySeconds := 60;
@@ -3221,16 +3202,15 @@ end;
 // - ThreadPollingWakeupLoad property defines how many fast processing events a
 // thread is supposed to handle in its loop - default value is computed as
 // (ThreadPoolCount / CpuCount) * 8 so should scale depending on the actual HW
-// - on Linux, waking up threads is done via efficient blocking eventfd()
+// - on POSIX waking up threads is done via our efficient TSynEvent.SetEvent
 // - on Windows, TWinIocp will directly handle atpReadPending thread wakening
 
 {$ifndef USE_WINIOCP}
 function TAsyncConnections.ThreadPollingWakeup(Events: integer): PtrInt;
 var
   i: PtrInt;
-  th: PAsyncConnectionsThread;
   t: TAsyncConnectionsThread;
-  c, tix: integer; // 32-bit is enough to check for
+  c, tix: integer;  // 32-bit is enough to check for
   ndx: TByteToByte; // wake up to 256 threads at once
 begin
   if Events > high(ndx) then
@@ -3246,54 +3226,63 @@ begin
   end;
   fThreadPollingWakeupSafe.Lock;
   try
-    th := @fThreads[1]; // [0]=fThreadReadPoll and should not be set from here
-    for i := 1 to length(fThreads) - 1 do
-    begin
-      t := th^;
-      if tix = 0 then
+    if tix = 0 then
+      // exactly wake up one thread per needed event
+      for i := 1 to length(fThreads) - 1 do
       begin
-        // exactly wake up one thread per needed event
-        if t.fWaitForReadPending then
-        begin
-          // this thread is currently idle and can be activated
-          t.fThreadPollingLastWakeUpCount := 0;
-          t.fThreadPollingLastWakeUpTix := 0;
-          t.fWaitForReadPending := false; // acquire this thread
-          ndx[result] := i; // notify outside of fThreadPollingWakeupSafe lock
-          inc(result);
-          dec(Events);
-        end;
-      end
-      // fast working threads handle up to fThreadPollingLastWakeUpCount events
-      else if not t.fWaitForReadPending and
-              (t.fThreadPollingLastWakeUpCount > 0) and
-              (t.fThreadPollingLastWakeUpTix = tix) then
-      begin
-        // this thread is likely to be available very soon: consider it done
-        c := t.fThreadPollingLastWakeUpCount;
-        dec(t.fThreadPollingLastWakeUpCount, Events);
-        dec(Events, c);
-      end
-      else if t.fWaitForReadPending then
-      begin
-        // we need to wake up a thread, since some slow work is going on
-        t.fThreadPollingLastWakeUpTix := tix;
-        t.fThreadPollingLastWakeUpCount := fThreadPollingWakeupLoad - Events;
-        t.fWaitForReadPending := false; // acquire this thread
-        ndx[result] := i;
+        t := fThreads[i];
+        if not (wuPossible in t.fWakeUp) then
+         continue;
+        // this thread is currently idle and can be activated
+        t.fThreadPollingLastWakeUpEvents := 0;
+        t.fThreadPollingLastWakeUpTix := 0;
+        exclude(t.fWakeUp, wuPossible); // acquire this thread
+        ndx[result] := i; // notify outside of fThreadPollingWakeupSafe lock
         inc(result);
-        dec(Events, fThreadPollingWakeupLoad);
+        dec(Events);
+        if Events <= 0 then
+          break;
+      end
+    else // acoThreadSmooting up to ThreadPollingWakeupLoad events per thread
+    begin
+      // first pass to identify any spare events in running threads
+      for i := 1 to length(fThreads) - 1 do
+      begin
+        t := fThreads[i];
+        if (wuPossible in t.fWakeUp) or                 // not running
+           (t.fThreadPollingLastWakeUpEvents = 0) or    // no spare event
+           (t.fThreadPollingLastWakeUpTix <> tix) then  // slow process
+          continue;
+        // this thread is likely to be available very soon: consider it done
+        c := t.fThreadPollingLastWakeUpEvents;
+        dec(t.fThreadPollingLastWakeUpEvents, Events);
+        dec(Events, c);
+        if Events <= 0 then
+          break;
       end;
-      if Events <= 0 then
-        break;
-      inc(th);
+      if Events > 0 then
+        // we need to wake up some thread(s), since some slow work is going on
+        for i := 1 to length(fThreads) - 1 do
+        begin
+          t := fThreads[i];
+          if not (wuPossible in t.fWakeUp) then
+           continue;
+          t.fThreadPollingLastWakeUpTix := tix;
+          t.fThreadPollingLastWakeUpEvents := fThreadPollingWakeupLoad - Events;
+          exclude(t.fWakeUp, wuPossible);
+          ndx[result] := i;
+          inc(result);
+          dec(Events, fThreadPollingWakeupLoad);
+          if Events <= 0 then
+            break;
+        end;
     end;
   finally
     fThreadPollingWakeupSafe.UnLock;
   end;
   // notify threads outside fThreadPollingWakeupSafe
   for i := 0 to result - 1 do
-    fThreads[ndx[i]].fEvent.SetEvent; // on Linux, uses eventfd()
+    fThreads[ndx[i]].fEvent.SetEvent;
 end;
 {$endif USE_WINIOCP}
 
@@ -4772,7 +4761,17 @@ begin
         begin
           fOwner.DoLog(sllWarning, 'OnRead: close connection after % (before=%)',
             [HTTP_STATE[fHttp.State], HTTP_STATE[previous]], self);
-          DoReject(HTTP_BADREQUEST);
+          case fHttp.State of
+            hrsErrorPayloadTooLarge:
+              begin
+                fServer.IncStat(grOversizedPayload); // e.g. over ContentMaxSize
+                DoReject(HTTP_PAYLOADTOOLARGE);
+              end;
+            hrsErrorContentStreamWrite:
+              DoReject(HTTP_INSUFFICIENTSTORAGE); // e.g. ENOSPC on spool file
+          else
+            DoReject(HTTP_BADREQUEST);
+          end;
           result := soClose;
         end;
       end;
@@ -4934,8 +4933,8 @@ begin
       fRemoteIP, fHttp.BearerToken, fHttp.ContentLength, fRequestFlags);
 end;
 
-function THttpAsyncServerConnection.DoReject(
-  status: integer): TPollAsyncSocketOnReadWrite;
+function THttpAsyncServerConnection.DoReject(status: integer;
+  const ExtraHeader: RawUtf8): TPollAsyncSocketOnReadWrite;
 var
   len: integer; // should not be PtrInt
 begin
@@ -4947,7 +4946,8 @@ begin
   end
   else
   begin
-    if fServer.ComputeRejectBody(fHttp.Content, fConnectionID, status) then
+    if fServer.ComputeRejectBody(
+         fHttp.Content, fConnectionID, status, ExtraHeader) then
       result := soContinue; // for grWwwAuthenticate
     len := length(fHttp.Content);
     Send(pointer(fHttp.Content), len); // no polling nor ProcessWrite
@@ -4969,6 +4969,44 @@ begin
       fOwner.DoLog(sllTrace, 'DoReject(%): BanIP(%) %',
         [status, fRemoteIP, fServer.Async.Banned], self);
     fServer.IncStat(grBanned);
+  end;
+end;
+
+function THttpAsyncServerConnection.DoBodyDownload: TPollAsyncSocketOnReadWrite;
+var
+  strm: TStream;
+  fn: TFileName; // managed local variables are on purpose in this sub-method
+  len: Int64;
+begin
+  result := soContinue;
+  len := fHttp.ContentLength;
+  if hfTransferChunked in fHttp.HeaderFlags then
+    len := -1; // a chunked body size is not known in advance
+  strm := fServer.fOnBodyDownload(fHttp.CommandUri, fHttp.CommandMethod,
+    fHttp.Headers, fHttp.ContentType, fRemoteIP, len);
+  if strm = nil then
+    exit; // in-memory Content buffering
+  if fHttp.ContentEncoding <> nil then
+  begin
+    // a streamed body does not support Content-Encoding: compression
+    fn := '';
+    if strm.InheritsFrom(TFileStreamEx) then
+      fn := TFileStreamEx(strm).FileName;
+    strm.Free;
+    if fn <> '' then
+      DeleteFile(fn); // remove the (void) spool file
+    result := DoReject(HTTP_UNSUPPORTEDMEDIATYPE,
+      'Accept-Encoding: identity'#13#10);
+  end
+  else
+  begin
+    // ProcessRead will download the body into this stream
+    fHttp.ContentStream := strm; // freed by ProcessDone/Reset on abort
+    include(fHttp.ResponseFlags, rfContentStreamNeedFree);
+    if strm.InheritsFrom(TFileStreamEx) then
+      fHttp.SetContentInputName(TFileStreamEx(strm));
+    // needed to track and limit the cumulated chunked body size
+    fHttp.ContentMaxSize := fServer.MaximumAllowedContentLength;
   end;
 end;
 
@@ -5006,7 +5044,15 @@ begin
     result := DoRequest;
   end
   else
+  begin
+    // allow OnBodyDownload callback to supply a stream for the body
     result := soContinue;
+    if (fHttp.State in
+         [hrsGetBodyChunkedHexFirst, hrsGetBodyContentLengthFirst]) and
+       not (hfConnectionUpgrade in fHttp.HeaderFlags) and
+       Assigned(fServer.fOnBodyDownload) then
+      result := DoBodyDownload;
+  end;
 end;
 
 function THttpAsyncServerConnection.DoRequest: TPollAsyncSocketOnReadWrite;
@@ -5022,6 +5068,11 @@ begin
          (fHttp.State in [hrsGetCommand, hrsUpgraded]) then
         exit; // rejected or upgraded to WebSockets
     end;
+  // move any body stream supplied by OnBodyDownload aside, before the response
+  // process could reuse the ContentStream field - it remains available to the
+  // request as InContentStream, and is released by ProcessDone afterwards
+  if fHttp.ContentStream <> nil then
+    fHttp.ContentInputDone;
   // optionaly uncompress content
   if fHttp.ContentEncoding <> nil then
     fHttp.UncompressData;
@@ -5930,7 +5981,7 @@ end;
 constructor THttpProxyServerMainSettings.Create;
 begin
   inherited Create;
-  fThreadCount := CpuThreads + 1;
+  fThreadCount := SystemInfo.dwNumberOfProcessors + 1;
   fPort := '8098';
 end;
 

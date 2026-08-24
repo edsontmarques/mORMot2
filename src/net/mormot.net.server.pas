@@ -88,6 +88,8 @@ type
       ProcessName: RawUtf8; TimeoutMS: integer); reintroduce;
     /// finalize the processing thread
     destructor Destroy; override;
+    /// notify the UDP main thread that it is finished
+    procedure TerminateAndWaitFinished(TimeOutMs: integer = 5000); override;
     /// low-level access to the bound UDP socket (for debugging purposes)
     property Sock: TNetSocket
       read fSock;
@@ -529,6 +531,7 @@ type
     /// optional event handlers for process interception
     fOnRequest: TOnHttpServerRequest;
     fOnBeforeBody: TOnHttpServerBeforeBody;
+    fOnBodyDownload: TOnHttpServerBodyDownload;
     fOnBeforeRequest: TOnHttpServerRequest;
     fOnAfterRequest: TOnHttpServerRequest;
     fOnAfterResponse: TOnHttpServerAfterResponse;
@@ -554,6 +557,7 @@ type
     procedure SetOptions(opt: THttpServerOptions);
     procedure SetOnRequest(const aRequest: TOnHttpServerRequest); virtual;
     procedure SetOnBeforeBody(const aEvent: TOnHttpServerBeforeBody); virtual;
+    procedure SetOnBodyDownload(const aEvent: TOnHttpServerBodyDownload); virtual;
     procedure SetOnBeforeRequest(const aEvent: TOnHttpServerRequest); virtual;
     procedure SetOnAfterRequest(const aEvent: TOnHttpServerRequest); virtual;
     procedure SetOnAfterResponse(const aEvent: TOnHttpServerAfterResponse); virtual;
@@ -685,6 +689,16 @@ type
     // error code to reject the request immediately, and close the connection
     property OnBeforeBody: TOnHttpServerBeforeBody
       read fOnBeforeBody write SetOnBeforeBody;
+    /// event handler called just before the body is downloaded from the client
+    // - could return a TStream instance (e.g. a TFileStreamEx spooling into a
+    // local temporary file) to receive the incoming request body with a fixed
+    // memory usage, whatever its size - see TOnHttpServerBodyDownload
+    // - only implemented by socket-based servers, i.e. THttpServer and
+    // THttpAsyncServer classes, not by THttpApiServer
+    // - warning: this handler must be thread-safe (can be called by several
+    // threads simultaneously)
+    property OnBodyDownload: TOnHttpServerBodyDownload
+      read fOnBodyDownload write SetOnBodyDownload;
     /// event handler called after HTTP body has been retrieved, before OnRequest
     // - may be used e.g. to return a HTTP_ACCEPTED (202) status to client and
     // continue a long-term job inside the OnRequest handler in the same thread;
@@ -910,6 +924,10 @@ type
     procedure TaskProcess(aCaller: TSynThreadPoolWorkThread); virtual;
     function TaskProcessBody(aCaller: TSynThreadPoolWorkThread;
       aHeaderResult: THttpServerSocketGetRequestResult): boolean;
+    procedure DownloadBody; {$ifdef HASINLINE} inline; {$endif}
+    procedure GetBodyStream;
+    // implement fServer.OnBodyDownload in GetRequest - false if rejected as 415
+    function DoOnBodyDownload: boolean; virtual;
   public
     /// create the socket according to a server
     // - will register the THttpSocketCompress functions from the server
@@ -1091,7 +1109,8 @@ type
     procedure SetRegisterCompressGzStatic(Value: boolean);
     function ComputeWwwAuthenticate(Opaque: Int64): RawUtf8;
     function ComputeRejectBody(var Body: RawByteString; Opaque: Int64;
-      Status: integer): boolean; virtual; // return true for grWwwAuthenticate
+      Status: integer; const ExtraHeader: RawUtf8 = ''): boolean;
+      virtual; // return true for grWwwAuthenticate - ExtraHeader needs #13#10
     function Authorization(var Http: THttpRequestContext;
       Opaque: Int64): TAuthServerResult;
     procedure SetBlackListUri(const Uri: RawUtf8);
@@ -2638,33 +2657,10 @@ end;
 
 destructor TUdpServerThread.Destroy;
 var
-  sock: TNetSocket;
   ilog: ISynLog;
 begin
   fLogClass.EnterLocal(ilog, 'Destroy: ending % - processing=%',
     [fProcessName, fProcessing], self);
-  // notify thread termination (if not already done)
-  Terminate;
-  // try to release fSock.WaitFor(1000) in DoExecute
-  if fProcessing and
-     (fSock <> nil) then
-  {$ifdef OSPOSIX} // a broadcast address won't reach DoExecute
-  if (fSockAddr.IP4 and $ff000000) = $ff000000 then // check x.x.x.255
-    fSock.ShutdownAndClose({rdwr=}true) // will release acept() ASAP
-  else
-  {$endif OSPOSIX}
-  begin
-    sock := fSockAddr.NewSocket(nlUdp);
-    if sock <> nil then
-    begin
-      fLogClass.Add.Log(sllTrace, 'Destroy: send final packet', self);
-      sock.SetSendTimeout(10);
-      sock.SendTo(pointer(UDP_SHUTDOWN), length(UDP_SHUTDOWN), fSockAddr);
-      sock.ShutdownAndClose(false);
-    end
-    else
-      fLogClass.Add.Log(sllTrace, 'Destroy: error creating final socket', self);
-  end;
   // finalize this thread process
   TerminateAndWaitFinished;
   fLogClass.Add.Log(sllDebug, 'Destroy: TerminateAndWaitFinished Processing=% [%]',
@@ -2674,6 +2670,37 @@ begin
     fSock.ShutdownAndClose({rdwr=}true);
   if fFrameOwned then
     FreeMem(fFrame);
+end;
+
+procedure TUdpServerThread.TerminateAndWaitFinished(TimeOutMs: integer);
+var
+  sock: TNetSocket;
+begin
+  // notify thread termination (if not already done)
+  Terminate;
+  // try to release fSock.WaitFor(1000) in DoExecute
+  if (fSock = nil) or
+     not fProcessing then
+    exit;
+  {$ifdef OSPOSIX} // a broadcast address won't reach DoExecute
+  if (fSockAddr.IP4 and $ff000000) = $ff000000 then // check x.x.x.255
+  begin
+    fSock.ShutdownAndClose({rdwr=}true); // will release acept() ASAP
+    exit;
+  end;
+  {$endif OSPOSIX}
+  sock := fSockAddr.NewSocket(nlUdp);
+  if sock = nil then
+    fLogClass.Add.Log(sllTrace,
+      'TerminateAndWaitFinished: error creating final socket', self)
+  else
+  begin
+    fLogClass.Add.Log(sllTrace,
+      'TerminateAndWaitFinished: send final packet', self);
+    sock.SetSendTimeout(10);
+    sock.SendTo(pointer(UDP_SHUTDOWN), length(UDP_SHUTDOWN), fSockAddr);
+    sock.ShutdownAndClose(false);
+  end;
 end;
 
 function TUdpServerThread.GetIPWithPort: RawUtf8;
@@ -3301,6 +3328,7 @@ begin
   FastAssignNew(fAuthBearer);
   FastAssignNew(fUserAgent);
   fRespStatus := 0;
+  fInContentStream := nil; // paranoid: Prepare() would set it anyway
   fOutContent := '';
   FastAssignNew(fOutContentType);
   FastAssignNew(fOutCustomHeaders);
@@ -3819,6 +3847,12 @@ procedure THttpServerGeneric.SetOnBeforeBody(
   const aEvent: TOnHttpServerBeforeBody);
 begin
   fOnBeforeBody := aEvent;
+end;
+
+procedure THttpServerGeneric.SetOnBodyDownload(
+  const aEvent: TOnHttpServerBodyDownload);
+begin
+  fOnBodyDownload := aEvent;
 end;
 
 procedure THttpServerGeneric.SetOnBeforeRequest(
@@ -4668,7 +4702,8 @@ begin
 end;
 
 function THttpServerSocketGeneric.ComputeRejectBody(
-  var Body: RawByteString; Opaque: Int64; Status: integer): boolean;
+  var Body: RawByteString; Opaque: Int64; Status: integer;
+  const ExtraHeader: RawUtf8): boolean;
 var
   reason: PRawUtf8;
   auth, html: RawUtf8;
@@ -4682,9 +4717,9 @@ begin
             (fAuthorize <> hraNone);
   if result then // don't close the connection but set grWwwAuthenticate
     auth := ComputeWwwAuthenticate(Opaque); // includes #13#10 trailer
-  FormatUtf8('HTTP/1.% % %'#13#10'%' + HTML_CONTENT_TYPE_HEADER +
+  FormatUtf8('HTTP/1.% % %'#13#10'%%' + HTML_CONTENT_TYPE_HEADER +
     #13#10'Content-Length: %'#13#10#13#10'%', [ord(result), status, reason^,
-    auth, length(html), html], RawUtf8(Body));
+    auth, ExtraHeader, length(html), html], RawUtf8(Body));
 end;
 
 
@@ -5145,6 +5180,14 @@ begin
              fServer.Terminated);   // abort e.g. any background SockRecvLn()
 end;
 
+procedure THttpServerSocket.DownloadBody; // properly inlined
+begin
+  if Http.ContentStream = nil then
+    GetBody // default in-memory download into Http.Content
+  else
+    GetBodyStream; // use Http.ContentStream from OnBodyDownload event
+end;
+
 procedure THttpServerSocket.TaskProcess(aCaller: TSynThreadPoolWorkThread);
 var
   freeme: boolean;
@@ -5199,7 +5242,7 @@ begin
             if not (hfConnectionUpgrade in Http.HeaderFlags) and
                not HttpMethodWithNoBody(Method) then
             begin
-              GetBody; // we need to get it now
+              DownloadBody; // we need to get it now
               fServer.IncStat(grBodyReceived);
             end;
             // multi-connection -> process now
@@ -5428,6 +5471,17 @@ begin
           exit;
         end;
       end;
+      // allow OnBodyDownload callback to supply a stream for the body
+      if Assigned(fServer.OnBodyDownload) and
+         not (hfConnectionUpgrade in Http.HeaderFlags) and
+         not HttpMethodWithNoBody(Http.CommandMethod) and
+         ((Http.ContentLength > 0) or
+          (hfTransferChunked in Http.HeaderFlags)) then
+        if not DoOnBodyDownload then
+        begin
+          result := grRejected;
+          exit;
+        end;
     end;
     // implement 'Expect: 100-Continue' Header
     if hfExpect100 in Http.HeaderFlags then
@@ -5439,14 +5493,90 @@ begin
        not (hfConnectionUpgrade in Http.HeaderFlags) then
     begin
       if not HttpMethodWithNoBody(Http.CommandMethod) then
-        GetBody;
+        DownloadBody;
       result := grBodyReceived;
     end
     else
       result := grHeaderReceived;
   except
+    on EHttpSocketOverflow do
+      result := grOversizedPayload; // e.g. chunked body over ContentMaxSize
     on E: Exception do
       result := grException;
+  end;
+end;
+
+function THttpServerSocket.DoOnBodyDownload: boolean;
+var
+  fn: TFileName; // managed local variables are fine in this slow sub-method
+  strm: TStream;
+  len: Int64;
+begin // called from GetRequest() to process OnBodyDownload event
+  result := true;
+  HeadersPrepare(fRemoteIP); // will include remote IP to Http.Headers
+  len := Http.ContentLength;
+  if hfTransferChunked in Http.HeaderFlags then
+    len := -1; // a chunked body size is not known in advance
+  strm := fServer.fOnBodyDownload(Http.CommandUri, Http.CommandMethod,
+    Http.Headers, Http.ContentType, fRemoteIP, len);
+  if strm = nil then
+    exit; // fallback to regular in-memory Content buffering
+  if Http.ContentEncoding <> nil then
+  begin
+    // a streamed body does not support Content-Encoding: compression
+    fn := '';
+    if strm.InheritsFrom(TFileStreamEx) then
+      fn := TFileStreamEx(strm).FileName;
+    strm.Free;
+    if fn <> '' then
+      DeleteFile(fn); // remove the (void) spool file
+    fServer.ComputeRejectBody(Http.Content, 0,
+      HTTP_UNSUPPORTEDMEDIATYPE, 'Accept-Encoding: identity'#13#10);
+    SockSendFlush(Http.Content);
+    result := false;
+  end
+  else
+  begin
+    // the (maybe deferred) DownloadBody will fill this stream
+    Http.ContentStream := strm; // freed by Reset on broken connection
+    include(Http.ResponseFlags, rfContentStreamNeedFree);
+    if strm.InheritsFrom(TFileStreamEx) then
+      Http.SetContentInputName(TFileStreamEx(strm));
+    // needed to track and limit the cumulated chunked body size
+    Http.ContentMaxSize := fServer.MaximumAllowedContentLength;
+  end;
+end;
+
+procedure THttpServerSocket.GetBodyStream;
+begin
+  // download into the stream supplied by the OnBodyDownload event
+  try
+    GetBody(Http.ContentStream);
+    // the stream (and any spool file) remains during the request processing,
+    // as InContentStream - and is released by ProcessDone afterwards
+    Http.ContentInputDone;
+  except
+    on EHttpSocketOverflow do
+    begin
+      // e.g. a chunked body over ContentMaxSize: report 413 before closing
+      Http.ProcessDone; // release the stream + delete any partial spool file
+      fServer.ComputeRejectBody(Http.Content, 0, HTTP_PAYLOADTOOLARGE);
+      SockSendFlush(Http.Content);
+      raise; // the caller will close the connection
+    end;
+    on EStreamError do
+    begin
+      // e.g. ENOSPC when spooling the body: report it before closing
+      Http.ProcessDone; // release the stream + delete any partial spool file
+      fServer.ComputeRejectBody(Http.Content, 0, HTTP_INSUFFICIENTSTORAGE);
+      SockSendFlush(Http.Content);
+      raise; // the caller will close the connection
+    end;
+    on Exception do
+    begin
+      Http.ProcessDone; // release the stream + delete any partial spool file
+      raise;
+    end;
   end;
 end;
 
@@ -5595,7 +5725,7 @@ begin
         // call from TSynThreadPoolTHttpServer -> handle first request
         if not (fBodyRetrieved in fServerSock.fFlags) and
            not HttpMethodWithNoBody(fServerSock.Http.CommandMethod) then
-          fServerSock.GetBody;
+          fServerSock.DownloadBody;
         fServer.Process(fServerSock, ConnectionID, self);
         if (fServer <> nil) and
            fServerSock.KeepAliveClient then
@@ -6241,7 +6371,7 @@ var
       QueryPerformanceMicroSeconds(stop);
       dec(stop, fOwner.fBroadcastStart);
       if stop > 0 then
-        MicroSecToString(stop, us);
+        MicroSecToStringVar(stop, us);
     end;
     fOwner.fLog.Add.Log(sllTrace, 'OnFrameReceived: % % %',
       [remote.IP4Short, txt, us], self);
@@ -7178,7 +7308,8 @@ var
               PartialID := 0;
         end
         else
-          Params.SetStep(wgsAlternateFailedRename, [Partial, ' as ', ToRename]);
+          Params.SetStep(wgsAlternateFailedRename,
+            [Partial, ' as ', ToRename, ' ', OsErrorShort]);
       end;
       if localok then
         fPartials.DoneLocked(Partial, local)
@@ -7255,7 +7386,8 @@ begin
         end;
       end
       else
-        Params.SetStep(wgsAlternateFailedCopyInCache, [Partial, ' into ', local]);
+        Params.SetStep(wgsAlternateFailedCopyInCache,
+          [Partial, ' into ', local, ' ', OsErrorShort]);
     finally
       fFilesSafe.UnLock;
     end;

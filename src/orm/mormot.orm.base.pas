@@ -3364,8 +3364,7 @@ var
 begin
   if P <> nil then
   begin
-    while (P^ <= ' ') and
-          (P^ <> #0) do
+    while P^ in [#1 .. ' '] do
       inc(P);
     if (PInteger(P)^ = NULL_LOW) and
        (P[4] = #0) then
@@ -3528,6 +3527,10 @@ begin
             end;
             W.ReplaceLastComma(')');
           end;
+          // the ORM path is the only one that knows the primary key column,
+          // so it is the only one that can emit a boUpsert clause
+          EncodeInsertSuffix(W, BatchOptions, DB, UpdateIDFieldName,
+            Decoder.DecodedFieldNames, Decoder.FieldCount);
         end;
     else
       EJsonObjectDecoder.RaiseUtf8('EncodeAsSqlPrepared(%)', [ToText(Occasion)^]);
@@ -10526,8 +10529,7 @@ begin
     TOrmTableRowVariantData(Source).VTable.ToDocVariant(r, tmp);
     if AVarType = DocVariantVType then
     begin
-      VarClear(variant(Dest));
-      ZeroFill(@Dest); // avoid GPF
+      ZeroClear(@Dest); // avoid GPF
       TDocVariantData(Dest) := TDocVariantData(tmp);
     end
     else
@@ -10955,7 +10957,7 @@ begin
     begin
       Value[i].Value.Free;
       new.Value := CopyObject(aOrm);
-      Value[i] := new // replace existing or registered ID
+      Value[i] := new; // replace existing or registered ID
     end
     else if CacheAll and
             (i >= 0) then
@@ -11258,15 +11260,11 @@ begin
   info.Json := P;
   if info.Json = nil then
     exit;
-  while (info.Json^ <= ' ') and
-        (info.Json^ <> #0) do
+  while info.Json^ in [#1 .. ' '] do
     inc(info.Json);
   if info.Json^ <> '[' then
     exit;
-  repeat
-    inc(info.Json)
-  until (info.Json^ > ' ') or
-        (info.Json^ = #0);
+  info.Json := IgnoreAndGotoNextNotSpace(info.Json);
   if ID = nil then
     decoded := 0
   else
@@ -11292,10 +11290,7 @@ begin
           exit;
         W.AddNoJsonEscape(Start, info.Json - Start);
         W.AddComma;
-        repeat
-          inc(info.Json)
-        until (info.Json^ > ' ') or
-              (info.Json^ = #0);
+        info.Json := IgnoreAndGotoNextNotSpace(info.Json);
       end;
     if sfoEndWithID in Format then
       decoded := info.GetJsonInt64;
@@ -11313,10 +11308,7 @@ begin
   if EndOfObject <> nil then
     EndOfObject^ := info.Json^;
   if info.Json^ <> #0 then
-    repeat
-      inc(info.Json)
-    until (info.Json^ > ' ') or
-          (info.Json^ = #0);
+    info.Json := IgnoreAndGotoNextNotSpace(info.Json);
   P := info.Json;
 end;
 

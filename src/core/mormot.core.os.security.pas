@@ -2378,7 +2378,11 @@ var
 var
   /// allow half a day margin when checking a Certificate date validity
   // - this global setting is used as default for all our units
+  // - could be set to 0 for strict RFC-style validity, especially for servers
   CERT_DEPRECATION_THRESHOLD: TDateTime = 0.5;
+
+/// check a Certificate date validity using CERT_DEPRECATION_THRESHOLD
+function IsCertValidDate(TimeUtc, NotAfter, NotBefore: TDateTime): boolean;
 
 const
   MD5_LO  = ord('m') + ord('d') shl 8 + ord('5') shl 16;
@@ -2402,15 +2406,6 @@ procedure SymmetricEncrypt(key: PtrUInt; data: PCardinal; len: PtrInt); overload
 { ****************** Windows API Specific Security Types and Functions }
 
 {$ifdef OSWINDOWS}
-
-/// low-level function returning some random binary from the Operating System
-// - POSIX version (using /dev/urandom or /dev/random) is located in mormot.core.os
-// - will call CryptGenRandom API on Windows then return TRUE, or fallback to
-// mormot.core.base gsl_rng_taus2's generator and return FALSE if the API failed
-// - you should not have to call this low-level procedure, but faster and safer
-// TAesPrng from mormot.crypt.core - also consider the TSystemPrng class
-function FillSystemRandom(Buffer: PByteArray; Len: integer;
-  AllowBlocking: boolean): boolean;
 
 /// protect some data for the current user, using Windows DPAPI
 // - the application can specify a secret salt text, which should reflect the
@@ -2571,9 +2566,9 @@ type
   UNICODE_STRING = packed record
     Length: word;
     MaximumLength: word;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
     Buffer: PWideChar;
   end;
 {$A+}
@@ -2615,10 +2610,6 @@ type
     /// decrypts data previously encrypted by using the CryptEncrypt function
     Decrypt: function(hKey: HCRYPTKEY; hHash: HCRYPTHASH; Final: BOOL;
       dwFlags: DWord; pbData: pointer; var pdwDataLen: DWord): BOOL; stdcall;
-    /// fills a buffer with cryptographically random bytes
-    // - since Windows Vista with Service Pack 1 (SP1), an AES counter-mode
-    // based PRNG specified in NIST Special Publication 800-90 is used
-    GenRandom: function(hProv: HCRYPTPROV; dwLen: DWord; pbBuffer: pointer): BOOL; stdcall;
     /// converts a security descriptor to a string format
     ConvertSecurityDescriptorToStringSecurityDescriptorA: function(
       SecurityDescriptor: PSECURITY_DESCRIPTOR; RequestedStringSDRevision: DWord;
@@ -2654,7 +2645,6 @@ const
   CRYPT_MODE_CTS                  = 5;
   HCRYPTPROV_NOTTESTED            = HCRYPTPROV(-1);
   NTE_BAD_KEYSET                  = HRESULT($80090016);
-  BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
 
 var
   /// direct access to the Windows CryptoApi - with late binding
@@ -4176,7 +4166,7 @@ begin
   i := SDDL_WKS_INDEX[k];
   if i <> 0 then
   begin
-    AppendShortTwoChars(@SID_SDDLW[i - 1], @s); // e.g. WD SY
+    AppendShortTwoCharsSafe(SID_SDDLW[i - 1], s); // e.g. WD SY
     exit;
   end
   else if (k = wksNull) and
@@ -4190,7 +4180,7 @@ begin
       i := SDDL_WKR_INDEX[TWellKnownRid(i)];
       if i <> 0 then
       begin
-        AppendShortTwoChars(@SID_SDDLW[i - 1], @s); // e.g. DA DU
+        AppendShortTwoCharsSafe(SID_SDDLW[i - 1], s); // e.g. DA DU
         exit;
       end;
     end
@@ -4311,16 +4301,16 @@ begin
     SddlInitialize;
   i := IntegerScanIndex(@SAR_MASK, length(SAR_MASK), cardinal(mask));
   if i >= 0 then
-    AppendShortTwoChars(@SAR_SDDL[TSecAccessRight(i)][1], @s)
+    AppendShortTwoCharsSafe(PWord(@SAR_SDDL[TSecAccessRight(i)][1])^, s)
   else if mask - samWithSddl <> [] then
   begin
-    AppendShortTwoChars(ord('0') + ord('x') shl 8, @s);  // missing token
+    AppendShortTwoCharsSafe(ord('0') + ord('x') shl 8, s);  // missing token
     AppendShortIntHex(cardinal(mask), s); // stored as @x##### hexadecimal
   end
   else
     for a := low(a) to high(a) do
-      if a in mask then
-        AppendShortTwoChars(@SAM_SDDL[a][1], @s); // store as SDDL pairs
+      if a in mask then // store as SDDL pairs
+        AppendShortTwoCharsSafe(PWord(@SAM_SDDL[a][1])^, s);
 end;
 
 function SddlNextOpaque(var p: PUtf8Char; var ace: TSecAce): TAceTextParse;
@@ -4467,7 +4457,7 @@ begin
     sctInt64:
       if v^.Int.Base <> scbDecimal then // scbOctal does fallback to hexa
       begin
-        AppendShortTwoChars(ord('0') + ord('x') shl 8, @s);
+        AppendShortTwoCharsSafe(ord('0') + ord('x') shl 8, s);
         AppendShortIntHex(v^.Int.Value, s);
       end
       else if v^.Int.Sign = scsNegative then
@@ -4867,7 +4857,7 @@ begin
     AppendShort(SAT_SDDL[AceType], s)
   else
   begin
-    AppendShortTwoChars(ord('0') + ord('x') shl 8, @s);
+    AppendShortTwoCharsSafe(ord('0') + ord('x') shl 8, s);
     AppendShortIntHex(RawType, s); // fallback to lower hex - paranoid
   end;
   AppendShortCharSafe(';', s);
@@ -5912,9 +5902,9 @@ begin
   if SCOPE_P[scope] in Flags then
     AppendShortChar('P', @tmp);
   if SCOPE_AR[scope] in Flags then
-    AppendShortTwoChars(ord('A') + ord('R') shl 8, @tmp);
+    AppendShortTwoCharsSafe(ord('A') + ord('R') shl 8, tmp);
   if SCOPE_AI[scope] in Flags then
-    AppendShortTwoChars(ord('A') + ord('I') shl 8, @tmp);
+    AppendShortTwoCharsSafe(ord('A') + ord('I') shl 8, tmp);
   acl := @Dacl;
   if scope = sasSacl then
     acl := @Sacl;
@@ -6005,12 +5995,12 @@ begin
   tmp[0] := #0;
   if Owner <> '' then
   begin
-    AppendShortTwoChars(ord('O') + ord(':') shl 8, @tmp);
+    AppendShortTwoCharsSafe(ord('O') + ord(':') shl 8, tmp);
     SddlAppendSid(tmp, pointer(Owner), dom);
   end;
   if Group <> '' then
   begin
-    AppendShortTwoChars(ord('G') + ord(':') shl 8, @tmp);
+    AppendShortTwoCharsSafe(ord('G') + ord(':') shl 8, tmp);
     SddlAppendSid(tmp, pointer(Group), dom);
   end;
   sddl.AddShort(tmp);
@@ -7709,6 +7699,16 @@ begin
       end;
 end;
 
+function IsCertValidDate(TimeUtc, NotAfter, NotBefore: TDateTime): boolean;
+begin
+  if TimeUtc = 0 then
+    TimeUtc := NowUtc;
+  result := ((NotAfter <= 0) or
+             (TimeUtc <= NotAfter  + CERT_DEPRECATION_THRESHOLD)) and
+            ((NotBefore <= 0) or
+             (TimeUtc + CERT_DEPRECATION_THRESHOLD >= NotBefore));
+end;
+
 procedure SymmetricEncrypt(key: cardinal; var data: RawByteString);
 begin
   if data = '' then
@@ -7752,7 +7752,7 @@ end;
 
 procedure TWinCryptoApi.Resolve;
 const
-  NAMES: array[0..8] of PAnsiChar = (
+  NAMES: array[0..7] of PAnsiChar = (
     'CryptAcquireContextA',
     'CryptReleaseContext',
     'CryptImportKey',
@@ -7760,7 +7760,6 @@ const
     'CryptDestroyKey',
     'CryptEncrypt',
     'CryptDecrypt',
-    'CryptGenRandom',
     'ConvertSecurityDescriptorToStringSecurityDescriptorA');
 var
   p: PPointer;
@@ -7805,37 +7804,8 @@ begin
   result := true;
 end;
 
-var
-  BCryptApi: THandle;
-  BCryptGenRandom: function(hAlgorithm, pBuffer: pointer;
-    cbBuffer, dwFlags: ULONG): cardinal; stdcall;
-  CryptProv: HCRYPTPROV; // use GenRandom() as XP fallback
 
-function FillSystemRandom(Buffer: PByteArray; Len: integer;
-  AllowBlocking: boolean): boolean;
-begin
-  result := false;
-  if Len <= 0 then
-    exit;
-  if (OSVersion >= wVista) and
-     DelayedProc(BCryptGenRandom, BCryptApi, 'bcrypt.dll', 'BCryptGenRandom') then
-    // use the new Vista+ API
-    result := BCryptGenRandom(nil, Buffer, Len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) = NOERROR;
-  if not result then
-  begin
-    if (CryptProv = nil) and
-       CryptoApi.Available then
-      CryptoApi.AcquireContextA(CryptProv, nil, nil,
-        PROV_RSA_FULL, CRYPT_VERIFYCONTEXT); // initialize once for XP fallback
-    if CryptProv <> nil then
-      result := CryptoApi.GenRandom(CryptProv, Len, Buffer);
-  end;
-  if not result then
-    // OS API call failed -> fallback to our TLecuyer gsl_rng_taus2 generator
-    SharedRandom.Fill(pointer(Buffer), Len)
-  else if Len >= SizeOf(SystemEntropy.LiveFeed) then
-    crcblock(@SystemEntropy.LiveFeed, pointer(Buffer)); // shuffle live state
-end;
+{ Direct Access to Other Security-Related Windows API }
 
 type
   {$ifdef FPC}
@@ -8324,9 +8294,9 @@ type
     Reserved1: array[0..1] of byte;
     BeingDebugged: byte;
     Reserved2: array[0..0] of byte;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align1: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
     Reserved3: array[0..1] of pointer;
     Ldr: PMS_PEB_LDR_DATA;
     ProcessParameters: PMS_RTL_USER_PROCESS_PARAMETERS;
@@ -8334,28 +8304,28 @@ type
     Reserved5: array[0..51] of pointer;
     PostProcessInitRoutine: _PPS_POST_PROCESS_INIT_ROUTINE;
     Reserved6: array[0..127] of byte;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align2: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
     Reserved7: array[0..0] of pointer;
     SessionId: ULONG;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align3: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
   end;
 
   PMS_PROCESS_BASIC_INFORMATION = ^MS_PROCESS_BASIC_INFORMATION;
   MS_PROCESS_BASIC_INFORMATION = packed record
     ExitStatus: integer;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align1: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
     PebBaseAddress: PMS_PEB;
     AffinityMask: PtrUInt;
     BasePriority: integer;
-    {$ifdef CPUX64}
+    {$ifdef CPU64}
     _align2: array[0..3] of byte;
-    {$endif CPUX64}
+    {$endif CPU64}
     UniqueProcessId: PtrUInt;
     InheritedFromUniqueProcessId: PtrUInt;
   end;
@@ -8987,8 +8957,6 @@ end;
 initialization
 
 finalization
-  if CryptProv <> nil then // used as fallback on XP
-    CryptoApi.ReleaseContext(CryptProv, 0);
   RawTokenOpenSafe.Done;
 
 {$endif OSWINDOWS}

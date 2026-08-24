@@ -306,6 +306,7 @@ type
     hrsConnect,
     hrsSendHeaders,
     hrsErrorPayloadTooLarge,
+    hrsErrorContentStreamWrite,
     hrsErrorRejected,
     hrsErrorMisuse,
     hrsErrorUnsupportedRange,
@@ -345,6 +346,7 @@ type
     rfRange,
     rfHttp10,
     rfContentStreamNeedFree,
+    rfContentFileNameNeedDelete,
     rfAsynchronous,
     rfProgressiveStatic);
 
@@ -385,6 +387,7 @@ type
     function ProcessParseLine(var st: TProcessParseLine): boolean;
       {$ifdef HASINLINE} inline; {$endif}
     function DoProcessParseLine(var st: TProcessParseLine; Len: PtrInt): boolean;
+    function DoProcessReadBody(var st: TProcessParseLine): boolean;
     function ParseHttp(P: PUtf8Char): boolean;
       {$ifdef HASINLINE} inline; {$endif}
     procedure GetTrimmed(P, P2: PUtf8Char; L: PtrInt; var result: RawUtf8;
@@ -459,6 +462,28 @@ type
     /// stream-oriented alternative to the Content in-memory buffer
     // - is typically a TFileStreamEx
     ContentStream: TStream;
+    /// the request body stream supplied by TOnHttpServerBodyDownload
+    // - kept aside from ContentStream (which is reused for the response) once
+    // the body has been received, and released by ProcessDone or Reset, i.e.
+    // once the request has been processed - so is available to the handler as
+    // THttpServerRequestAbstract.InContentStream, rewinded if seekable
+    ContentInputStream: TStream;
+    /// local file name of a request body spooled by TOnHttpServerBodyDownload
+    // - is set from ContentInputStream if it is a TFileStreamEx, and supplied
+    // to the handler as InContent, mirroring the STATICFILE response trick
+    // - if rfContentFileNameNeedDelete is set in ResponseFlags, this file is
+    // deleted by ProcessDone or Reset, i.e. once the request has been
+    // processed, unless the handler did rename/move it meanwhile
+    // - a TFileStreamEventuallyDelete does delete the file by itself, so the
+    // rfContentFileNameNeedDelete flag is not set for such a stream
+    ContentInputName: TFileName;
+    /// maximum cumulated size of a chunked body written into ContentStream
+    // - as set e.g. from THttpServerGeneric.MaximumAllowedContentLength when
+    // TOnHttpServerBodyDownload supplied a stream, since - in contrast to a
+    // Content-Length - the final size of a chunked body is not known in
+    // advance, so can not be checked from the headers
+    // - 0 (the default) means no limit
+    ContentMaxSize: Int64;
     /// same as HeaderGetValue('SERVER-INTERNALSTATE'), but retrieved by ParseHeader()
     // - proprietary header, used with our RESTful ORM access
     ServerInternalState: integer;
@@ -548,6 +573,13 @@ type
     // Content/ContentStream/ContentLength/ContentEncoding are manually set
     // - used by THttpClientSocket.Request on custom protocol (e.g. 'file://')
     function ContentToOutput(aStatus: integer; aOutStream: TStream): integer;
+    /// set ContentInputName from a TOnHttpServerBodyDownload spool stream
+    // - and rfContentFileNameNeedDelete, unless the stream deletes it by itself
+    procedure SetContentInputName(aStream: TFileStreamEx);
+    /// move a received TOnHttpServerBodyDownload body into ContentInputStream
+    // - to be called once the body has been fully received, because the
+    // response process will reuse the ContentStream field for its own output
+    procedure ContentInputDone;
     /// should be done when the HTTP Server state machine is done
     // - will check and process hfContentStreamNeedFree flag
     procedure ProcessDone;
@@ -601,6 +633,10 @@ type
   /// exception class raised during HTTP process
   EHttpSocket = class(ESynException);
 
+  /// exception raised when an incoming request body overflows a size limit
+  // - so that the server could return 413 "Payload Too Large" before closing
+  EHttpSocketOverflow = class(EHttpSocket);
+
   /// parent of THttpClientSocket and THttpServerSocket classes
   // - contain properties for implementing HTTP/1.1 using the Socket API
   // - handle chunking of body content
@@ -616,6 +652,9 @@ type
   public
     /// the whole context of the HTTP/1.0 or HTTP/1.1 request
     Http: THttpRequestContext;
+    /// finalize this instance and its Http state
+    // - e.g. free any pending TOnHttpServerBodyDownload stream and spool file
+    destructor Destroy; override;
     /// retrieve the HTTP headers into Headers[] and fill most properties below
     // - with default HeadersUnFiltered=false, only relevant headers are retrieved:
     // use directly the ContentLength/ContentType/ServerInternalState/Upgrade
@@ -769,6 +808,63 @@ type
     aInContentType, aRemoteIP, aBearerToken: RawUtf8; aContentLength: Int64;
     aFlags: THttpServerRequestFlags): cardinal of object;
 
+  /// event handler used by THttpServerGeneric.OnBodyDownload property
+  // - called once the request headers have been parsed (and OnBeforeBody
+  // accepted the request), just before the body is downloaded from the client
+  // - should return a stream instance to receive the incoming request body,
+  // e.g. a TFileStreamEx spooling into a local temporary file, or nil to
+  // fallback to the default in-memory Content buffering
+  // - aContentLength is the incoming Content-Length: header value, or -1 for
+  // a chunked body, whose final size is not known in advance
+  // - returning a stream disables the 1GB in-memory body size limit, so that
+  // huge file uploads can be processed with a constant memory usage: only
+  // THttpServerGeneric.MaximumAllowedContentLength applies (0 = no limit),
+  // which is also enforced on the cumulated size of a chunked body,
+  // rejected as HTTP_PAYLOADTOOLARGE = 413 while it is received
+  // - only a body with a Content-Length: header or chunked Transfer-Encoding
+  // is streamed: the deprecated HTTP/1.0 close-delimited body is not
+  // - the stream is owned by the server, and stays available to the OnRequest
+  // callback as THttpServerRequestAbstract.InContentStream - rewinded to its
+  // beginning if seekable - then is freed once the request has been processed:
+  // a handler should not free it, nor keep any reference past the request
+  // - if the stream is a TFileStreamEx, the request is also supplied with
+  // InContentType set to STATICFILE_CONTENT_TYPE and InContent set to the local
+  // file name (mirroring the response process), and the file is deleted once
+  // the request has been processed - note that the stream is still open while
+  // the handler runs, so on Windows the file needs a sharing mode to be read
+  // back by its name, e.g. TFileStreamEx.Create(fn, fmCreate or fmShareRead),
+  // and can not be renamed/moved from the handler itself, since our FileShare()
+  // never includes FILE_SHARE_DELETE
+  // - to keep the spool file, i.e. as nginx "client_body_in_file_only on" does,
+  // return a TFileStreamEventuallyDelete: this class owns its own file, so the
+  // server won't delete it, and the handler can set its DeleteFileOnDestroy to
+  // false (from InContentStream) to take data ownership and process the file
+  // once the request is done - with a plain TFileStreamEx, the same is achieved
+  // by excluding rfContentFileNameNeedDelete from ConnectionHttp^.ResponseFlags
+  // - any other TStream class (e.g. a TPipeStream to a consumer thread) has no
+  // InContent file name, but is still supplied as InContentStream - beware that
+  // a TPipeStream Write() blocks until its consumer drains the pipe, which on
+  // THttpAsyncServer holds one of the few event loop threads for the whole
+  // upload duration
+  // - a transformation stream which only finalizes its output when released -
+  // e.g. TSynZipCompressor, which flushes and writes its .gz trailer in its
+  // destructor - will complete its own destination only AFTER the request has
+  // been processed, since the stream is released at that point: such a
+  // callback should not expect its destination to be readable from OnRequest
+  // - aInHeaders is the raw headers text, which also includes the 'RemoteIP:'
+  // header on THttpServer, but not (yet) on THttpAsyncServer: use aRemoteIP
+  // - the original Content-Type header is still available from InHeaders
+  // - a compressed body - i.e. with a Content-Encoding: header matching a
+  // registered compression algorithm - can not be streamed, and is rejected
+  // as HTTP_UNSUPPORTEDMEDIATYPE = 415; an unknown/unregistered encoding is
+  // spooled verbatim, exactly as the in-memory process would supply it
+  // - if writing to the stream fails (e.g. on a full disk), the request is
+  // aborted as HTTP_INSUFFICIENTSTORAGE = 507 - notified as best effort,
+  // since the client may still be sending - and the connection is closed
+  // - on a broken connection, the stream is released and any spool file deleted
+  TOnHttpServerBodyDownload = function(const aUrl, aMethod, aInHeaders,
+    aInContentType, aRemoteIP: RawUtf8; aContentLength: Int64): TStream of object;
+
   /// event handler used by THttpServer.Process to send a local file
   // when STATICFILE_CONTENT_TYPE content-type is returned by the service
   // - can be defined e.g. to use NGINX X-Accel-Redirect header
@@ -798,6 +894,7 @@ type
     fOutContentType: RawUtf8;
     fOutCustomHeaders: RawUtf8;
     fInContent: RawByteString;
+    fInContentStream: TStream;
     fOutContent: RawByteString;
     fConnectionID: THttpServerConnectionID;                  // 64-bit
     fConnectionFlags: THttpServerRequestFlags;               // 8-bit
@@ -839,6 +936,19 @@ type
     // - e.g. some GET/POST/PUT JSON data can be specified here
     property InContent: RawByteString
       read fInContent write fInContent;
+    /// the body stream supplied by the TOnHttpServerBodyDownload event
+    // - nil unless this server has an OnBodyDownload event which returned a
+    // TStream for this request: then the body was written into this stream
+    // instead of the InContent memory buffer, and is available here without
+    // any RAM copy - rewinded to its beginning if the stream is seekable
+    // - is owned by the server, and released once the request is processed:
+    // don't free it, and don't keep any reference past this request
+    // - if the stream was a TFileStreamEx, InContent does also contain its
+    // file name and InContentType is STATICFILE_CONTENT_TYPE - note that on
+    // Windows, reading that file by its name requires the stream to have been
+    // created with a sharing mode, e.g. fmCreate or fmShareRead
+    property InContentStream: TStream
+      read fInContentStream;
     /// output parameter to be set to the response message body
     property OutContent: RawByteString
       read fOutContent write fOutContent;
@@ -3362,14 +3472,64 @@ end;
 
 { THttpRequestContext }
 
+procedure THttpRequestContext.SetContentInputName(aStream: TFileStreamEx);
+begin
+  ContentInputName := aStream.FileName;
+  if not aStream.InheritsFrom(TFileStreamEventuallyDelete) then
+    // this stream has no deletion policy of its own: the server owns the file
+    // - note: a TFileStreamEventuallyDelete is left alone even if its
+    // DeleteFileOnDestroy is false, which is how a callback can ask for the
+    // spool file to be kept, as nginx "client_body_in_file_only on" does
+    include(ResponseFlags, rfContentFileNameNeedDelete);
+end;
+
+procedure THttpRequestContext.ContentInputDone;
+begin
+  if not (rfContentStreamNeedFree in ResponseFlags) then
+    exit; // not a server-owned TOnHttpServerBodyDownload input stream
+  ContentInputStream := ContentStream; // released by ProcessDone
+  exclude(ResponseFlags, rfContentStreamNeedFree);
+  ContentStream := nil; // input only: don't interfere with the response
+  if (ContentInputStream <> nil) and
+     not ContentInputStream.InheritsFrom(TStreamWithNoSeek) then
+    // rewind for InContentStream reading - but not e.g. on a TPipeStream,
+    // which is the TStreamWithNoSeek class marking a non-seekable stream
+    try
+      ContentInputStream.Position := 0;
+    except
+      // paranoid: a custom non-seekable TStream is supplied as it is, and
+      // should not abort the request from this TStream-focused method
+    end;
+end;
+
+procedure THttpRequestContext.ProcessDone;
+begin
+  if rfContentStreamNeedFree in ResponseFlags then
+  begin // ensure no leak on (reused) broken connection
+    FreeAndNilSafe(ContentStream);
+    exclude(ResponseFlags, rfContentStreamNeedFree);
+  end;
+  if ContentInputStream <> nil then
+    // a TFileStreamEventuallyDelete does remove its spool file in Destroy
+    FreeAndNilSafe(ContentInputStream);
+  if ContentInputName <> '' then
+  begin
+    if rfContentFileNameNeedDelete in ResponseFlags then
+    begin
+      DeleteFile(ContentInputName); // remove any pending spooled body file
+      exclude(ResponseFlags, rfContentFileNameNeedDelete);
+    end;
+    ContentInputName := '';
+  end;
+end;
+
 procedure THttpRequestContext.Reset;
 begin
   Head.Reset;  // set Len to 0, but keep existing fBuffer
   Process.Reset;
   State := hrsNoStateMachine;
   HeaderFlags := [];
-  if rfContentStreamNeedFree in ResponseFlags then
-    ContentStream.Free; // ensure no leak on (reused) broken connection
+  ProcessDone; // ContentStream.Free + DeleteFile(ContentInputName)
   ResponseFlags := [];
   Options := [];
   HeadCustom := [];
@@ -3390,6 +3550,7 @@ begin
   RangeLength := -1;
   ContentLength := -1; // -1 = no Content-Length: header
   ContentLastModified := 0;
+  ContentMaxSize := 0;
   ContentStream := nil;
   ServerInternalState := 0;
   ContentEncoding := nil;
@@ -3397,13 +3558,14 @@ begin
   ProgressiveID := 0;
   ProgressiveTix := 0;
   fProgressivePosition := 0;
+  fContentLeft := 0; // a body rejected in the middle may have left it <> 0
+  fContentPos := nil; // ProcessInit expects those fields to be 0/nil
 end;
 
 procedure THttpRequestContext.GetTrimmed(P, P2: PUtf8Char; L: PtrInt;
   var result: RawUtf8; nointern: boolean);
 begin
-  while (P^ > #0) and
-        (P^ <= ' ') do
+  while P^ in [#1 .. ' '] do
     inc(P); // trim left
   dec(L, P - P2);
   repeat
@@ -3492,8 +3654,7 @@ begin
       begin
         // 'HOST:'
         inc(P, 5);
-        while (P^ > #0) and
-              (P^ <= ' ') do
+        while P^ in [#1 .. ' '] do
           inc(P); // trim left
         if (fLastHost <> '') and
            (StrComp(pointer(P), pointer(fLastHost)) = 0) then
@@ -3877,6 +4038,8 @@ begin
     State := hrsErrorRejected;
     exit;
   end;
+  if Len + 1 >= st.Len then
+    exit; // half-received #13#10 delimiter: wait for more input
   P := st.P;
   P[Len] := #0;                // replace ending #13 by #0
   if (P[Len + 1] <> #10) or    // HTTP requires #13#10 not #10
@@ -3902,6 +4065,44 @@ begin
   Len := ByteScanIndex(pointer(st.P), st.Len, 13); // fast SSE2 or FPC IndexByte
   result := (PtrUInt(Len) < PtrUInt(st.Len)) and // detect st.Len=0 and/or Len=-1
             DoProcessParseLine(st, Len);         // enough input: sub-function
+end;
+
+function THttpRequestContext.DoProcessReadBody(var st: TProcessParseLine): boolean;
+begin
+  if st.Len < fContentLeft then
+    st.LineLen := st.Len
+  else
+    st.LineLen := fContentLeft;
+  if ContentStream = nil then
+  begin
+    if Content = '' then // we need to allocate the result memory buffer
+    begin
+      if ContentLength > MaxHttpInMemSize then // 1GB in memory max
+      begin
+        State := hrsErrorPayloadTooLarge; // avoid memory overflow
+        result := false;
+        exit;
+      end;
+      fContentPos := FastSetString(RawUtf8(Content), ContentLength);
+    end;
+    MoveFast(st.P^, fContentPos^, st.LineLen);
+    inc(fContentPos, st.LineLen);
+  end
+  else
+    try // sub funct?
+      ContentStream.WriteBuffer(st.P^, st.LineLen);
+    except
+      on EStreamError do
+      begin
+        State := hrsErrorContentStreamWrite; // e.g. ENOSPC -> 507
+        result := false;
+        exit;
+      end;
+    end;
+  inc(st.P, st.LineLen); // consume the body bytes (e.g. for pipelining)
+  dec(st.Len, st.LineLen);
+  dec(fContentLeft, st.LineLen);
+  result := true;
 end;
 
 function THttpRequestContext.ProcessRead(
@@ -3935,8 +4136,11 @@ begin
           else
             // void line: we reached end of headers
             if hfTransferChunked in HeaderFlags then
+            begin
               // process chunked body
-              State := hrsGetBodyChunkedHexFirst
+              ContentLength := 0; // any Content-Length: is ignored when chunked
+              State := hrsGetBodyChunkedHexFirst;
+            end
             else if ContentLength > 0 then // -1 = no Content-Length: header
               // regular process with explicit content-length
               State := hrsGetBodyContentLengthFirst
@@ -3957,6 +4161,12 @@ begin
               State := hrsErrorPayloadTooLarge
             else
             begin
+              if (ContentMaxSize > 0) and
+                 (ContentLength + fContentLeft > ContentMaxSize) then
+              begin
+                State := hrsErrorPayloadTooLarge; // e.g. spool disk overflow
+                break;
+              end;
               if ContentStream = nil then
               begin
                 // reserve appended chunk size to Content memory buffer
@@ -3967,7 +4177,8 @@ begin
                   break;
                 end;
                 SetLength(Content, bytes); // realloc to append new chunk
-                fContentPos := @PByteArray(Content)[length(Content)];
+                // append at the previous end, not after the reallocated buffer
+                fContentPos := @PByteArray(Content)[bytes - fContentLeft];
               end;
               inc(ContentLength, fContentLeft);
               State := hrsGetBodyChunkedData;
@@ -3979,18 +4190,8 @@ begin
           exit; // not enough input or hrsErrorRejected
       hrsGetBodyChunkedData:
         begin
-          if st.Len < fContentLeft then
-            st.LineLen := st.Len
-          else
-            st.LineLen := fContentLeft;
-          if ContentStream <> nil then
-            ContentStream.WriteBuffer(st.P^, st.LineLen)
-          else
-          begin
-            MoveFast(st.P^, fContentPos^, st.LineLen);
-            inc(fContentPos, st.LineLen);
-          end;
-          dec(fContentLeft, st.LineLen);
+          if not DoProcessReadBody(st) then
+            break; // hrsErrorPayloadTooLarge or hrsErrorContentStreamWrite
           if fContentLeft = 0 then
             State := hrsGetBodyChunkedDataVoidLine
           else
@@ -4011,29 +4212,9 @@ begin
         begin
           if fContentLeft = 0 then
             fContentLeft := ContentLength;
-          if st.Len < fContentLeft then
-            st.LineLen := st.Len
-          else
-            st.LineLen := fContentLeft;
-          if ContentStream = nil then
-          begin
-            if Content = '' then // we need to allocate the result memory buffer
-            begin
-              if ContentLength > MaxHttpInMemSize then // 1GB in memory max
-              begin
-                State := hrsErrorPayloadTooLarge; // avoid memory overflow
-                break;
-              end;
-              fContentPos := FastSetString(RawUtf8(Content), ContentLength);
-            end;
-            MoveFast(st.P^, fContentPos^, st.LineLen);
-            inc(fContentPos, st.LineLen);
-          end
-          else
-            ContentStream.WriteBuffer(st.P^, st.LineLen);
+          if not DoProcessReadBody(st) then
+            break; // hrsErrorPayloadTooLarge or hrsErrorContentStreamWrite
           State := hrsGetBodyContentLengthNext;
-          dec(st.Len, st.LineLen);
-          dec(fContentLeft, st.LineLen);
           if fContentLeft = 0 then     // reached end of Content-Length body
             State := hrsWaitProcessing // notice: st.Len<>0 if pipelining
           else
@@ -4294,14 +4475,6 @@ begin
   result := hrpSend;
 end;
 
-procedure THttpRequestContext.ProcessDone;
-begin
-  if not (rfContentStreamNeedFree in ResponseFlags) then
-    exit;
-  FreeAndNilSafe(ContentStream);
-  exclude(ResponseFlags, rfContentStreamNeedFree);
-end;
-
 function THttpRequestContext.ContentFromFile(const FileName: TFileName;
   CompressGz: integer): integer;
 var
@@ -4496,7 +4669,7 @@ var
   chunk: RawUtf8;
   len: PtrInt;
   bytes: Int64;
-  chunksize: array[0..31] of AnsiChar; // 32 bits chunk length in hexa
+  chunksize: TTemp32; // 32 bits chunk length in hexa
 begin
   include(fFlags, fBodyRetrieved);
   Http.Content := '';
@@ -4519,7 +4692,10 @@ begin
         break;      // reached the end of input stream
       end;
       if len > MaxHttpChunkSize then // allow up to 256 MB chunk
-        EHttpSocket.RaiseUtf8('%.GetBody: chunk size=% overflow', [self, len]);
+        EHttpSocketOverflow.RaiseUtf8('%.GetBody: chunk size=% overflow', [self, len]);
+      if (Http.ContentMaxSize > 0) and
+         (Http.ContentLength + len > Http.ContentMaxSize) then
+        EHttpSocketOverflow.RaiseUtf8('%.GetBody: chunked size overflow', [self]);
       if DestStream <> nil then
       begin
         if length({%H-}chunk) < len then
@@ -4613,6 +4789,12 @@ begin
     AppendLine(Http.Headers, ['Content-Type: ', aForcedContentType]);
 end;
 
+destructor THttpSocket.Destroy;
+begin
+  Http.ProcessDone; // e.g. free any pending body download stream / spool file
+  inherited Destroy;
+end;
+
 procedure THttpSocket.HeadersPrepare(const aRemoteIP: RawUtf8);
 begin
   if (aRemoteIP = '') or
@@ -4660,6 +4842,23 @@ begin
     FastAssign(fAuthBearer, aHttp.BearerToken);
   fUserAgent := aHttp.UserAgent;
   fInContent := aHttp.Content;
+  fInContentStream := aHttp.ContentInputStream; // nil if no OnBodyDownload
+  if aHttp.ContentInputName <> '' then
+  begin
+    // the body was spooled into a local file by TOnHttpServerBodyDownload:
+    // supply its name in InContent, mirroring the STATICFILE response trick
+    StringToUtf8(aHttp.ContentInputName, RawUtf8(fInContent));
+    if (fInContentType <> '') and // note: aHttp.ContentType was moved above
+       (FindNameValue(pointer(fInHeaders), 'CONTENT-TYPE:') = nil) then
+      // keep the original type: only 'application/json' is not in the headers
+      AppendLine(fInHeaders, ['Content-Type: ', fInContentType]);
+    fInContentType := STATICFILE_CONTENT_TYPE;
+  end
+  else if PropNameEquals(fInContentType, STATICFILE_CONTENT_TYPE) then
+    // paranoid: '!' is a valid token char, so a client could have sent this
+    // content type by itself - never let InContent be seen as a local file
+    // name by a callback expecting a TOnHttpServerBodyDownload spooled body
+    FastAssignNew(fInContentType);
 end;
 
 procedure THttpServerRequestAbstract.PrepareDirect(
@@ -4674,6 +4873,7 @@ begin
   fInHeaders := aInHeaders;
   fInContentType := aInContentType;
   fInContent := aInContent;
+  fInContentStream := nil; // no OnBodyDownload on this non-HTTP code path
 end;
 
 procedure THttpServerRequestAbstract.AddInHeader(AppendedHeader: RawUtf8);

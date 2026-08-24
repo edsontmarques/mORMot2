@@ -1896,6 +1896,11 @@ type
 implementation
 
 
+{$ifdef FPC} // already part of mormot.defines.inc but seems needed with -O2
+  {$WARN 5093 off} // function result variable of a managed uninitialized 1
+{$endif FPC}
+
+
 { ************* TThreads thread-safe wrapper }
 
 { TThreads }
@@ -2527,7 +2532,7 @@ begin
     fLast := n - 1;
     fValues.Count := NextGrow(n); // allocate with some spare
     siz := fValues.Info.Cache.ItemSize * n;
-    BinaryLoadSeveral(fValues.Value^, fReader,
+    BinaryLoadSeveral(fValues.Value^, fReader^,
       fValues.Info.Cache.ItemInfoManaged, n, siz);
   finally
     fSafe.WriteUnLock;
@@ -4216,7 +4221,7 @@ procedure TNotifiedThread.SetServerThreadsAffinityPerCpu(
 var
   rnd, i: PtrInt;
 begin
-  rnd := CpuThreads;
+  rnd := CpuThreads; // fast sched_getaffinity syscall on Linux
   if (threads = nil) or
      (rnd <= 1) then
     exit;

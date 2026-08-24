@@ -422,7 +422,7 @@ begin
     end;
     if Log <> nil then
       Log.Log(sllDebug, 'Connected to % using % % recognized as %',
-        [DbmsName, DriverName, DbmsVersion, ToText(fDbms)^]);
+        [DbmsName, DriverName, DbmsVersion, DBDEF_TXT[fDbms]]);
     // notify any re-connection
     inherited Connect;
   except
@@ -882,7 +882,7 @@ procedure TSqlDBOdbcStatement.ColumnToJson(Col: integer; W: TJsonWriter);
 var
   p: PSqlDBColumnProperty;
   v: pointer;
-  tmp: array[0..31] of AnsiChar;
+  tmp: TTemp32;
 begin
   if (not Assigned(fStatement)) or
      (CurrentRow <= 0) then
@@ -1375,7 +1375,7 @@ var
   schema, table: RawUtf8;
   stmt: TSqlDBOdbcStatement;
   F: TSqlDBColumnDefine;
-  i, n, datatype: integer;
+  i, n, datatype: integer; // not PtrInt
   status: SqlReturn;
   FA: TDynArray;
 begin
@@ -1607,7 +1607,7 @@ var
   schem, pack, proc: RawUtf8;
   P: TSqlDBProcColumnDefine;
   PA: TDynArray;
-  n, DataType: integer;
+  n, DataType: integer; // not PtrInt
   status: SqlReturn;
   stmt: TSqlDBOdbcStatement;
 begin

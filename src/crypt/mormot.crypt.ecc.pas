@@ -1894,7 +1894,7 @@ const
     128, 128, 128, 128, 128, 128, 128, 128,
     128, 256, 128, 256, 128, 256, 128, 256);
 
-  ECIES_MAGIC: array[0..1] of array[0..15] of AnsiChar = (
+  ECIES_MAGIC: array[0..1] of TTemp16 = (
     'SynEccEncrypted'#26,
     'SynEccEncrypt01'#26);
 
@@ -2181,7 +2181,7 @@ end;
 
 function EccToDer(const sign: TEccSignature): RawByteString;
 var
-  der: array[0..511] of AnsiChar;
+  der: TTemp512;
   len: PtrInt;
 begin
   if IsZero(sign) then
@@ -2198,7 +2198,7 @@ end;
 
 function EccToDer(const priv: TEccPrivateKey): RawByteString;
 var
-  der: array[0..511] of AnsiChar;
+  der: TTemp512;
   len: PtrInt;
 begin
   if IsZero(priv) then
@@ -2214,7 +2214,7 @@ end;
 
 function EccToDer(const pub: TEccPublicKey): RawByteString;
 var
-  der: array[0..511] of AnsiChar;
+  der: TTemp512;
   len: PtrInt;
 begin
   if IsZero(pub) then
@@ -2948,7 +2948,7 @@ end;
 
 const
   // header of a private key binary file
-  PRIVKEY_MAGIC: array[0..15] of AnsiChar =
+  PRIVKEY_MAGIC: TTemp16 =
     'SynEccPrivatKey'#26;
   // 128-bit is enough, since it is transmitted as clear
   PRIVKEY_SALTSIZE = 16;
@@ -5786,7 +5786,7 @@ type
     function GetNotAfter: TDateTime; override;
     function IsValidDate(date: TDateTime): boolean; override;
     function IsVoid: boolean; override;
-    function GetUsage: TCryptCertUsages; override;
+    function GetUsage(PathLen: PInteger): TCryptCertUsages; override;
     function GetPeerInfo: RawUtf8; override;
     function GetSignatureInfo: RawUtf8; override;
     function Load(const Saved: RawByteString; Content: TCryptCertContent;
@@ -6034,12 +6034,14 @@ begin
   result := not fEcc.CheckCRC;
 end;
 
-function TCryptCertInternal.GetUsage: TCryptCertUsages;
+function TCryptCertInternal.GetUsage(PathLen: PInteger): TCryptCertUsages;
 begin
   if fEcc <> nil then
     result := fEcc.GetUsage
   else
     result := [];
+  if PathLen <> nil then
+    PathLen^ := -1; // not supported
 end;
 
 function TCryptCertInternal.GetPeerInfo: RawUtf8;

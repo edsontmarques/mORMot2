@@ -950,7 +950,7 @@ type
     // DHCP v6 Info following (not used by our code)
   end;
 
-  IP_ADDRESS_STRING = array[0..15] of AnsiChar;
+  IP_ADDRESS_STRING = TTemp16;
   IP_ADDR_IP4 = TNetIP4;
 
   IP_ADDR_STRING = packed record
@@ -1521,7 +1521,7 @@ end;
 constructor TWinIocp.Create(processing: integer; options: TWinIocpOptions);
 begin
   if processing = 0 then
-    processing := CpuThreads;
+    processing := SystemInfo.dwNumberOfProcessors; // = CpuThreads
   fIocp := IocpCreate(INVALID_HANDLE_VALUE, 0, nil, processing);
   if fIocp <= 0 then
     RaiseLastError('TWinIocp: CreateIoCompletionPort', EWinIocp);

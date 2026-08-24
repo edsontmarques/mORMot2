@@ -280,7 +280,7 @@ const
 
 {$endif FPC}
 
-  /// maps string/text types in TRttiKind RTTI enumerates, excluding shortstring
+  /// maps string/text types in TRttiKind RTTI enumerates, excluding ShortString
   rkStringTypes =
     [rkLString,
      {$ifdef FPC}
@@ -299,6 +299,9 @@ const
      {$endif HASVARUSTRING}
      rkWString
     ];
+
+  /// maps heap-allocated string types with PStrRec header - not WinAPI BSTR
+  rkStrRecTypes = rkStringTypes {$ifdef OSWINDOWS} - [rkWString] {$endif};
 
   /// maps types with proper TRttiProp.RttiOrd field
   // - i.e. rkOrdinalTypes excluding the 64-bit values
@@ -1911,7 +1914,7 @@ function FastRecordClear(Value: pointer; Info: PRttiInfo): PtrInt;
 procedure RecordClearSeveral(v: PAnsiChar; info: PRttiInfo; n: PtrInt);
 
 /// efficient finalization of successive RawUtf8 items from a (dynamic) array
-procedure StringClearSeveral(v: PPointer; n: PtrInt);
+procedure StringClearSeveral(v: PPointer; n: PtrInt; siz: PtrInt = SizeOf(RawUtf8));
 
 /// low-level finalization of a dynamic array of RawUtf8
 // - faster than RTL Finalize() or setting nil
@@ -3177,11 +3180,11 @@ var
 { ************************ TRttiMap Field Mapping (e.g. DTO/Domain Objects) }
 
 type
-  /// pointer to a TRttiMap reference, for fluid-interface initialization
+  /// pointer to a TRttiMap reference, for fluent-interface initialization
   PRttiMap = ^TRttiMap;
 
   /// customizable field mapping between classes and records
-  // - Init/Map overloaded methods return self to allow proper fluid-calling
+  // - Init/Map overloaded methods return self to allow proper fluent-calling
   // - records should have field-level extended RTTI (since Delphi 2010 / FPC
   // trunk), or have been properly defined with Rtti.RegisterFromText() on
   // oldest Delphi or FPC
@@ -3214,15 +3217,15 @@ type
     // !  map.Init(TypeInfo(TMyRecordA), TypeInfo(TMyRecordB));
     function Init(A, B: PRttiInfo): PRttiMap; overload;
     /// use RTTI field names to map the content
-    // - returns self to continue manual calls to Map() in a fluid interface,
+    // - returns self to continue manual calls to Map() in a fluent interface,
     // e.g. to tune the default mapping made by this method
     function AutoMap: PRttiMap;
     /// map two fields by name
     // - if any field A or B name is '', this field will be ignored
-    // - returns self to continue manual calls to Map() in a fluid interface
+    // - returns self to continue manual calls to Map() in a fluent interface
     function Map(const A, B: RawUtf8): PRttiMap; overload;
     /// map fields by A,B pairs of names
-    // - returns self to continue manual calls to Map() in a fluid interface
+    // - returns self to continue manual calls to Map() in a fluent interface
     function Map(const ABPairs: array of RawUtf8): PRttiMap; overload;
     /// thread-safe copy mapped B fields values into A
     // - A and B are either a TObject instance or a @record pointer, depending
@@ -6792,24 +6795,47 @@ begin
   if fields.Count = 0 then
     exit;
   fin := @RTTI_FINALIZE;
-  repeat
-    f := fields.Fields;
-    i := fields.Count;
+  case fields.Count of
+    0:
+      exit;
+    1: // optimized for a record with a single managed field - especially string
+      begin
+        p := fields.Fields^.{$ifdef HASDIRECTTYPEINFO}TypeInfo{$else}TypeInfoRef^{$endif};
+        if p^.Kind in rkStrRecTypes then
+          StringClearSeveral(pointer(v + fields.Fields^.Offset), n, fields.Size)
+        else
+        begin
+          fin := @fin[p^.Kind];
+          {$ifdef FPC_OLDRTTI}
+          if Assigned(fin) then
+          {$endif FPC_OLDRTTI}
+            repeat
+              TRttiFinalizer(fin)(v + fields.Fields^.Offset, p);
+              inc(v, fields.Size);
+              dec(n);
+            until n = 0;
+        end;
+      end;
+  else // generic case with several managed fields
     repeat
-      p := f^.{$ifdef HASDIRECTTYPEINFO}TypeInfo{$else}TypeInfoRef^{$endif};
-      {$ifdef FPC_OLDRTTI}
-      if Assigned(fin[p^.Kind]) then
-      {$endif FPC_OLDRTTI}
-        fin[p^.Kind](v + f^.Offset, p);
-      inc(f);
-      dec(i);
-    until i = 0;
-    inc(v, fields.Size);
-    dec(n);
-  until n = 0;
+      f := fields.Fields;
+      i := fields.Count;
+      repeat
+        p := f^.{$ifdef HASDIRECTTYPEINFO}TypeInfo{$else}TypeInfoRef^{$endif};
+        {$ifdef FPC_OLDRTTI}
+        if Assigned(fin[p^.Kind]) then
+        {$endif FPC_OLDRTTI}
+          fin[p^.Kind](v + f^.Offset, p);
+        inc(f);
+        dec(i);
+      until i = 0;
+      inc(v, fields.Size);
+      dec(n);
+    until n = 0;
+  end;
 end;
 
-procedure StringClearSeveral(v: PPointer; n: PtrInt);
+procedure StringClearSeveral(v: PPointer; n, siz: PtrInt);
 var
   p: PStrRec;
 begin
@@ -6823,7 +6849,7 @@ begin
          StrCntDecFree(p^.refCnt) then
         FreeMem(p); // works for both rkLString + rkUString
     end;
-    inc(v);
+    inc(PByte(v), siz);
     dec(n);
   until n = 0;
 end;
@@ -7181,7 +7207,7 @@ end;
 
 { RTTI_FINALIZE[] implementation functions }
 
-function _StringClear(V: PPointer; Info: PRttiInfo): PtrInt;
+function _StringClear(V: PPointer; Info: PRttiInfo): PtrInt; {$ifdef OSPOSIX}inline;{$endif}
 var
   p: PStrRec;
 begin
@@ -7199,13 +7225,13 @@ end;
 
 function _WStringClear(V: PWideString; Info: PRttiInfo): PtrInt;
 begin
+  {$ifdef OSWINDOWS}
   if V^ <> '' then
-    {$ifdef FPC}
-    Finalize(V^);
-    {$else}
-    V^ := '';
-    {$endif FPC}
+    V^ := ''; // let RTL call SysFreeString() for this BSTR instance
   result := SizeOf(V^);
+  {$else}
+  result := _StringClear(pointer(V), Info); // PStrRec UnicodeString on OSPOSIX
+  {$endif OSWINDOWS}
 end;
 
 function _VariantClear(V: PVarData; Info: PRttiInfo): PtrInt;
@@ -9033,7 +9059,7 @@ begin
   // set vmtAutoTable slot for efficient Find(TClass) - to be done asap
   vmt := pointer(PAnsiChar(aClass) + vmtAutoTable);
   if vmt^ = nil then
-    PatchCodePtrUInt(pointer(vmt), PtrUInt(self));
+    PatchPointer(pointer(vmt), PtrUInt(self));
   if vmt^ <> self then
     ERttiException.RaiseUtf8(
       '%.SetValueClass(%): vmtAutoTable set to %', [self, aClass, vmt^]);
@@ -9763,20 +9789,14 @@ begin
       // rec: { a,b: integer }
       pt := ptRecord;
       ee := eeCurly;
-      repeat
-        inc(P)
-      until (P^ > ' ') or
-            (P^ = #0);
+      P := IgnoreAndGotoNextNotSpace(P);
     end
     else if P^ = '[' then
     begin
       // arr: [ a,b:integer ]
       pt := ptDynArray;
       ee := eeSquare;
-      repeat
-        inc(P)
-      until (P^ > ' ') or
-            (P^ = #0);
+      P := IgnoreAndGotoNextNotSpace(P);
     end
     else
     begin
@@ -10059,7 +10079,7 @@ var
   k: PRttiCustomListPairs;
   h: PtrUInt;
   p: PPointerArray; // ^TPointerDynArray
-begin
+begin // vmtAuto: 8894966/31321/1265 NOPATCHVMT: 10137568/312233/14624
   {$ifndef NOPATCHVMT}
   if Info^.Kind <> rkClass then
   begin
@@ -10069,14 +10089,14 @@ begin
     // try latest found RTTI for this slot of type definition (very effective)
     result := k^.LastInfo;
     if (result <> nil) and
-       (result.Info = Info) then // happens e.g. 12,612,097 times during tests
+       (result.Info = Info) then // happens 99.6% (96% NOPATCH) during tests
       exit;
     // O(1) hash of the PRttiInfo pointer using RTTI-specific hashing
     h := RttiPointerMix(PtrUInt(Info));
     // try latest found RTTI for this hash slot
     result := k^.LastHash[h];
     if (result <> nil) and
-       (result.Info = Info) then // happens e.g. 1280 times during tests
+       (result.Info = Info) then // happens e.g. 0.35% (3% NOPATCH) during tests
     begin
       k^.LastInfo := result; // for faster lookup next time
       exit; // avoid most ReadLock/ReadUnLock and LockedFind() search
@@ -10087,7 +10107,7 @@ begin
     if p <> nil then
       result := LockedFind(p, @p[PDALen(PAnsiChar(p) - _DALEN)^ + _DAOFF], Info);
     k^.Safe.UnLock;
-    if result <> nil then // happens e.g. around 500 times during tests
+    if result <> nil then // happens e.g. 0.01% 82us (0.14% 494us NOPATCH)
     begin
       k^.LastInfo := result;   // aligned pointers are atomically accessed
       k^.LastHash[h] := result;
@@ -11318,12 +11338,12 @@ begin
   {$ifdef FPC_CPUX64}
   RedirectRtl;
   {$endif FPC_CPUX64}
+  PatchCodeProtectBack; // restore back all RWX sections to the original RX
 end;
 
 
 initialization
   InitializeUnit;
-
 
 end.
 

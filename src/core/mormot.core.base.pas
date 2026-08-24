@@ -584,7 +584,7 @@ type
   {$M-}
 
 type
-  /// 128-bytes aligned shortstring - e.g. for TNetAddr.IPShort()
+  /// 128-bytes aligned ShortString - e.g. for TNetAddr.IPShort()
   TShort127 = string[127];
   PShort127 = ^TShort127;
 
@@ -592,26 +592,26 @@ type
   TShort64 = string[64];
   PShort64 = ^TShort64;
 
-  /// 64-bytes aligned shortstring - e.g. for GetCurrentThreadInfo
+  /// 64-bytes aligned ShortString - e.g. for GetCurrentThreadInfo
   TShort63 = string[63];
   PShort63 = ^TShort63;
 
-  /// 48-bytes aligned shortstring - e.g. for StatusCodeToShort
+  /// 48-bytes aligned ShortString - e.g. for StatusCodeToShort
   TShort47 = string[47];
   PShort47 = ^TShort47;
 
-  /// 40-bytes aligned shortstring - e.g. for THttpDateNowUtc/TShortGuid
+  /// 40-bytes aligned ShortString - e.g. for THttpDateNowUtc/TShortGuid
   TShort39 = string[39];
 
   /// used to serialize up to 128-bit binary as hexadecimal
   TShort32 = string[32];
   PShort32 = ^TShort32;
 
-  /// 32-bytes aligned shortstring - e.g. for SetThreadName
+  /// 32-bytes aligned ShortString - e.g. for SetThreadName
   TShort31 = string[31];
   PShort31 = ^TShort31;
 
-  /// 24-bytes aligned shortstring - e.g. for TwoDigits/ToShort/Int64ToHttpEtag
+  /// 24-bytes aligned ShortString - e.g. for TwoDigits/ToShort/Int64ToHttpEtag
   TShort23 = string[23];
   PShort23 = ^TShort23;
 
@@ -619,7 +619,7 @@ type
   TShort16 = string[16];
   PShort16 = ^TShort16;
 
-  /// 16-bytes aligned shortstring - e.g. for TSynSystemTime.ToTextDateShort
+  /// 16-bytes aligned ShortString - e.g. for TSynSystemTime.ToTextDateShort
   TShort15 = string[15];
   PShort15 = ^TShort15;
 
@@ -627,21 +627,18 @@ type
   TShort8 = string[8];
   PShort8 = ^TShort8;
 
-  /// 8-bytes aligned shortstring - e.g. for WinOsBuild()
+  /// 8-bytes aligned ShortString - e.g. for WinOsBuild()
   TShort7 = string[7];
 
-  /// 4-bytes aligned shortstring - e.g. as efficient array[] constants
+  /// 4-bytes aligned ShortString - e.g. as efficient array[] constants
   TShort3 = string[3];
 
-  /// shortstring used to store none or one character
+  /// ShortString used to store none or one character
   TShort1 = string[1];
 
   /// stack-allocated ASCII string, for mormot.core.text GuidToShort() function
   TShortGuid = TShort39;
   PShortGuid = ^TShortGuid;
-
-  /// internal temporary buffer on stack used e.g. by StrInt32() or StrInt64()
-  TTemp24 = array[0..23] of AnsiChar;
 
   /// cross-compiler type used for string length
   // - FPC uses PtrInt/SizeInt, Delphi uses 32-bit integer even on CPU64 (!)
@@ -798,6 +795,9 @@ const
   // - even if a dynamic array can handle PtrInt length, consider other patterns
   _DAMAXSIZE = (800 shl 20) - 1;
 
+  /// cross-compiler refCnt for a constant string or dynamic array instance
+  _REFCNTCONST = -1;
+
 /// like SetLength() but without any memory resize - WARNING: len should be > 0
 procedure DynArrayFakeLength(arr: pointer; len: TDALen);
   {$ifdef HASINLINE} inline; {$endif}
@@ -846,6 +846,7 @@ const
   OPTI_32    = ord('O') + ord('P') shl 8 + ord('T') shl 16 + ord('I') shl 24;
   NONE_32    = ord('N') + ord('O') shl 8 + ord('N') shl 16 + ord('E') shl 24;
   NOT_32     = ord('N') + ord('O') shl 8 + ord('T') shl 16 + ord(' ') shl 24;
+  TEXT32     = ord('t') + ord('e') shl 8 + ord('x') shl 16 + ord('t') shl 24;
   SLASH_16   = ord('/') + ord('/') shl 8;
   SLBEG_16   = ord('/') + ord('*') shl 8;
   SLEND_16   = ord('*') + ord('/') shl 8;
@@ -971,6 +972,14 @@ procedure FastSetStrRec(var Rec: TStrRec; const Len: TStrLen; const RefCnt: TStr
 /// fill a RawUtf8 constant with up to 7 chars of UTF-8 content
 function FastSetConst(var S; var Rec: TStrRecConst; P: pointer; Len: TStrLen): PUtf8Char;
 
+/// prepare a RawByteString to pre-allocate several constant RawUtf8 values
+// - see ReadSymbol() in mormot.core.log for an usage sample
+function StrRecAlloc(var temp: RawByteString; count, size: PtrInt): PStrRec;
+
+/// append a new RawUtf8 to a StrRecAlloc() pre-allocate array
+function StrRecNew(U: PPointer; sr: PStrRec; P: pointer; const len: PtrInt): PStrRec;
+  {$ifdef HASINLINE}inline;{$endif}
+
 /// ensure the supplied variable will have a CP_UTF8 code page
 // - making it unique if needed
 procedure EnsureRawUtf8(var s: RawByteString); overload;
@@ -1058,67 +1067,71 @@ procedure ShortStringToAnsi7String(const source: ShortString; var result: RawUtf
 procedure Ansi7StringToShortString(const source: RawUtf8; var result: ShortString);
   {$ifdef FPC}inline;{$endif}
 
-/// shortstring concatenation of a 32-bit unsigned integer as text
+/// ShortString concatenation of a 32-bit unsigned integer as text
 procedure AppendShortCardinal(value: cardinal; var dest: ShortString);
 
-/// shortstring concatenation of a 8-bit unsigned integer as text
+/// ShortString concatenation of a 8-bit unsigned integer as text
 procedure AppendShortByte(value: PtrUInt; dest: PAnsiChar);
 
-/// shortstring concatenation of a signed 64-bit integer as text
+/// ShortString concatenation of a signed 64-bit integer as text
 procedure AppendShortInt64(const value: Int64; var dest: ShortString);
 
-/// shortstring concatenation of an unsigned 64-bit integer as text
+/// ShortString concatenation of an unsigned 64-bit integer as text
 procedure AppendShortQWord(const value: QWord; var dest: ShortString);
 
-/// shortstring concatenation of INTEGER Curr64 (value*10000)
+/// ShortString concatenation of INTEGER Curr64 (value*10000)
 // - will emit 0, 2 or 4 decimals in the output text (e.g. '1', '1.23', '1.2345')
 procedure AppendShortCurr64(const value: Int64; var dest: ShortString;
   fixeddecimals: PtrInt = 0);
 
-/// shortstring concatenation of no banker rounding floating point value as TwoDigits()
+/// ShortString concatenation of no banker rounding floating point value as TwoDigits()
 procedure AppendShortTwoDigits(const Value: double; var Dest: ShortString);
 
-/// shortstring concatenation of a character into a @shorstring, checking its length
-// - dest is @shortstring and not shortstring to circumvent a Delphi inlining bug
+/// ShortString concatenation of a character into a @shorstring, checking its length
+// - dest is @ShortString and not ShortString to circumvent a Delphi inlining bug
 procedure AppendShortCharSafe(chr: AnsiChar; var dest: ShortString);
   {$ifdef FPC} inline; {$endif}
 
-/// shortstring concatenation of a character into a @shorstring
-// - dest is @shortstring and not shortstring to circumvent a Delphi inlining bug
+/// ShortString concatenation of a character into a @shorstring
+// - dest is @ShortString and not ShortString to circumvent a Delphi inlining bug
 procedure AppendShortChar(chr: AnsiChar; dest: PAnsiChar);
   {$ifdef HASINLINE} inline; {$endif}
 
-/// shortstring concatenation of two characters into a @shorstring
-// - dest is @shortstring and not shortstring to circumvent a Delphi inlining bug
+/// ShortString concatenation of two characters into a @shorstring
+// - dest is @ShortString and not ShortString to circumvent a Delphi inlining bug
 procedure AppendShortTwoChars(twochars, dest: PAnsiChar); overload;
   {$ifdef HASINLINE} inline; {$endif}
 
-/// shortstring concatenation of two characters (as 16-bit integer) into a @shorstring
-// - dest is @shortstring and not shortstring to circumvent a Delphi inlining bug
+/// ShortString concatenation of two characters (as 16-bit integer) into a @shorstring
+// - dest is @ShortString and not ShortString to circumvent a Delphi inlining bug
 procedure AppendShortTwoChars(twochars: cardinal; dest: PAnsiChar); overload;
   {$ifdef HASINLINE} inline; {$endif}
 
-/// shortstring concatenation of a #0 ending text into a @shorstring
-// - dest is @shortstring and not shortstring to circumvent a Delphi inlining bug
+/// ShortString concatenation of two characters (as 16-bit integer) into a shorstring
+procedure AppendShortTwoCharsSafe(twochars: cardinal; var dest: ShortString);
+  {$ifdef FPC} inline; {$endif}
+
+/// ShortString concatenation of a #0 ending text into a @shorstring
+// - dest is @ShortString and not ShortString to circumvent a Delphi inlining bug
 procedure AppendShortBuffer(buf: PAnsiChar; len, max: PtrInt; dest: PAnsiChar);
   {$ifdef HASINLINE} inline; {$endif}
 
-/// shortstring concatenation of hexadecimal binary buffer
+/// ShortString concatenation of hexadecimal binary buffer
 procedure AppendShortHex(value: PByte; len: PtrInt; var dest: ShortString);
 
-/// shortstring concatenation of an integer as lowercase hexadecimal
+/// ShortString concatenation of an integer as lowercase hexadecimal
 procedure AppendShortIntHex(value: Int64; var dest: ShortString);
 
-/// shortstring concatenation of a byte as uppercase hexadecimal
+/// ShortString concatenation of a byte as uppercase hexadecimal
 procedure AppendShortByteHex(value: PtrUInt; var dest: ShortString);
 
-/// shortstring concatenation of a ShortString text
+/// ShortString concatenation of a ShortString text
 procedure AppendShort(const src: ShortString; var dest: ShortString);
 
-/// shortstring concatenation of an ANSI-7 AnsiString
+/// ShortString concatenation of an ANSI-7 AnsiString
 procedure AppendShortAnsi7String(const buf: RawByteString; var dest: ShortString);
 
-/// shortstring concatenation of TDateTime as 'yyyy-mm-dd hh:nn:ss' text
+/// ShortString concatenation of TDateTime as 'yyyy-mm-dd hh:nn:ss' text
 procedure AppendShortDateTime(const dt: TDateTime; var dest: ShortString);
 
 /// simple concatenation of a text buffer into a RawUtf8
@@ -1594,7 +1607,7 @@ function StrUInt64(P: PAnsiChar; const val: QWord): PAnsiChar;
 // - is called by Curr64ToPChar() and Curr64ToStr() functions
 function StrCurr64(P: PAnsiChar; const Value: Int64): PAnsiChar;
 
-/// fast convert an Int64 value into a temporary shortstring on stack
+/// fast convert an Int64 value into a temporary ShortString on stack
 function ToShort(const val: Int64): TShort23;
 
 /// fast convert an unsigned value into a string[>=23] variable
@@ -2049,6 +2062,14 @@ function FromU64(const Values: array of QWord): TQWordDynArray;
 
 /// internal function called e.g. by DeleteWord/DeleteInteger/DeleteInt64
 procedure UnmanagedDynArrayDelete(var v; Count, Index, ItemSize: PtrUInt);
+
+/// prepare a RawByteString to pre-allocate several constant dynamic array values
+// - see TDebugFile.LoadMab in mormot.core.log for an usage sample
+function DARecAlloc(var temp: RawByteString; count, size: PtrInt): PDynArrayRec;
+
+/// append a new RawUtf8 to a StrRecAlloc() pre-allocate array
+function DARecNew(A: PPointer; da: PDynArrayRec; P: pointer; const len: PtrInt): PDynArrayRec;
+  {$ifdef HASINLINE}inline;{$endif}
 
 type
   /// used to store and retrieve Words in a sorted array
@@ -2820,6 +2841,7 @@ type
   // - Intel introduced a Level 4 cache (eDRAM) with some Haswell/Iris CPUs
   // - only Unified or Data caches are included (not Instruction or Trace)
   // - note: some CPU - like the Apple M1 - have 128 bytes of LineSize
+  // - warning: WinArm may put wrong values into Size - typically 64
   TCpuCaches = array[1 .. 4] of record
     Count, Size, LineSize: cardinal;
   end;
@@ -2979,7 +3001,7 @@ function IntelAvx10: cardinal;
 /// compute 32-bit random number generated by modern Intel CPU hardware
 // - using NIST SP 800-90A and FIPS 140-2 compliant RDRAND Intel x86/x64 opcode
 // - caller should ensure that cfSSE42 is included in CpuFeatures flags
-// - consider XorEntropy() or XorOsEntropy() which offer additional sources
+// - consider TAesPrng.GetEntropy() from mormot.crypt.core instead
 function RdRand32: cardinal; overload;
 
 /// XOR a memory buffer with some random generated by modern Intel CPU
@@ -3047,6 +3069,13 @@ procedure LockedInc64(int64: PInt64); inline;
 // - used e.g. as thread-safe atomic operation for TLightLock/TRWLock
 // - Target should be aligned, which is the case when defined as a class field
 function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
+  {$ifndef ASMINTEL} inline; {$endif}
+
+/// fast atomic compare-and-swap operation on a 32-bit integer value
+// - via Intel/AMD custom asm or FPC RTL InterlockedCompareExchange(pointer)
+// - true if Target was equal to Comparand, and Target set to NewValue
+// - Target should be aligned, which is the case when defined as a class field
+function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
   {$ifndef ASMINTEL} inline; {$endif}
 
 /// fast atomic addition operation on a pointer-sized integer value
@@ -3254,7 +3283,7 @@ function CompareMemFixed(P1, P2: pointer; Length: PtrInt): boolean;
 function CompareMemSmall(P1, P2: pointer; Length: PtrInt): boolean;
   {$ifdef HASINLINE}inline;{$endif}
 
-/// a CompareMem()-like function designed for comparison with a small shortstring
+/// a CompareMem()-like function designed for comparison with a small ShortString
 function CompareShort(P1: pointer; const P2: ShortString): boolean;
   {$ifdef HASINLINE}inline;{$endif}
 
@@ -3478,6 +3507,7 @@ type
     // function with the same entropy again WON'T seed the generator with the same
     // sequence (as with RTL's RandomSeed function), but initiate a new one
     // - calls XorEntropy(), so OS API and RdRand32/Rdtsc opcodes on Intel/AMD
+    // - entropy is accumulated as forward secrecy via global BaseEntropy[]
     procedure Seed(entropy: PByteArray = nil; entropylen: PtrInt = 0);
     /// force a well-defined seed of the generator from a fixed initial point
     // - to be called before Next/Fill to generate the very same output
@@ -3514,25 +3544,28 @@ procedure LecuyerEncrypt(key: Qword; var data: RawByteString);
 /// use a gsl_rng_taus2 generator to diffuse 128-bit into any output size
 procedure LecuyerDiffusion(dest: pointer; destsize: PtrUInt; src: PHash128);
 
-/// retrieve 512-bit of entropy, as used to seed our gsl_rng_taus2 TLecuyer
+/// retrieve some entropy bits, as used to seed our gsl_rng_taus2 TLecuyer
 // - XOR _Fill256FromOs() then ThreadID and RdRand32/Rdtsc on Intel/AMD
-// - the resulting output is expected to contain at least 88-bit of true
-// entropy, and is to be hashed - e.g. with DefaultHasher128() by TLecuyer.Seed
-// - execution is fast and safe, but not secure enough for a cryptographic PRNG:
-// TAesPrng.GetEntropy will call it as one of its entropy sources, in addition
-// to the more complete mormot.core.os.pas' XorOSEntropy() function
+// - the resulting output is expected to be hashed - e.g. with DefaultHasher128()
+// by TLecuyer.Seed or as part of TAesPrng.GetEntropy SHAKE-256 absorption -
+// and to be accumulated by storing the previous state for forward secrecy
+// - execution is fast and safe, but real entropy varies a lot from the system:
+// more than 128-bit on Windows, Linux or Intel/AMD, but only 30-bit on
+// macOS/BSD without Intel/AMD - and entropy is not cumulative between calls
+// - consider TAesPrng.GetEntropy() from mormot.crypt.core instead
 procedure XorEntropy(var e: THash512Rec);
 
 var
   /// 512-bit filled at startup from Intel cpuid/rdtsc/rdrand and/or Linux auxv
   // - is likely to be weak (but not void) on BSD/Mac ARM just after start
-  // - used and updated in-place by TLecuyer.Seed for its forward secrecy
+  // - accumulated in-place by TLecuyer.Seed for its forward secrecy
   BaseEntropy: THash512Rec;
 
-  /// internal stub used by XorEntropy() to quickly get 256-bit of OS entropy
-  // - this default unit with call sysutils.CreateGuid() twice - fine on Windows
-  // - mormot.core.os.posix.inc will override it to properly call fast OS APIs
-  // - consider rather XorEntropy() XorOSEntropy() or TAesPrng.GetEntropy()
+  /// internal stub used by XorEntropy() to quickly get 256-bit of OS state
+  // - warning: this provides some system-derived unpredictable state, not real
+  // OS entropy - consider TAesPrng.GetEntropy() from mormot.crypt.core instead
+  // - Windows CoCreateGuid returns at least 122-bit, Linux modern getrandom
+  // syscall 256-bit, but fallback to raw POSIX clocks may be less than 30-bit
   _Fill256FromOs: procedure(out e: THash256Rec);
 
 /// convert the endianness of a given unsigned 16-bit integer
@@ -3639,6 +3672,16 @@ function EventEquals(const eventA, eventB): boolean;
 { ************ Buffers (e.g. Hashing and SynLZ compression) Raw Functions }
 
 type
+  // internal temporary buffers on stack used e.g. by StrInt32() or StrInt64()
+  TTemp2   = array[0..1] of AnsiChar;
+  TTemp4   = array[0..3] of AnsiChar;
+  TTemp8   = array[0..7] of AnsiChar;
+  TTemp16  = array[0..15] of AnsiChar;
+  TTemp24  = array[0..23] of AnsiChar;
+  TTemp32  = array[0..31] of AnsiChar;
+  TTemp64  = array[0..63] of AnsiChar;
+  TTemp512 = array[0..511] of AnsiChar;
+
   /// define a buffer of 1KB of data
   TBuffer1K = array[0 .. pred(1 shl 10)] of AnsiChar;
   /// define a buffer of 2KB of data
@@ -3653,6 +3696,11 @@ type
   TBuffer64K = array[word] of AnsiChar;
   /// define a buffer of 128KB of data
   TBuffer128K = array[0 .. pred(128 shl 10)] of AnsiChar;
+
+  /// define a buffer of 1024 WideChar
+  TWide1K = array[0 .. pred(1 shl 10)] of WideChar;
+  /// define a buffer of 4096 WideChar
+  TWide4K = array[0 .. pred(4 shl 10)] of WideChar;
 
   /// implements a 4KB stack-based storage of some (UTF-8 or binary) content
   // - could be used e.g. to make a temporary copy when JSON is parsed in-place
@@ -4278,6 +4326,9 @@ var
 procedure VarClear(var v: variant); inline;
 {$endif HASINLINE}
 
+/// calls VarClear(v[]) on all supplied variant pointers
+procedure VarClearSeveral(const v: array of PVariant);
+
 /// overloaded function which can be properly inlined to clear a variant
 procedure VarClearAndSetType(var v: variant; vtype: integer);
   {$ifdef HASINLINE}inline;{$endif}
@@ -4510,7 +4561,7 @@ function SortDynArrayUnicodeString(const A, B): integer;
 // - the expected string type is the RTL string
 function SortDynArrayString(const A, B): integer;
 
-/// compare two "array of shortstring" elements, with case sensitivity
+/// compare two "array of ShortString" elements, with case sensitivity
 function SortDynArrayShortString(const A, B): integer;
 
 /// compare two "array of variant" elements, with case sensitivity
@@ -4846,6 +4897,22 @@ begin
     TSynVarData(v).VType := 0;
 end;
 {$endif HASINLINE}
+
+procedure VarClearSeveral(const v: array of PVariant);
+var
+  i: PtrInt;
+  p: ^PSynVarData;
+begin
+  p := @v[0];
+  for i := 0 to high(v) do
+  begin
+    if (p^.VType and VTYPE_STATIC) <> 0 then
+      VarClearProc(p^.Data)
+    else
+      p^.VType := 0;
+    inc(p);
+  end;
+end;
 
 {$ifdef CPUARM}
 function ToByte(value: cardinal): cardinal;
@@ -5375,12 +5442,27 @@ end;
 
 function FastSetConst(var S; var Rec: TStrRecConst; P: pointer; Len: TStrLen): PUtf8Char;
 begin
-  FastSetStrRec(Rec.Header, Len, -1);
+  FastSetStrRec(Rec.Header, Len, _REFCNTCONST);
   result := @Rec.TextLo;
   if P <> nil then
     PInt64(result)^ := PInt64(P)^; // up to 7 chars
   result[Len] := #0;
   pointer(S) := result;
+end;
+
+function StrRecAlloc(var temp: RawByteString; count, size: PtrInt): PStrRec;
+begin
+  result := FastNewRawByteString(temp, count * (SizeOf(result^) + 1) + size);
+end;
+
+function StrRecNew(U: PPointer; sr: PStrRec; P: pointer; const len: PtrInt): PStrRec;
+begin
+  FastSetStrRec(sr^, len, _REFCNTCONST);
+  inc(sr);
+  U^ := sr;
+  MoveFast(P^, sr^, len);
+  PAnsiChar(sr)[len] := #0;
+  result := pointer(@PAnsiChar(sr)[len + 1]);
 end;
 
 {$ifdef HASVARUSTRING}
@@ -5557,8 +5639,6 @@ end;
 
 procedure AppendShortTwoChars(twochars, dest: PAnsiChar);
 begin
-  if dest[0] >= #254 then
-    exit;
   PWord(dest + ord(dest[0]) + 1)^ := PWord(twochars)^;
   inc(dest[0], 2);
 end;
@@ -5567,6 +5647,17 @@ procedure AppendShortTwoChars(twochars: cardinal; dest: PAnsiChar);
 begin
   PWord(dest + ord(dest[0]) + 1)^ := twochars;
   inc(dest[0], 2);
+end;
+
+procedure AppendShortTwoCharsSafe(twochars: cardinal; var dest: ShortString);
+var
+  l: PtrInt;
+begin
+  l := ord(dest[0]) + 1;
+  if l >= high(dest) then
+    exit;
+  inc(dest[0], 2);
+  PWord(PAnsiChar(@dest) + l)^ := twochars;
 end;
 
 procedure AppendShortBuffer(buf: PAnsiChar; len, max: PtrInt; dest: PAnsiChar);
@@ -5595,8 +5686,8 @@ begin
 end;
 
 const
-  HexCharsUpper: array[0..15] of AnsiChar = '0123456789ABCDEF';
-  HexCharsLower: array[0..15] of AnsiChar = '0123456789abcdef';
+  HexCharsUpper: TTemp16 = '0123456789ABCDEF';
+  HexCharsLower: TTemp16 = '0123456789abcdef';
 
 procedure AppendShortByteHex(value: PtrUInt; var dest: ShortString);
 var
@@ -5688,7 +5779,7 @@ end;
 procedure AppendShortCurr64(const value: Int64; var dest: ShortString;
   fixeddecimals: PtrInt);
 var
-  tmp: array[0..31] of AnsiChar;
+  tmp: TTemp32;
   p: PAnsiChar;
   l: PtrInt;
 begin
@@ -6511,8 +6602,7 @@ begin
   result := 0;
   if P = nil then
     exit;
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P);
   c := byte(P^) - 48;
   if c > 9 then
@@ -6543,8 +6633,7 @@ begin
   result := 0;
   if P = nil then
     exit;
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P);
   if P^ = '-' then
   begin
@@ -6598,8 +6687,7 @@ begin
   result := 0;
   if P = nil then
     exit;
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P);
   if P^ = '+' then
     repeat
@@ -6697,8 +6785,7 @@ begin
   result := 0;
   if P = nil then
     exit;
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P);
   if P^ = '-' then
   begin
@@ -6771,8 +6858,7 @@ begin
   result := 0;
   if P = nil then
     exit;
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P);
   inc(err);
   r32 := byte(P^) - 48;
@@ -7306,6 +7392,21 @@ begin // ensured (Last > 0) and (Index <= Last) and made Finalize(Values[Index])
   //FillCharFast(p[Last * ValueSize], ValueSize, 0); // not needed: dec(length)
 end;
 
+function DARecAlloc(var temp: RawByteString; count, size: PtrInt): PDynArrayRec;
+begin
+  result := FastNewRawByteString(temp, count * SizeOf(result^) + size);
+end;
+
+function DARecNew(A: PPointer; da: PDynArrayRec; P: pointer; const len: PtrInt): PDynArrayRec;
+begin
+  da^.length := len;
+  da^.refCnt := _REFCNTCONST;
+  inc(da);
+  A^ := da;
+  MoveFast(P^, da^, len);
+  result := pointer(@PAnsiChar(da)[len]);
+end;
+
 {$ifdef FPC} // some FPC-specific low-level code due to diverse compiler or RTL
 
 // redirect to FPC compilerproc - maybe patched by mormot.core.rtti.fpc.inc
@@ -7545,7 +7646,8 @@ var
   n: PtrInt;
 begin
   dec(old);
-  dec(old^.refCnt);
+  if old^.refCnt > 0 then
+    dec(old^.refCnt);
   n := (old^.length * ItemSize) + SizeOf(new^);
   new := AllocMem(n);
   MoveFast(old^, new^, n); // copy header + all ordinal values
@@ -10327,16 +10429,12 @@ end;
 
 {$ifdef OSWINDOWS} // not defined in the Delphi RTL but in its Windows unit :(
 function GetCurrentThreadId: PtrUInt; stdcall; external 'kernel32';
-function CoCreateGuid(var h: THash128): PtrUInt; stdcall; external 'ole32.dll';
-{$ifndef CPUINTEL} // always available on WinARM but not defined in Delphi RTL
-function GetTickCount64: UInt64; stdcall; external 'kernel32';
-{$endif CPUINTEL}
-
+function CoCreateGuid(var h: THash128Rec): PtrUInt; stdcall; external 'ole32.dll';
 procedure __Fill256FromOs(out e: THash256Rec);
 begin
-  CoCreateGuid(e.Lo); // fast but not CSPRNG
-  CoCreateGuid(e.Hi);
-end;
+  CoCreateGuid(e.l); // 122-bit of entropy from Windows CSPRNG
+  CoCreateGuid(e.h);
+end; // seldom called: RtlGenRandom/SystemFunction036 is not worth it
 {$else}
 {$ifdef OSDARWIN} // lighter than sysutil's fpgettimeofday(), and in nanoseconds
 function GetTickCount64: UInt64; cdecl external 'c' name 'mach_absolute_time';
@@ -10346,7 +10444,7 @@ begin
   {$ifdef FPC}
   e.q[0] := GetTickCount64;         // always available in FPC RTL
   {$else}
-  PDouble(@e)^ := Now;              // good enough as Delphi POSIX  fallback
+  PDouble(@e)^ := Now;              // good enough Delphi POSIX fallback
   {$endif FPC}
   crc256c(@e, SizeOf(e.q[0]), e.b); // weak but not void
 end; // mormot.core.os.posix.inc overrides to use OS API - but not /dev/urandom
@@ -10356,13 +10454,14 @@ procedure XorEntropy(var e: THash512Rec);
 var
   tmp: THash256Rec;  // keep existing (custom) entropy in e
 begin
-  _Fill256FromOs(tmp);              // fast 256-bit entropy from OS APIs
+  _Fill256FromOs(tmp); // 256-bit of OS-derived unpredictable state
   XorMemory(e.r[0], tmp.l);
   XorMemory(e.r[1], tmp.h);
   e.r[2].L := e.r[2].L xor PtrUInt(@tmp) xor tmp.d3; // stack address
   e.r[2].H := e.r[2].H xor tmp.d2 xor PtrUInt(       // thread ID
     {$ifdef POSIXDELPHI} MainThreadID {$else} GetCurrentThreadId {$endif});
   {$ifdef ASMINTEL}
+  // Intel/AMD RDRAND may add 128-bit and RDTSC add 30-bit of entropy
   if cfTSC in CpuFeatures then      // may trigger GPF if CR4.TSD bit is set
     tmp.d0 := tmp.d0 xor Rdtsc;     // 64-bit CPU cycles
   RdRand32(@tmp.l, 4);              // xor 128-bit HW CSPRNG: no-op if no SSE42
@@ -10372,6 +10471,7 @@ begin
   {$ifdef FPC} e.r[2].L := e.r[2].L xor sysutils.GetTickCount64; {$endif FPC}
   {$endif ASMINTEL}
   crcblock(@e.r[3], @tmp.l);        // crc32c 128-bit diffusion
+  FillZero(tmp.b);                  // anti-forensic
 end; // note: RTL Random() not used because it is not thread-safe nor consistent
 
 procedure AdjustShortStringFromRandom(dest: PByteArray; size: PtrUInt);
@@ -10383,7 +10483,7 @@ begin
   if size = 31 then
     size := len and 31  // optimized for FillShort31()
   else if size = 255 then
-    size := ToByte(len) // optimized for shortstring
+    size := ToByte(len) // optimized for ShortString
   else
     size := len mod size;
   dest[0] := size;
@@ -11224,6 +11324,12 @@ function LockedExc(var Target: PtrUInt; NewValue, Comperand: PtrUInt): boolean;
 begin
   result := {$ifdef ISDELPHI}AtomicCmpExchange{$else}InterlockedCompareExchange{$endif}(
     pointer(Target), pointer(NewValue), pointer(Comperand)) = pointer(Comperand);
+end;
+
+function LockedExc32(var Target: cardinal; NewValue, Comperand: cardinal): boolean;
+begin
+  result := {$ifdef ISDELPHI}AtomicCmpExchange{$else}InterlockedCompareExchange{$endif}(
+    Target, NewValue, Comperand) = Comperand;
 end;
 
 procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
