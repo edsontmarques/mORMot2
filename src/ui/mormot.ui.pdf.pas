@@ -657,7 +657,7 @@ type
     fDestStreamPosition: integer;
     fAddGlyphFont: (fNone, fMain, fFallBack);
     fDoc: TPdfDocument;
-    fTmp: array[0..511] of AnsiChar;
+    fTmp: TTemp512;
     /// internal Ansi->Unicode conversion, using the CodePage used in Create()
     // - returned Dest.len is in WideChar count, not in bytes
     // - caller must release the returned memory via Dest.Done
@@ -3152,7 +3152,7 @@ begin
   DecodeDate(ADate, D[2], D[3], D[4]);
   DecodeTime(ADate, D[5], D[6], D[7], D[8]);
   SetLength(result{%H-}, 17);
-  YearToPChar(D[2], pointer(PtrInt(result) + 2));
+  YearToPChar(D[2], pointer(PtrUInt(result) + 2));
   PWord(result)^ := ord('D') + ord(':') shl 8;
   for i := 3 to 7 do
     PWordArray(pointer(result))^[i] := TwoDigitLookupW[D[i]];
@@ -4770,7 +4770,7 @@ end;
 
 function TPdfWrite.Add(Value, DigitCount: integer): TPdfWrite;
 var
-  t: array[0..15] of AnsiChar;
+  t: TTemp16;
   i64: array[0..1] of Int64 absolute t;
 begin
 //  assert(DigitCount<high(t));
@@ -4882,7 +4882,7 @@ begin
 end;
 
 const // should be local for better code generation
-  HexChars: array[0..15] of AnsiChar = '0123456789ABCDEF';
+  HexChars: TTemp16 = '0123456789ABCDEF';
   ESCAPENAME: TSynAnsicharSet = [
     #1..#31, '%', '(', ')', '<', '>', '[', ']', '{', '}', '/', '#', #127..#255];
 
@@ -4966,7 +4966,7 @@ begin
         L := high(fTmp) shr 1;
     end;
     mormot.core.text.BinToHex(PW, B, L);
-    inc(PtrInt(PW), L);
+    inc(PByte(PW), L);
     inc(B, L * 2);
     dec(len, L);
   until len = 0;
@@ -5164,7 +5164,7 @@ begin
           L := high(fTmp) shr 2; // max WideCharCount allowed in Tmp[]
       end;
       BinToHex4(pointer(PW), B, L);
-      inc(PtrInt(PW), L * 2);
+      inc(PByte(PW), L * 2);
       inc(B, L * 4);
       dec(WideCharCount, L);
     until WideCharCount = 0;
@@ -5930,7 +5930,7 @@ begin
   if P = nil then
     exit;
   Header := P;
-  inc(PtrInt(P), SizeOf(TCmapHeader));
+  inc(PByte(P), SizeOf(TCmapHeader));
   off := 0;
   for i := 0 to Header^.numberSubtables - 1 do
     with SubTable^[i] do
@@ -6297,7 +6297,7 @@ type
 const
   // see http://www.4real.gr/technical-documents-ttf-subset.html and
   // https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6.html
-  TTF_SUBSET: array[0..9] of array[0..3] of AnsiChar = (
+  TTF_SUBSET: array[0..9] of TTemp4 = (
     'head', 'cvt ', 'fpgm', 'prep', 'hhea', 'maxp', 'hmtx', 'cmap', 'loca', 'glyf');
 
 procedure ReduceTTF(out ttf: PdfString; SubSetData: pointer; SubSetSize: integer);
@@ -6879,7 +6879,7 @@ begin
   // retrieve true type fonts available for all charsets
   FillCharFast(LFont, SizeOf(LFont), 0);
   LFont.lfCharset := DEFAULT_CHARSET; // enumerate ALL fonts
-  EnumFontFamiliesExW(fDC, LFont, @EnumFontsProcW, PtrInt(@fTrueTypeFonts), 0);
+  EnumFontFamiliesExW(fDC, LFont, @EnumFontsProcW, PtrUInt(@fTrueTypeFonts), 0);
   QuickSortRawUtf8(fTrueTypeFonts, length(fTrueTypeFonts), nil, @StrIComp);
   fCompressionMethod := cmFlateDecode; // deflate by default
   fBookMarks := TRawUtf8List.CreateEx([fCaseSensitive, fNoDuplicate]);
@@ -10990,13 +10990,13 @@ begin
               PT_BEZIERTO:
                 begin
                   E.Canvas.CurveToCI(
+                    PEMRPolyDraw(R)^.aptl[i].X,
+                    PEMRPolyDraw(R)^.aptl[i].Y,
                     PEMRPolyDraw(R)^.aptl[i + 1].X,
                     PEMRPolyDraw(R)^.aptl[i + 1].Y,
                     PEMRPolyDraw(R)^.aptl[i + 2].X,
-                    PEMRPolyDraw(R)^.aptl[i + 2].Y,
-                    PEMRPolyDraw(R)^.aptl[i + 3].X,
-                    PEMRPolyDraw(R)^.aptl[i + 3].Y);
-                  inc(i, 3);
+                    PEMRPolyDraw(R)^.aptl[i + 2].Y);
+                  inc(i, 2); // eventual inc(i) below
                   if polytypes^[i] and PT_CLOSEFIGURE <> 0 then
                   begin
                     E.Canvas.LineToI(position.X, position.Y);
@@ -11049,13 +11049,13 @@ begin
               PT_BEZIERTO:
                 begin
                   E.Canvas.CurveToCI(
+                    PEMRPolyDraw16(R)^.apts[i].X,
+                    PEMRPolyDraw16(R)^.apts[i].Y,
                     PEMRPolyDraw16(R)^.apts[i + 1].X,
                     PEMRPolyDraw16(R)^.apts[i + 1].Y,
                     PEMRPolyDraw16(R)^.apts[i + 2].X,
-                    PEMRPolyDraw16(R)^.apts[i + 2].Y,
-                    PEMRPolyDraw16(R)^.apts[i + 3].X,
-                    PEMRPolyDraw16(R)^.apts[i + 3].Y);
-                  inc(i, 3);
+                    PEMRPolyDraw16(R)^.apts[i + 2].Y);
+                  inc(i, 2); // eventual inc(i) below
                   if polytypes^[i] and PT_CLOSEFIGURE <> 0 then
                   begin
                     E.Canvas.LineToI(position.X, position.Y);

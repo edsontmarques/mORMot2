@@ -612,11 +612,6 @@ const
     ' like ');      // opLike
 
 
-/// retrieve the text of a given Database SQL dialect enumeration
-// - see also TSqlDBConnectionProperties.GetDbmsName() method
-function ToText(Dbms: TSqlDBDefinition): PShortString; overload;
-
-
 { ************ General SQL Processing Functions }
 
 /// function helper logging some column truncation information text
@@ -2025,7 +2020,7 @@ type
     function GetThreadOwned(aClass: TClass): pointer;
       {$ifdef HASINLINE} inline; {$endif}
     /// register one object owned by a thread-safe connection instance
-    // - returns the supplied aObject instance as a fluid-interface mechanism
+    // - returns the supplied aObject instance as a fluent-interface mechanism
     // - raise an ESqlDBException if not a TSqlDBConnectionPropertiesThreadSafe
     function SetThreadOwned(aObject: TObject): pointer;
 
@@ -2179,8 +2174,8 @@ type
   TSqlDBStatement = class(TInterfacedObject, ISqlDBRows, ISqlDBStatement)
   protected
     fConnection: TSqlDBConnection;
-    fParamCount: integer;
-    fColumnCount: integer;
+    fParamCount: integer;  // not PtrInt
+    fColumnCount: integer; // not PtrInt
     fTotalRowsRetrieved: integer;
     fCurrentRow: integer;
     fDbms: TSqlDBDefinition;
@@ -3128,7 +3123,7 @@ type
   TReplaceSql = record
     Flags: set of (fAllowSemicolon, fByNumber);
     IndexChar: AnsiChar;
-    Name: array[0..1] of AnsiChar;
+    Name: TTemp2;
     Number: Integer;
     Dest: PRawUtf8;
     Temp: TSynTempAdder; // 4KB temp output on stack is almost always enough
@@ -3410,12 +3405,6 @@ end;
 
 
 { ************ Define Database Engine Specific Behavior }
-
-function ToText(Dbms: TSqlDBDefinition): PShortString;
-begin
-  result := GetEnumName(TypeInfo(TSqlDBDefinition), ord(Dbms));
-end;
-
 
 { ************ Abstract SQL DB Classes and Interfaces }
 
@@ -4130,7 +4119,7 @@ procedure TSqlDBConnectionProperties.GetFields(const aTableName: RawUtf8;
   out Fields: TSqlDBColumnDefineDynArray);
 var
   sql: RawUtf8;
-  n, i: integer;
+  n, i: integer; // not PtrInt
   f: TSqlDBColumnDefine;
   fa: TDynArray;
 begin
@@ -4203,7 +4192,7 @@ procedure TSqlDBConnectionProperties.GetIndexes(const aTableName: RawUtf8;
   out Indexes: TSqlDBIndexDefineDynArray);
 var
   sql: RawUtf8;
-  n: integer;
+  n: integer; // not PtrInt
   f: TSqlDBIndexDefine;
   fa: TDynArray;
 begin
@@ -4256,7 +4245,7 @@ procedure TSqlDBConnectionProperties.GetProcedureParameters(
   const aProcName: RawUtf8; out Parameters: TSqlDBProcColumnDefineDynArray);
 var
   sql: RawUtf8;
-  n: integer;
+  n: integer; // not PtrInt
   f: TSqlDBProcColumnDefine;
   fa: TDynArray;
 begin
@@ -5316,6 +5305,7 @@ var
             W.AddDirect(')', ',');
           end;
           W.CancelLastComma;
+          EncodeInsertSuffix(W, BatchOptions, Props.fDbms);
           sqlcached := true;
         end;
       end;
@@ -5451,7 +5441,7 @@ begin
       repeat
         for f := 0 to maxf do
           inc(sqllen, length(FieldValues[f, r]));
-        if sqllen + PtrInt(W.TextLength) > 30000 then
+        if Int64(sqllen) + W.TextLength > 30000 then
           break;
         EncodeInsertPrefix(W, BatchOptions, dFirebird);
         W.AddString(TableName);
@@ -5593,11 +5583,8 @@ begin
 end;
 
 function TSqlDBConnectionProperties.GetDbmsName: RawUtf8;
-var
-  ps: PShortString;
 begin
-  ps := ToText(GetDbms);
-  FastSetString(result, @ps^[2], ord(ps^[0]) - 1);
+  result := DBDEF_TXT[GetDbms];
 end;
 
 function TSqlDBConnectionProperties.SanitizeFromPassword(const S: RawUtf8): RawUtf8;
@@ -5860,7 +5847,7 @@ var
         if p^.VPointer = nil then
           BindNull(arg, IO)
         else
-          Bind(arg, PtrInt(p^.VPointer), IO);
+          Bind(arg, Int64(PtrUInt(p^.VPointer)), IO);
       vtVariant:
         BindVariant(arg, p^.VVariant^, VariantIsBlob(p^.VVariant^), IO);
       {$ifdef UNICODE}
@@ -6895,7 +6882,7 @@ begin
       end;
       Msg := @tmp;
     end;
-    MicroSecToString(fSqlLogTimer.StopInMicroSec, elapsed);
+    MicroSecToStringVar(fSqlLogTimer.StopInMicroSec, elapsed);
     if fSqlLogLevel = sllSQL then
       fSqlLogLog.Log(sllSQL, 'Execute t=%% q=%',
         [elapsed, Msg^, fSqlWithInlinedParams], self)

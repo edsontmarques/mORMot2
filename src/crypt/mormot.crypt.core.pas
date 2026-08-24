@@ -1665,6 +1665,23 @@ type
     destructor Destroy; override;
   end;
 
+  /// sources used by TAesPrng.GetEntropy() to gather its entropy
+  // - gesSystemOnly and gesSystemOnlyMayBlock return Len bytes of "system"
+  // randomness directly from ProcessPrng() on Windows, or /dev/urandom or
+  // /dev/random on POSIX - maybe blocking for gesSystemOnlyMayBlock
+  // - gesSystemFast and gesSystemFull XOR these Len bytes with "userland"
+  // entropy expanded by SHAKE-256 in XOF mode; gesSystemFull also absorbs
+  // slower mormot.core.os XorEntropyOs()
+  // - gesUserOnly does not retrieve Len bytes directly from the system RNG, but
+  // absorbs an initial 256-bit seed at startup, then some additional OS entropy
+  // at each Seed(), and expands it with SHAKE-256 in XOF mode
+  TAesPrngGetEntropySource = (
+    gesSystemFast,
+    gesSystemFull,
+    gesSystemOnly,
+    gesSystemOnlyMayBlock,
+    gesUserOnly);
+
   /// abstract parent for TAesPrng* classes
   // - you should never use this class, but TAesPrng, TSystemPrng or
   // TAesPrngOsl
@@ -1681,6 +1698,29 @@ type
     // TAesPrng*.Main.FillRandom() overloaded methods, or directly
     // TAesPrng*.Fill() class methods
     class function Main: TAesPrngAbstract; virtual; abstract;
+    /// retrieve some entropy bytes from the Operating System and process state
+    // - to gather randomness, use TAesPrng.Main.FillRandom() or TAesPrng.Fill()
+    // methods, but NOT this class method - which will be much slower
+    // - mixes several independent entropy sources (OS CSPRNG, internal process
+    // state and optional external providers) using SHAKE-256 in XOF mode
+    // - maintains a 256-bit secret chaining state updated on every call, for
+    // forward secrecy and backtracking resistance across successive invocations
+    // - the supplied AppNonce is used as a personalization/domain-separation
+    // string, allowing independent applications or protocols to derive
+    // unrelated entropy streams from the same implementation
+    // - if Source <> gesUserOnly, the SHAKE-256 output is XOR-ed with fresh
+    // Operating System random bytes, so the returned entropy remains secure as
+    // long as either the OS CSPRNG or the internal entropy accumulator remains
+    // unpredictable, offering resilience even if one entropy source becomes weak
+    class procedure GetEntropy(Dest: pointer; Len: integer;
+      Source: TAesPrngGetEntropySource = gesSystemFast;
+      const AppNonce: RawByteString = ''); overload; virtual;
+    /// retrieve some entropy bytes from the Operating System and process state
+    // - overloaded high-level method filling a raw memory buffer
+    // - defined as procedure to ensure RefCnt=1 so that FillZero(Buffer) works
+    class procedure GetEntropy(var Buffer: RawByteString; Len: integer;
+      Source: TAesPrngGetEntropySource = gesSystemFast;
+      const AppNonce: RawByteString = ''); overload;
     /// fill a TAesBlock with some pseudorandom data
     // - could be used e.g. to compute an AES Initialization Vector (IV)
     // - this method is thread-safe
@@ -1738,8 +1778,9 @@ type
     function RandomSalt(var bin, b64: RawByteString; defsiz: integer = 0;
       const salt: RawUtf8 = ''; enc: PChar64 = nil; dec: PAnsiCharDec = nil): boolean;
     /// would force the internal generator to re-seed its private key
-    // - avoid potential attacks on backward or forward secrecy
-    // - would be called by FillRandom() methods, according to SeedAfterBytes
+    // - would be called by FillRandom() methods to periodically reinitialize
+    // the internal state of the generator e.g. from SHAKE-256 GetEntropy(),
+    // for forward secrecy and backtracking resistance to state compromise
     // - this method is thread-safe, and does nothing by default
     procedure Seed; virtual;
     /// create a TKS1 anti-forensic representation of a key for safe storage
@@ -1809,31 +1850,20 @@ type
   /// meta-class for our CSPRNG implementations
   TAesPrngClass = class of TAesPrngAbstract;
 
-  /// sources used by TAesPrng.GetEntropy() to gather its entropy
-  // - gesSystemOnly and gesSystemOnlyMayBlock "system" entropy comes directly
-  // from FIPS CryptGenRandom API on Windows, and /dev/urandom or /dev/random on
-  // Linux/POSIX (maybe blocking for gesSystemOnlyMayBlock)
-  // - gesSystemAndUser and gesUserOnly "userland" entropy comes from the output
-  // of a cryptographic SHA-3 SHAKE-256 generator in XOF mode, from several
-  // sources: timestamps, thread, detailed hardware and system information,
-  // mormot.core.base XorEntropy and gsl_rng_taus2 generator, OpenSSL CSPRNG
-  // (if loaded) and the system CSPRNG (only once for gesUserOnly)
-  // - TAesPrng defaults to gesUserOnly which seems the safest for its needs
-  TAesPrngGetEntropySource = (
-    gesSystemAndUser,
-    gesSystemOnly,
-    gesSystemOnlyMayBlock,
-    gesUserOnly);
-
-  /// cryptographic secure pseudorandom number generator (CSPRNG) based on AES-256
-  // - use as a shared instance via TAesPrng.Fill() overloaded class methods
-  // - this class is able to generate some random output by encrypting successive
-  // values of a counter with AES-256-CTR and a secret key
-  // - an internal secret key is generated via SHAKE-256 XOF from OS and HW entropy
-  // - by design, such a PRNG is as good as the cypher used - for reference, see
-  // https://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator
-  // - FillRandom() is thread-safe, and its AES process is not blocking: only
-  // the CTR is pre-computed inside a lock
+  /// cryptographically secure pseudorandom number generator (CSPRNG) based on
+  // AES-CTR with periodic reseeding from entropy mixed by SHAKE-256
+  // - use as a shared instance via the TAesPrng.Fill*() overloaded class methods
+  // - random data is generated by encrypting successive counter values with
+  // AES-128 or AES-256 in CTR mode using a secret key
+  // - the key is periodically regenerated from multiple entropy sources
+  // (Operating System, hardware and process state) mixed with SHAKE-256 in XOF
+  // mode, with a secret chaining state for forward secrecy
+  // - the security of the generated stream relies on the cryptographic strength
+  // of AES and the unpredictability of the derived secret key
+  // - FillRandom() is fully thread-safe and minimizes lock contention: only
+  // the shared counter allocation is synchronized, while the AES computation
+  // itself is performed without blocking for FillRandom() over buffers
+  // - consider FillSystemRandom() or TSystemPrng for the OS official CSPRNG
   // - use fast hardware AES-NI, and our 8X interleaved asm on x86_64 asm:
   // $  mORMot FillRandom in 1.22ms, 7.6 GB/s
   // $  OpenSSL FillRandom in 1.22ms, 7.6 GB/s
@@ -1851,10 +1881,13 @@ type
     fSeedAfterBytes: PtrUInt;
     fAesKeySize: integer;
     fSeedEntropySource: TAesPrngGetEntropySource;
-    fSeeding: boolean;
+    fSeedNonce: RawByteString;
+    procedure LockAndPrepareFill(Len: PtrInt); {$ifdef HASINLINE} inline; {$endif}
   public
     /// initialize the internal secret key, using Operating System entropy
-    // - entropy is gathered from the OS via SHAKE-256, using GetEntropy() method
+    // - once created, you can tune this instance before any Fill() by setting
+    // Nonce, SeedAfterBytes, SeedEntropySource or AesKeySize properties
+    // - Seed execution is delayed until the first Fill() is actually made
     constructor Create; override;
     /// fill a TAesBlock with some pseudorandom data
     // - this method is thread-safe
@@ -1863,48 +1896,42 @@ type
     // - this method is thread-safe
     procedure FillRandom(out Buffer: THash256); override;
     /// fill a binary buffer with some pseudorandom data
-    // - this method is thread-safe
-    // - is just a wrapper around FillSystemRandom()
+    // - this method is thread-safe, and not-blocking for Len > 256 bytes
     procedure FillRandom(Buffer: pointer; Len: PtrInt); override;
     /// would force the internal generator to re-seed its private key
-    // - as called by FillRandom() methods once SeedAfterBytes limit is reached
-    // - (re)initialize the internal AES-CTR engine from SHAKE-256  GetEntropy()
-    // to avoid potential attacks on backward or forward secrecy
+    // - as called by FillRandom() methods when SeedAfterBytes limit is reached
+    // - (re)initialize the internal AES-CTR engine from SHAKE-256 GetEntropy()
+    // for forward secrecy and improve backtracking resistance to state compromise
     // - this method is thread-safe
     procedure Seed; override;
-    /// retrieve some entropy bytes from the Operating System and process state
-    // - you can specify the expected Source of entropy - TAesPrng will default
-    // to gesUserOnly but this method proposes gesSystemAndUser
-    // - to gather randomness, use TAesPrng.Main.FillRandom() or TAesPrng.Fill()
-    // methods, but NOT this class method - which will be much slower
-    class function GetEntropy(Len: integer;
-      Source: TAesPrngGetEntropySource = gesSystemAndUser): RawByteString; virtual;
     /// returns a shared instance of a TAesPrng instance
     // - if you need to generate some random content, just call the
     // TAesPrng.Main.FillRandom() overloaded methods, or directly TAesPrng.Fill()
     class function Main: TAesPrngAbstract; override;
+    /// application-specific text/binary domain to personalize this instance
+    property Nonce: RawByteString
+      read fSeedNonce write fSeedNonce;
   published
     /// after how many generated bytes Seed method would be called
-    // - default is 256 MB - which seems paranoid enough
-    // - if set to 0 - e.g. for TSystemPrng - no seeding will occur
+    // - default is 256 shl 20 = 256 MB; setting 0 would disable re-seeding
     property SeedAfterBytes: PtrUInt
       read fSeedAfterBytes write fSeedAfterBytes;
-    /// the source of entropy used during seeding - safest gesUserOnly by default
+    /// the source of entropy used during seeding - gesSystemFast by default
     property SeedEntropySource: TAesPrngGetEntropySource
       read fSeedEntropySource write fSeedEntropySource;
-    /// how many bits (128 or 256 - which is the default) are used for the AES
+    /// AES key size in bits (256 with hardware AES by default)
     property AesKeySize: integer
       read fAesKeySize write fAesKeySize;
   end;
 
-  /// TAesPrng-compatible class using Operating System pseudorandom source
-  // - may be used instead of TAesPrng if a "standard" generator is required -
-  // you could override MainAesPrng global variable
-  // - will call /dev/urandom under POSIX, and CryptGenRandom API on Windows
-  // - warning: may block on some BSD flavors, depending on /dev/urandom
-  // - from the cryptographic point of view, our TAesPrng class doesn't suffer
-  // from the "black-box" approach of Windows, give consistent randomness
-  // over all supported cross-platform, and seems indubitably faster and safer
+  /// TAesPrng-compatible class using the Operating System CSPRNG
+  // - may be used instead of TAesPrng if a standard OS generator is required;
+  // you could override the MainAesPrng global variable if really needed
+  // - calls /dev/urandom under POSIX, or ProcessPrng() on Windows
+  // - may block on some BSD systems, depending on the underlying implementation
+  // - unlike TAesPrng, this class delegates all randomness generation to the
+  // Operating System; TAesPrng additionally mixes several entropy sources,
+  // maintains a forward-secure internal state, and is typically faster
   TSystemPrng = class(TAesPrngAbstract)
   public
     /// fill a binary buffer with some pseudorandom data
@@ -1929,7 +1956,7 @@ var
   /// the shared TAesPrng instance returned by TAesPrng.Main class function
   // - you may override this to a customized instance, e.g. for a specific
   // random generator to be used, like TSystemPrng or TAesPrngOsl
-  MainAesPrng: TAesPrng;
+  MainAesPrng: TAesPrngAbstract;
 
   /// low-level RAND_bytes() OpenSSL API function set by mormot.crypt.openssl
   // - used by TAesPrng.GetEntropy if available to add some audited entropy
@@ -2313,9 +2340,8 @@ type
     // - Digest destination buffer must contain enough bytes
     // - default DigestBits=0 will write the default number of bits to Digest
     // output memory buffer, according to the current TSha3Algo
-    // - you can call this method several times, to use this SHA-3 hasher as
-    // "Extendable-Output Function" (XOF), e.g. for stream encryption (ensure
-    // NoInit is set to true, to enable recall)
+    // - with NoInit=true, you can call this method several times, to use this
+    // SHA-3 hasher in "Extendable-Output Function" (XOF) mode
     procedure Final(Digest: pointer; DigestBits: integer = 0;
       NoInit: boolean = false); overload;
     /// compute a SHA-3 hash 256-bit Digest from a buffer, in one call
@@ -2371,7 +2397,7 @@ type
       Algo: TSha3Algo = SHAKE_256); overload;
     /// uses SHA-3 in "Extendable-Output Function" (XOF) to cypher some content
     // - this overloaded function expects the instance to have been prepared
-    // by previous InitCypher call
+    // by previous InitCypher call and requires Source <> Dest by design
     // - resulting Dest buffer will have the very same size than the Source
     // - XOF is implemented as a symmetrical algorithm: use this Cypher()
     // method for both encryption and decryption of any buffer
@@ -4134,15 +4160,14 @@ var
   rnd: THash256;
 begin // note: we can't use Random128() here to avoid endless recursion
   if Bits = 0 then
-    Bits := 128 shl ord(HasHWAes); // AES-128 or AES-256 with HW AES opcodes
-  {$ifdef OSLINUX}
-  if (MainAesPrng <> nil) or
-     not LinuxGetRandom(@rnd, Bits shr 3) then // 128/256-bit in 1 syscall
-  {$endif OSLINUX}
-    TAesPrng.Main.FillRandom(rnd);     // 256-bit from our CSPRNG (if available)
-  EncryptInit(rnd, Bits);              // transient AES-128/256 secret
-  FillZero(TAesContext(Context).iv.b); // as per NIST SP 800-90A
-  FillZero(rnd);                       // anti-forensic
+    Bits := 128 shl ord(HasHWAes);      // AES-128 or AES-256 with HW AES opcodes
+  if MainAesPrng <> nil then
+    MainAesPrng.FillRandom(rnd)         // favor our CSPRNG if available
+  else
+    FillSystemRandom(@rnd, Bits shr 3, false); // seed from OS
+  EncryptInit(rnd, Bits);               // transient AES-128/256 secret
+  FillZero(TAesContext(Context).iv.b);  // as per NIST SP 800-90A
+  FillZero(rnd);                        // anti-forensic
 end;
 
 function TAes.DecryptInitFrom(const Encryption: TAes; const Key;
@@ -7177,7 +7202,7 @@ begin
 end;
 
 const
-  AESMODE_TXT: array[TAesMode] of array[0..3] of AnsiChar = (
+  AESMODE_TXT: array[TAesMode] of TTemp4 = (
     'ecb', 'cbc', 'cfb', 'ofb', 'c64', 'ctr', 'cfc', 'ofc', 'ctc', 'gcm');
 
 procedure AesAlgoNameEncode(Mode: TAesMode; KeyBits: integer;
@@ -7608,67 +7633,40 @@ begin
   result := Main.FillRandomBytes(Len);
 end;
 
-
-{ TAesPrng }
-
-constructor TAesPrng.Create;
+class procedure TAesPrngAbstract.GetEntropy(var Buffer: RawByteString; Len: integer;
+  Source: TAesPrngGetEntropySource; const AppNonce: RawByteString);
 begin
-  inherited Create;                     // initialize an associated TOSLightLock
-  fSeedEntropySource := gesUserOnly;    // safest and seeded once from OS
-  fSeedAfterBytes := 256 shl 20;         // reseed after 256MB by default
-  fBytesSinceSeed := PtrUInt(-1);       // force seed
-  fAesKeySize := 128 shl ord(HasHWAes); // AES-128 or AES-256 with HW AES opcodes
-end;
-
-function SetMainAesPrng: TAesPrng;
-begin
-  GlobalLock; // RegisterGlobalShutdownRelease() will use it anyway
-  try
-    if MainAesPrng = nil then
-      MainAesPrng := RegisterGlobalShutdownRelease(TAesPrng.Create);
-  finally
-    GlobalUnLock;
-  end;
-  result := MainAesPrng;
-end;
-
-class function TAesPrng.Main: TAesPrngAbstract;
-begin
-  result := MainAesPrng;
-  if result = nil then
-    result := SetMainAesPrng;
+  FillZero(Buffer);
+  if Len > 0 then
+    GetEntropy(FastNewRawByteString(Buffer, Len), Len, Source, AppNonce);
 end;
 
 var
+  _EntropyChainSafe: TLightLock;
   _EntropyChain: THash256Rec; // 256-bit secret chaining for forward security
 
-class function TAesPrng.GetEntropy(
-  Len: integer; Source: TAesPrngGetEntropySource): RawByteString;
+class procedure TAesPrngAbstract.GetEntropy(Dest: pointer; Len: integer;
+  Source: TAesPrngGetEntropySource; const AppNonce: RawByteString);
 var
-  fromos: RawByteString;
   data: THash512Rec;
   sha3: TSha3;
+  tmp: TSynTempBuffer; // for SHAKE-256 output
 begin
-  FastAssignNew(result);
   if Len <= 0 then
     exit;
-  // retrieve official "system" entropy (not for gesUserOnly)
-  pointer(fromos) := FastNewString(Len);
+  // fill Dest with Len bytes of official "system" entropy
   if Source <> gesUserOnly then
-    FillSystemRandom(pointer(fromos), Len, Source = gesSystemOnlyMayBlock);
-  if Source in [gesSystemOnly, gesSystemOnlyMayBlock] then
   begin
-    result := fromos; // standard, but weaker if OS is outdated/corrupted
-    exit;
+    FillSystemRandom(Dest, Len, Source = gesSystemOnlyMayBlock);
+    if Source in [gesSystemOnly, gesSystemOnlyMayBlock] then
+      exit; // enough for some usecases
   end;
-  // XOR with some "userland" entropy
+  // XOR with Len bytes of "userland" entropy
   sha3.Init(SHAKE_256); // SHA-3 in XOF mode for variable-length output
   try
-    // use the library version as domain separation
-    sha3.Update('mORMot AES-PRNG Seed ' + SYNOPSE_FRAMEWORK_VERSION);
-    // system/process information used as salt/padding from mormot.core.os
+    // 128-bit system/process information used as salt/padding
     sha3.Update(@Executable.Hash, SizeOf(Executable.Hash));
-    // 512-bit startup entropy from mormot.core.base
+    // 512-bit of mormot.core.base startup entropy
     sha3.Update(@BaseEntropy, SizeOf(BaseEntropy));
     // 256-bit of mormot.core.os randomness state with strong forward secrecy
     sha3.Update(@SystemEntropy, SizeOf(SystemEntropy));
@@ -7678,52 +7676,85 @@ begin
       OpenSslRandBytes(@data, SizeOf(data));
       sha3.Update(@data, SizeOf(data));
     end;
+    if Source <> gesSystemFast then // bypass this slow function by default
+    begin
+      // 512-bit of low-level Operating System current state from mormot.core.os
+      XorOSEntropy(data); // detailed system cpu and memory info + system random
+      sha3.Update(@data, SizeOf(data));
+    end;
     // 512-bit from mormot.core.base _Fill256FromOs + RdRand/Rdtsc + threadid
     XorEntropy(data);
     sha3.Update(@data, SizeOf(data));
-    // 512-bit of low-level Operating System current state from mormot.core.os
-    XorOSEntropy(data); // detailed system cpu and memory info + system random
-    sha3.Update(@data, SizeOf(data));
-    // 256-bit hash of previous state
-    sha3.Update(@_EntropyChain, SizeOf(_EntropyChain));
-    // XOR previously retrieved OS entropy using SHA-3 in 256-bit XOF mode
-    result := sha3.Cypher(fromos);
+    // append the supplied nonce (library name by default) as domain separation
+    sha3.Update(AppNonce);
+    // thread-safe 256-bit state ratcheting
+    _EntropyChainSafe.Lock;
+    try
+      // ensure proper initialization from OS e.g. for gesUserOnly mode
+      if _EntropyChain.d0 = 0 then
+        FillSystemRandom(@_EntropyChain, SizeOf(_EntropyChain), {block=}false);
+      // 256-bit hash of previous state
+      sha3.Update(@_EntropyChain, SizeOf(_EntropyChain));
+      // perfect forward secrecy by squeezing next seed chain from SHAKE-256
+      sha3.Final(_EntropyChain.b, {NoInit=}true);
+    finally
+      _EntropyChainSafe.UnLock;
+    end;
+    // squeeze Len bytes of SHAKE-256 output as "userland" entropy
+    if Source = gesUserOnly then
+    begin
+      sha3.Final(Dest, {bits=}Len shl 3, {NoInit=}true); // direct expand
+      exit;
+    end;
+    sha3.Final(tmp.Init(Len), {bits=}Len shl 3, {NoInit=}true);
+    XorMemory(Dest, tmp.buf, Len); // returns "system" XOR "userland"
+    FillZero(tmp.buf^, Len);
+    tmp.Done;
   finally
     sha3.Done;
-    FillZero(fromos);
     FillZero(data.b);
   end;
 end;
 
+
+{ TAesPrng }
+
+constructor TAesPrng.Create;
+begin
+  inherited Create;                     // initialize an associated TOSLightLock
+  fSeedAfterBytes := 256 shl 20;        // reseed after 256MB by default
+  fAesKeySize := 128 shl ord(HasHWAes); // AES-128 or AES-256 with HW AES opcodes
+  fSeedNonce := 'mORMot AES-PRNG Seed'; // default personalization string
+end;
+
 procedure TAesPrng.Seed;
 var
-  alreadyseeding: boolean;
-  entropy: RawByteString;
-  e: PHash512Rec;
+  e: THash512Rec;
 begin
-  if fSeedAfterBytes = 0 then
-    exit;
-  fSafe.Lock;
-  alreadyseeding := fSeeding; // atomic flag
-  fSeeding := true;
-  fSafe.UnLock;
-  if alreadyseeding then // a single thread should do the entropy seeding
-    exit;
   // gather 512-bit seed of SHAKE-256 XOF from several sources of entropy
-  entropy := GetEntropy(SizeOf(e^), fSeedEntropySource);
-  e := pointer(entropy);
+  GetEntropy(@e, SizeOf(e), fSeedEntropySource, fSeedNonce);
   // initialize the new thread-safe state as its AES-CTR key
   fSafe.Lock;
   try
-    fAes.Done;                           // anti-forensic + set IV = 0
-    fAes.EncryptInit(e^.l, fAesKeySize); // up to 256-bit
-    _EntropyChain := e^.h;               // perfect forward secrecy
-    fBytesSinceSeed := 0;                // reset counter for next Seed
+    fAes.Done;                          // anti-forensic + set IV = 0
+    fAes.EncryptInit(e.l, fAesKeySize); // up to 256-bit
+    TAesContext(fAes).iv.L := e.q[7];   // keep high part = CTR = 0
+    fBytesSinceSeed := 1;               // reset counter for next Seed (not 0)
   finally
-    FillZero(e^.b);                      // anti-forensic
-    fSeeding := false;
     fSafe.UnLock;
+    FillZero(e.b);                      // anti-forensic
   end;
+end;
+
+procedure TAesPrng.LockAndPrepareFill(Len: PtrInt);
+begin
+  if (fBytesSinceSeed = 0) or // never seeded
+     ((fSeedAfterBytes <> 0) and
+      (fBytesSinceSeed >= fSeedAfterBytes)) then // re-seed needed
+    Seed;
+  fSafe.Lock;
+  inc(fBytesSinceSeed, Len);
+  inc(fTotalBytes, Len);
 end;
 
 procedure DoRndBlock(var ctx: TAesContext; out dest); // random from AES-CTR
@@ -7736,26 +7767,16 @@ end;
 
 procedure TAesPrng.FillRandom(out Block: TAesBlock);
 begin
-  if (fSeedAfterBytes <> 0) and
-     (fBytesSinceSeed >= fSeedAfterBytes) then
-    Seed;
-  fSafe.Lock;
+  LockAndPrepareFill(16);
   DoRndBlock(TAesContext(fAes), Block);
-  inc(fBytesSinceSeed, 16);
-  inc(fTotalBytes, 16);
   fSafe.UnLock;
 end;
 
 procedure TAesPrng.FillRandom(out Buffer: THash256);
 begin
-  if (fSeedAfterBytes <> 0) and
-     (fBytesSinceSeed >= fSeedAfterBytes) then
-    Seed;
-  fSafe.Lock;
+  LockAndPrepareFill(32);
   DoRndBlock(TAesContext(fAes), THash256Rec({%H-}Buffer).Lo);
   DoRndBlock(TAesContext(fAes), THash256Rec({%H-}Buffer).Hi);
-  inc(fBytesSinceSeed, 32);
-  inc(fTotalBytes, 32);
   fSafe.UnLock;
 end;
 
@@ -7796,15 +7817,10 @@ begin
     exit;
   main := Len shr AesBlockShift;
   remain := Len and AesBlockMod;
-  if (fSeedAfterBytes <> 0) and
-     (fBytesSinceSeed >= fSeedAfterBytes) then
-    Seed;
   Len := main shl AesBlockShift;
   if remain <> 0 then
     inc(Len, SizeOf(TAesBlock));
-  fSafe.Lock;
-  inc(fBytesSinceSeed, Len);
-  inc(fTotalBytes, Len);
+  LockAndPrepareFill(Len);
   if main <= 16 then
   begin
     // small buffers (up to 16 * 16 = 256 bytes) are filled within the lock
@@ -7814,7 +7830,7 @@ begin
   end;
   // big buffers will update the CTR IV and release the lock before processing
   MoveFast(fAes, local, SizeOf(local));
-  h := bswap64(local.iv.Hi); // start at 0, seed after 21-bit: never overflows
+  h := bswap64(local.iv.Hi); // start at 0, seed after 2^24 blocks: never overflows
   TAesContext(fAes).iv.Hi := bswap64(h + (main + ord(remain <> 0)));
   fSafe.UnLock;
   // unlocked local AES-CTR computation of buffers > 256 bytes
@@ -7822,13 +7838,32 @@ begin
   FillCharFast(local, SizeOf(local), 0); // anti-forensic
 end;
 
+function SetMainAesPrng: TAesPrngAbstract;
+begin
+  GlobalLock; // RegisterGlobalShutdownRelease() will use it anyway
+  try
+    if MainAesPrng = nil then
+      MainAesPrng := RegisterGlobalShutdownRelease(TAesPrng.Create);
+  finally
+    GlobalUnLock;
+  end;
+  result := MainAesPrng;
+end;
+
+class function TAesPrng.Main: TAesPrngAbstract;
+begin
+  result := MainAesPrng;
+  if result = nil then
+    result := SetMainAesPrng;
+end;
+
 
 { TSystemPrng }
 
 procedure TSystemPrng.FillRandom(Buffer: pointer; Len: PtrInt);
-begin // call mormot.core.os[.security] function
-  inc(fTotalBytes, Len);
+begin // calls mormot.core.os function
   FillSystemRandom(Buffer, Len, {allowblocking=}false);
+  inc(fTotalBytes, Len);
 end;
 
 var
@@ -9191,7 +9226,9 @@ end;
 
 procedure TSha3.Cypher(Source, Dest: pointer; DataLen: integer);
 begin
-  Final(Dest, DataLen shl 3, true); // in XOF mode
+  if Source = Dest then
+    ESynCrypto.RaiseU('Unexpected TSha3.Cypher(Source=Dest)');
+  Final(Dest, DataLen shl 3, {noinit=}true); // in XOF mode
   XorMemory(Dest, Source, DataLen);
 end;
 
@@ -10483,7 +10520,6 @@ var
   i: PtrInt;
 {$endif USEARMCRYPTO}
 begin
-  _EntropyChain := BaseEntropy.l; // not void
   {$ifndef USEAESNI}
   ComputeAesStaticTables; // ARM or pure pascal would need those tables anyway
   {$endif USEAESNI}
@@ -10514,7 +10550,7 @@ begin
   {$endif ASMX64NOTPIC}
   {$ifdef USEAESNIHASH}
   {$ifdef OSWINDOWS}
-  if not (wsPrism in WindowsSpecs) then // seems inconsistent with only few aesenc
+  if not (wsPrism in WindowsSpecs) then // seems inconsistent with a few aesenc
   {$endif OSWINDOWS}
   if (cfAesNi in CpuFeatures) and   // AES-NI
      (cfSSE3 in CpuFeatures) then   // PSHUFB

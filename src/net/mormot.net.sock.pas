@@ -243,10 +243,10 @@ type
     /// convert an IPv4 value into text, or '' for AF_INET6 or AF_UNIX
     function IP4Short: TShort16;
       {$ifdef FPC} inline; {$endif}
-    /// convert this address into its shortstring IPv4/IPv6 textual representation
+    /// convert this address into its ShortString IPv4/IPv6 textual representation
     function IPShort(withport: boolean = false): TShort127; overload;
       {$ifdef HASINLINE}inline;{$endif}
-      /// convert this address into its shortstring IPv4/IPv6 textual representation
+      /// convert this address into its ShortString IPv4/IPv6 textual representation
     procedure IPShort(var result: TShort127; withport: boolean = false); overload;
     /// convert this address into its 'IPv4/IPv6:port' textual representation
     function IPWithPort: RawUtf8; overload;
@@ -705,7 +705,7 @@ procedure IP6Text(ip6addr: PByteArray; var result: RawUtf8);
 function MacToText(mac: pointer): RawUtf8;
   {$ifdef HASINLINE} inline; {$endif}
 
-/// convert a MAC address into a 17-chars shortstring like '12:50:b6:1e:c6:aa'
+/// convert a MAC address into a 17-chars ShortString like '12:50:b6:1e:c6:aa'
 function MacToShort(mac: pointer): TShort23;
   {$ifdef HASINLINE} inline; {$endif}
 
@@ -2271,7 +2271,10 @@ type
     function TrySockRecv(Buffer: pointer; var Length: integer;
       StopBeforeLength: boolean = false; NetResult: PNetResult = nil;
       RawError: PNetErrorInt = nil): boolean;
-    /// faster readln(SockIn^,Line) or simulate it with direct use of Recv(Sock, ..)
+    /// faster readln(SockIn^,Line) after CreateSockIn
+    // - if not CreateSockIn has been done, tries to simulate it with direct use
+    // of Recv(Sock, bychar, 1) which could fail on Windows when the server closes
+    // the socket and the client is broken before all bytes are read
     // - just wrap SockInReadLn() with a 16KB buffer (which is enough e.g. with HTTP)
     // - use TimeOut milliseconds wait for incoming data
     // - raise ENetSock exception on socket error
@@ -3865,7 +3868,7 @@ end;
 { ******************** Mac and IP Addresses Support }
 
 const // should be local for better code generation
-  HexCharsLower: array[0..15] of AnsiChar = '0123456789abcdef';
+  HexCharsLower: TTemp16 = '0123456789abcdef';
 
 function IsPublicIP(ip4: TNetIP4): boolean;
 begin
@@ -6733,7 +6736,7 @@ begin
         SockSendLine(['Proxy-Authorization: Basic ', Tunnel.UserPasswordBase64]);
       SockSendFlush(#13#10);
       repeat
-        SockRecvLn(s);
+        SockRecvLn(s); // without CreateSockIn may be slow especially on Windows
         if NetStartWith(pointer(s), 'HTTP/') and
            (length(s) > 11) and
            (s[10] = '2') then // 'HTTP/1.1 2xx xxxx' success

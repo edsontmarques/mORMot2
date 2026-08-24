@@ -359,6 +359,16 @@ function OpenSslInitialize(
    const libsslname: TFileName = '';
    const libprefix: RawUtf8 = _PU): boolean;
 
+{$ifdef OSWINDOWS}
+/// try to locate https://github.com/openssl/installer/releases official setup
+// - returns the highest version of '{install_dir}\bin\libcrypto-{major}-x64.dll'
+function OpenSslWinLocate: TFileName;
+{$endif OSWINDOWS}
+
+// used by OpenSslWinLocate() - published only for testing purposes
+function OpenSslWinLocateEntry(const entries: TRawUtf8DynArray;
+  out majsel: integer): RawUtf8;
+
 
 { ******************** OpenSSL Library Constants }
 
@@ -846,6 +856,7 @@ const
   NID_issuer_alt_name = 86;
   NID_basic_constraints = 87;
   NID_authority_key_identifier = 90;
+  NID_crl_distribution_points = 103;
   NID_ext_key_usage = 126;
   NID_info_access = 177;
 
@@ -1406,6 +1417,7 @@ type
     function Size: integer;
     procedure ToBin(bin: PByte); overload;
     procedure ToBin(out bin: RawByteString); overload;
+    function ToInteger: Int64;
     procedure Free;
   end;
 
@@ -1480,6 +1492,7 @@ type
   public
     function ToBigInt: PBIGNUM;
     function ToDecimal: RawUtf8;
+    function ToInteger: Int64;
     procedure Free;
   end;
   PASN1_INTEGER = ^ASN1_INTEGER;
@@ -1697,7 +1710,7 @@ type
   /// convenient wrapper to a PX509_EXTENSION instance
   X509_EXTENSION = object
   public
-    function BasicConstraintIsCA: boolean;
+    function BasicConstraintIsCA(pathlen: PInteger): boolean;
     function IsDataEqual(x: PX509_EXTENSION): boolean;
     procedure ToUtf8(out result: RawUtf8; flags: cardinal = X509V3_EXT_DEFAULT);
     procedure Free;
@@ -1928,7 +1941,7 @@ type
     function GetExtensions: TX509_Extensions;
     /// if the Certificate X509v3 Basic Constraints contains 'CA:TRUE'
     // - match kuCA flag in GetUsage/HasUsage
-    function IsCA: boolean;
+    function IsCA(pathlen: PInteger = nil): boolean;
     /// if the Certificate issuer is itself
     function IsSelfSigned: boolean;
     /// if both Issuer = x.Subject and AKI (if set) = x.SKI
@@ -1943,7 +1956,7 @@ type
     // - returns e.g. 'SHA256'
     function GetSignatureHash: RawUtf8;
     /// the X509v3 Key and Extended Key Usage Flags of this Certificate
-    function GetUsage: TX509Usages;
+    function GetUsage(pathlen: PInteger = nil): TX509Usages;
     /// check a X509v3 Key and Extended Key Usage Flag of this Certificate
     // - fastest and easiest way of checking Certificate abilities from code
     // - OpenSSL caches the flags, so any SetUsage() won't be taken into account
@@ -2634,7 +2647,7 @@ function OpenSSL_error_eof(error: integer): boolean;
 
 function SSL_is_fatal_error(get_error: integer): boolean;
 procedure SSL_get_error_text(get_error: integer; var result: RawUtf8);
-procedure SSL_get_error_short(get_error: integer; var dest: shortstring);
+procedure SSL_get_error_short(get_error: integer; var dest: ShortString);
 function SSL_get_ex_new_index(l: integer; p: pointer; newf: PCRYPTO_EX_new;
   dupf: PCRYPTO_EX_dup; freef: PCRYPTO_EX_free): integer;
 
@@ -6118,6 +6131,79 @@ begin
   result := openssl_initialized = lsAvailable;
 end;
 
+function OpenSslWinLocateEntry(const entries: TRawUtf8DynArray;
+  out majsel: integer): RawUtf8;
+var
+  p: PUtf8Char;
+  maj, min, minsel: integer;
+  i: PtrInt;
+begin // parse 'SOFTWARE\OpenSSL Corporation\OpenSSL-{maj}.{min}-OpenSSLProject'
+  result := '';
+  majsel := 0;
+  minsel := -1;
+  for i := 0 to high(entries) do
+  begin
+    p := pointer(entries[i]);
+    if not NetStartWith(p, 'OPENSSL-') then
+      continue;
+    inc(p, 8);
+    maj := GetCardinal(p);
+    if maj < majsel then
+      continue;
+    while p^ in ['0' .. '9'] do
+      inc(p);
+    if p^ <> '.' then
+      continue;
+    inc(p);
+    min := GetCardinal(p);
+    if (maj = majsel) and
+       (min < minsel) then
+      continue;
+    while p^ in ['0' .. '9'] do
+      inc(p);
+    if not NetStartWith(p, '-OPENSSLPROJECT') then
+      continue;
+    result := entries[i]; // found the highest version
+    majsel := maj;
+    minsel := min;
+  end;
+end;
+
+{$ifdef OSWINDOWS}
+{$ifdef CPU32}
+function OpenSslWinLocate: TFileName;
+begin
+  result := ''; // official releases seem to be Win64 only for now
+end;
+{$else}
+const
+  OPENSSL_REGKEY = 'SOFTWARE\OpenSSL Corporation\';
+
+function OpenSslWinLocate: TFileName;
+var
+  reg: TWinRegistry;
+  entry: RawUtf8;
+  major: integer;
+begin
+  result := '';
+  if not reg.ReadOpen(wrLocalMachine, OPENSSL_REGKEY) then
+    exit;
+  entry := OpenSslWinLocateEntry(reg.ReadEnumEntries, major);
+  if (entry = '') or
+     not reg.ReadReOpen(wrLocalMachine, [OPENSSL_REGKEY, entry]) then
+    exit;
+  result := reg.ReadFileName('EnvPath');
+  reg.Close;
+  if not DirectoryExists(result) then
+    exit;
+  result := format('%slibcrypto-%d-x64.dll',
+    [IncludeTrailingPathDelimiter(result), major]);
+  if not FileExists(result) then
+    result := '';
+end;
+{$endif CPU32}
+{$endif OSWINDOWS}
+
 function OpenSslInitialize(const libcryptoname, libsslname: TFileName;
   const libprefix: RawUtf8): boolean;
 var
@@ -6177,6 +6263,10 @@ begin
         libexe4,
         libexe3,
         libexe1,
+        {$ifdef OSWINDOWS}
+        // Win64 dll from https://github.com/openssl/installer/releases
+        OpenSslWinLocate,
+        {$endif OSWINDOWS}
         // try the library from OPENSSL_LIBPATH or somewhere in the system
         libsys4,
         libsys3,
@@ -9142,6 +9232,18 @@ begin
   ToBin(pointer(bin));
 end;
 
+function BIGNUM.ToInteger: Int64;
+var
+  tmp: PUtf8Char;
+begin
+  result := 0;
+  if @self = nil then
+    exit;
+  tmp := BN_bn2dec(@self);
+  SetInt64(tmp, result);
+  OpenSSL_Free(tmp);
+end;
+
 procedure BIGNUM.Free;
 begin
   if @self <> nil then
@@ -9160,8 +9262,24 @@ begin
 end;
 
 function ASN1_INTEGER.ToDecimal: RawUtf8;
+var
+  bn: PBIGNUM;
 begin
-  result := ToBigInt.ToDecimal;
+  bn := ToBigInt;
+  result := bn.ToDecimal;
+  bn.Free;
+end;
+
+function ASN1_INTEGER.ToInteger: Int64;
+var
+  bn: PBIGNUM;
+begin
+  bn := ToBigInt;
+  if bn.Size > 8 then
+    result := -1
+  else
+    result := bn.ToInteger;
+  bn.Free;
 end;
 
 procedure ASN1_INTEGER.Free;
@@ -9250,7 +9368,7 @@ end;
 
 { X509_EXTENSION }
 
-function X509_EXTENSION.BasicConstraintIsCA: boolean;
+function X509_EXTENSION.BasicConstraintIsCA(pathlen: PInteger): boolean;
 var
   d: PASN1_OCTET_STRING;
   data: PByte;
@@ -9269,6 +9387,12 @@ begin
   if c = nil then
     exit;
   result := c^.ca <> 0;
+  if pathlen <> nil then
+    if (c^.pathlen = nil) or
+       not result then
+      pathlen^ := -1 // convention for absent or not CA
+    else
+      pathlen^ := c^.pathlen.ToInteger;
   BASIC_CONSTRAINTS_free(c);
 end;
 
@@ -9397,15 +9521,14 @@ procedure GetNext(var P: PUtf8Char; Sep1, Sep2: AnsiChar; var result: RawUtf8);
 var
   S, E: PUtf8Char;
 begin // see GetNextItemTrimed() from mormot.core.text
-  while (P^ <= ' ') and
-        (P^ <> #0) do
+  while P^ in [#1 .. ' '] do
     inc(P); // trim left
   S := P;
   while not (S^ in [#0, Sep1, Sep2]) do
     inc(S);
   E := S;
   while (E > P) and
-        (E[-1] in [#1..' ']) do
+        (E[-1] in [#1 .. ' ']) do
     dec(E); // trim right
   FastSetString(result, P, E);
   if S^ <> #0 then
@@ -9501,9 +9624,9 @@ begin
     Extension(nid).ToUtf8(result);
 end;
 
-function X509.IsCA: boolean;
+function X509.IsCA(pathlen: PInteger): boolean;
 begin
-  result := Extension(NID_basic_constraints).BasicConstraintIsCA;
+  result := Extension(NID_basic_constraints).BasicConstraintIsCA(pathlen);
 end;
 
 function X509.IsSelfSigned: boolean;
@@ -9577,15 +9700,17 @@ const
     XKU_OCSP_SIGN,
     XKU_TIMESTAMP);
 
-function X509.GetUsage: TX509Usages;
+function X509.GetUsage(pathlen: PInteger): TX509Usages;
 var
   f: integer;
   u: TX509Usage;
 begin
   result := [];
+  if pathlen <> nil then
+    pathlen^ := -1;
   if @self = nil then
     exit;
-  if IsCA then
+  if IsCA(pathlen) then
     include(result, kuCA);
   f := X509_get_key_usage(@self); // returns -1 if not present
   if f > 0 then
@@ -9607,12 +9732,12 @@ begin
     result := false
   else
   if u = kuCA then
-    result := IsCA
+    result := IsCA(nil)
   else if (u >= low(KU)) and
           (u <= high(KU)) then
   begin
-    f := X509_get_key_usage(@self); // -1 if not present
-    result := (f > 0) and ((f and KU[u]) <> 0);
+    f := X509_get_key_usage(@self); // -1 if not present -> OK by RFC 5280
+    result := (f < 0) or ((f and KU[u]) <> 0);
   end
   else if (u >= low(XU)) and
           (u <= high(XU)) then
@@ -9720,17 +9845,8 @@ begin
 end;
 
 function X509.IsValidDate(TimeUtc: TDateTime): boolean;
-var
-  na, nb: TDateTime;
-begin
-  na := NotAfter; // 0 if ASN1_TIME_to_tm() not supported by old OpenSSL
-  nb := NotBefore;
-  if TimeUtc = 0 then
-    TimeUtc := NowUtc;
-  result := ((na = 0) or
-             (TimeUtc < na + CERT_DEPRECATION_THRESHOLD)) and
-            ((nb = 0) or
-             (TimeUtc + CERT_DEPRECATION_THRESHOLD > nb));
+begin // NotAfter/NotBefore=0 if ASN1_TIME_to_tm() not supported by old OpenSSL
+  result := IsCertValidDate(TimeUtc, NotAfter, NotBefore);
 end;
 
 function X509.FingerPrint(md: PEVP_MD): RawUtf8;
@@ -10524,7 +10640,7 @@ const
     'WANT_ASYNC_JOB',
     'WANT_CLIENT_HELLO_CB');
 
-procedure SSL_get_error_short(get_error: integer; var dest: shortstring);
+procedure SSL_get_error_short(get_error: integer; var dest: ShortString);
 var
   tmp: ShortString;
 begin
@@ -10538,7 +10654,7 @@ begin
           get_error := ERR_get_error; // unqueue earliest error code
           if get_error <> SSL_ERROR_NONE then
           begin
-            AppendShortTwoChars(ord(' ') + ord('(') shl 8, @dest);
+            AppendShortTwoCharsSafe(ord(' ') + ord('(') shl 8, dest);
             OpenSSL_error_short(get_error, tmp);
             AppendShort(tmp, dest);
             AppendShortCharSafe(')', dest)
@@ -11309,11 +11425,19 @@ begin
             begin
               writeln(OBJ_nid2sn(nid),'=',OBJ_nid2ln(nid),'=', nid,'=',
                 AsnDecOidText(BinaryOid));
-              if nid <> NID_info_access then
-                continue;
-              AsnDecAia(value^.ToBinary, ocsp, isssuers);
-              writeln('ocsp=', RawUtf8ArrayToCsv(ocsp));
-              writeln('issuers=', RawUtf8ArrayToCsv(isssuers));
+              case nid of
+                NID_info_access:
+                  begin
+                    AsnDecAia(value^.ToBinary, ocsp, isssuers);
+                    writeln('  ocsp=', RawUtf8ArrayToCsv(ocsp));
+                    writeln('  issuers=', RawUtf8ArrayToCsv(isssuers));
+                  end;
+                NID_crl_distribution_points:
+                  begin
+                    isssuers := AsnDecCdp(value^.ToBinary);
+                    writeln('  crl=', RawUtf8ArrayToCsv(isssuers));
+                  end;
+              end;
             end;
           writeln('NotBefore= ',DateTimeToStr(fPeer.NotBefore));
           writeln('NotAfter= ',DateTimeToStr(fPeer.NotAfter));

@@ -5587,7 +5587,7 @@ implementation
 function SqlVarToSQlite3Context(const Res: TSqlVar;
   Context: TSqlite3FunctionContext): boolean;
 var
-  tmp: array[0 .. 31] of AnsiChar;
+  tmp: TTemp32;
 begin
   case Res.VType of
     ftNull:
@@ -7922,7 +7922,7 @@ begin
         if p^.VPointer = nil then
           BindNull(arg)
         else
-          Bind(arg, PtrInt(p^.VPointer));
+          Bind(arg, Int64(PtrUInt(p^.VPointer)));
     else
       begin
         VarRecToUtf8(p, tmp);

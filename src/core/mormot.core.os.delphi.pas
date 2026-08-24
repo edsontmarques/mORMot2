@@ -147,6 +147,7 @@ const
   StdOutputHandle   = 1;
   StdErrorHandle    = 2;
   RTLD_LAZY         = Posix.Dlfcn.RTLD_LAZY;
+  RTLD_NOW          = Posix.Dlfcn.RTLD_NOW;
   O_RDONLY          = O_RDONLY;
   O_NONBLOCK        = O_NONBLOCK;
   SEEK_CUR          = SEEK_CUR;
@@ -229,6 +230,7 @@ function FpS_ISLNK(m: cint): boolean;
 
 function fpkill(pid, sig: cint): cint; cdecl;
   external clib name 'kill';
+
 function fpfork: TPid; cdecl;
   external clib name 'fork';
 
@@ -251,6 +253,7 @@ const
 function fpsysctl(name: pcint; namelen: cuint; oldp: pointer;
     oldlenp: psize_t; newp: pointer; newlen: size_t): cint; cdecl;
   external clib name 'sysctl';
+
 function fpsysctlbyname(name: PAnsiChar; oldp: pointer; oldlenp: psize_t;
     newp: pointer; newlen: size_t): cint; cdecl;
   external clib name 'sysctlbyname';
@@ -280,6 +283,7 @@ function fpreaddir(var dirp: Dir): pDirent;
 function fpclosedir(var dirp: Dir): cint;
 
 {$ifdef OSLINUX}
+
 type
   TStatfs = record
     fstype, bsize: clong;
@@ -311,10 +315,17 @@ type
 
 function SysInfo(Info: PSysinfo): cInt; cdecl;
   external clib name 'sysinfo';
+
+function sched_getaffinity(pid: integer;
+    cpusetsize: PtrUInt; cpuset: pointer): integer; cdecl
+  external clib name 'sched_getaffinity';
+
 {$endif OSLINUX}
 
 function fpstatfs(path: PWideChar; nfo: pointer): cint;
 function IsAtty(fd: cint): cint;
+
+procedure _OsLoadResString(Rec: PResStringRec; var Res: string);
 
 
 { ****************** Network POSIX Operating Systems API for Delphi }
@@ -410,8 +421,10 @@ type
 
 function epoll_create(size: cint): cint; cdecl;
   external clib name 'epoll_create';
+
 function epoll_ctl(epfd, op, fd: cint; event: PEPoll_Event): cint; cdecl;
   external clib name 'epoll_ctl';
+
 function epoll_wait(epfd: cint; events: PEPoll_Event;
     maxevents, timeout: cint): cint; cdecl;
   external clib name 'epoll_wait';
@@ -852,6 +865,31 @@ var
 begin
   result := ord(tcgetattr(fd, t) = 0);
 end;
+
+type // main exe-only cut-down version of LLVM POSIX LoadResString() system.pas
+  TResStringResource = packed record
+    ShortLen: word;
+    case integer of
+    0: ( ShortW: TWide4K );
+    1: ( LongLen: cardinal;
+         LongW: TWide4K );
+  end;
+
+procedure _OsLoadResString(Rec: PResStringRec; var Res: string);
+var
+  p: ^TResStringResource;
+begin
+  Res := '';
+  if Rec = nil then
+    exit;
+  p := Posix.Dlfcn.dlsym(FindResourceHInstance(HInstance), Rec^.Key); // main exe only
+  if p <> nil then
+    if p^.ShortLen = $ffff then
+      SetString(Res, p^.ShortW, p^.ShortLen)
+    else
+      SetString(Res, p^.LongW, p^.LongLen);
+end;
+
 
 {****************** Network POSIX Operating Systems API for Delphi }
 

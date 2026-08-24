@@ -79,9 +79,18 @@ const
   /// human-friendly alias to open a file for exclusive writing ($20)
   fmShareRead      = fmShareDenyWrite;
   /// human-friendly alias to open a file for exclusive reading ($30)
-  fmShareWrite     = {$ifdef DELPHIPOSIX} fmShareDenyNone {$else} fmShareDenyRead {$endif};
+  // - use raw FPC/Delphi RTL value fmShareDenyRead to avoid "platform" warnings
+  fmShareWrite     = {$ifdef DELPHIPOSIX} fmShareDenyNone {$else} $0030 {$endif};
   /// human-friendly alias to open a file with no read/write exclusion ($40)
   fmShareReadWrite = fmShareDenyNone;
+  /// hidden file attribute ($02) - i.e. the Delphi/FPC RTL faHidden value
+  faHiddenFile     = $0002;
+  /// system file attribute ($04) - i.e. the Delphi/FPC RTL faSysFile value
+  faSystemFile     = $0004;
+  /// DOS volume label attribute ($08) - i.e. the Delphi/FPC RTL faVolumeID value
+  faVolumeLabel    = $0008;
+  /// WinAPI FILE_ATTRIBUTE_REPARSE_POINT - i.e. the Delphi/FPC RTL faSymLink value
+  faSymbolicLink   = $0400;
 
   /// execute FileOpen/TFileStreamEx.Create for reading without exclusion
   fmOpenReadShared = fmOpenRead or fmShareReadWrite;
@@ -184,6 +193,8 @@ const
   HTTP_GATEWAYTIMEOUT = 504;
   /// HTTP Status Code for "HTTP Version Not Supported"
   HTTP_HTTPVERSIONNONSUPPORTED = 505;
+  /// HTTP Status Code for "Insufficient Storage"
+  HTTP_INSUFFICIENTSTORAGE = 507;
 
   /// a fake response code, generated for client side panic failure/exception
   // - for it is the number of a man, and that number is 666
@@ -688,9 +699,9 @@ const
     {$endif CPUARM}
     {$endif CPUAARCH64}
     {$ifdef CPU32}
-      'cpu32'
+      '32'
     {$else}
-      'cpu64'
+      '64'
     {$endif CPU32}
     {$endif CPUX64}
     {$endif CPUX86};
@@ -760,14 +771,17 @@ var
 // - CpuThreads = SystemInfo.dwNumberOfProcessors is the logical CPU count
 // - as used e.g. by SetThreadAffinity()
 {$ifdef OSLINUXANDROID} function {$endif} CpuSockets: cardinal;
+
 /// how many hardware CPU cores are defined on this system
 // - i.e. the number of physical CPU cores
-// - CpuThreads = SystemInfo.dwNumberOfProcessors is the logical CPU count
+// - CpuThreads = SystemInfo.dwNumberOfProcessors is the logical CPU count,
+// which is the value you are likely to need e.g. for a thread pool dimension
 {$ifdef OSLINUXANDROID} function {$endif} CpuCores: cardinal;
 
 /// the number of available logical CPUs threads
 // - just an alias to SystemInfo.dwNumberOfProcessors compatibility value
 // - on Linux will make fast sched_getaffinity syscall for the current state
+// - this is the main information to scale any thread pool or background process
 {$ifdef OSLINUXANDROID} function {$endif} CpuThreads: cardinal;
 
 {$ifdef OSLINUXANDROID}
@@ -1574,10 +1588,10 @@ type
     // - e.g. 'C:\Dev\lib\SQLite3\exe\TestSQL3.exe 1.2.3.123 (2011-03-29 11:09:06)'
     ProgramFullSpec: RawUtf8;
     /// the main executable file name (including full path)
-    // - same as paramstr(0)
+    // - same as ExpandFileName(paramstr(0))
     ProgramFileName: TFileName;
     /// the main executable full path (excluding .exe file name)
-    // - same as ExtractFilePath(paramstr(0)) - including an ending PathDelim
+    // - same as ExtractFilePath(ExpandFileName(paramstr(0))) - with PathDelim
     ProgramFilePath: TFileName;
     /// the full path of the running executable or library
     // - for an executable, same as paramstr(0)
@@ -1629,7 +1643,7 @@ var
   WindowsUbr: integer;
   /// the current System information, as retrieved for the current process
   // - under a WOW64 process, it will use the GetNativeSystemInfo() new API
-  // to retrieve the real top-most system information
+  // to retrieve the real top-most host system information
   // - note that the lpMinimumApplicationAddress field is replaced by a
   // more optimistic/realistic value ($100000 instead of default $10000)
   // - under BSD/Linux, only contain dwPageSize and dwNumberOfProcessors fields
@@ -1663,7 +1677,8 @@ var
     /// OS allocation page size retrieved from libc's getpagesize() or AT_PAGESZ
     dwPageSize: cardinal;
     /// the number of available logical CPUs threads
-    // - from HW_NCPU (BSD), hw.logicalcpu (macOS) or /proc/cpuinfo (Linux)
+    // - from HW_NCPU (BSD), hw.logicalcpu (macOS), /proc/cpuinfo or a fast
+    // sched_getaffinity syscall (Linux)
     // - prefer the CpuThreads global variable/function instead of this Windowism
     // - see CpuSockets/CpuCores for the number of physical CPU sockets/cores
     dwNumberOfProcessors: cardinal;
@@ -1715,7 +1730,8 @@ var
   // - if mormot.core.log.pas is defined in the project, will redirect to
   // TDebugFile.FindLocationShort() method using .map/.dbg/.mab information, and
   // return filename, symbol name and line number (if any) as plain text, e.g.
-  // '4cb765 ../src/core/mormot.core.base.pas statuscodeissuccess (11183)' on FPC
+  // $ 57f480 mormot.core.log.pas TSynLog.LogEscape (5782)
+  // $ 4a0a40 mormot.core.base.asmx64.inc (mormot.core.base) Rdtsc (3005)
   GetExecutableLocation: function(aAddress: pointer): ShortString;
 
   /// retrieve the MAC addresses of all hardware network adapters
@@ -1724,13 +1740,23 @@ var
   // - as used e.g. by GetComputerUuid() fallback if SMBIOS is not available
   GetSystemMacAddress: function: TRawUtf8DynArray;
 
-/// try to retrieve the file name of the executable/library holding a function
-// - calls dladdr() on POSIX, or GetModuleFileName() on Windows
-function GetExecutableName(aAddress: pointer): TFileName;
-
-/// check if a function address is known within the main executable module
+/// retrieve the base address of the executable/library holding a function
 // - calls dladdr() on POSIX, or GetModuleHandleEx() on Windows
-function IsMainExecutable(aAddress: pointer): boolean;
+// - return the current executable module base (exe or dll) with aAddress = nil
+function GetExecutableBase(aAddress: pointer = nil): PtrUInt;
+
+/// try to retrieve the file name of the executable/library holding a function
+// - calls dladdr() on POSIX - so could return a relative path for a library
+// (but the main exe/lib will return properly expanded Executable.InstanceName)
+// - calls GetModuleHandleEx() then GetModuleFileNameW() on Windows so
+// always returns an absolute path
+function GetExecutableName(aAddress: pointer; aBase: PPtrUInt = nil;
+  aSymbol: PPUtf8Char = nil): TFileName;
+
+/// check if a function address is known within the current running module
+// - not the main process, but the current module - maybe a dll
+// - calls dladdr() on POSIX, or GetModuleHandleEx() against HInstance on Windows
+function IsCurrentExecutable(aAddress: pointer): boolean;
 
 type
   /// identify an operating system folder for GetSystemPath()
@@ -2841,7 +2867,7 @@ function WinApiErrorString(Code: cardinal; Lib: HMODULE = 0): string;
 
 /// return the error message - maybe of a given library - as UTF-8 ShortString
 // - may be used e.g. in conjunction with Exception.CreateUtf8()
-function WinApiErrorShort(Code: cardinal; Lib: HMODULE = 0): shortstring;
+function WinApiErrorShort(Code: cardinal; Lib: HMODULE = 0): ShortString;
 
 /// return the error message - maybe of a given library - as UTF-8 string
 function WinApiErrorUtf8(Code: cardinal; Lib: HMODULE = 0): RawUtf8;
@@ -3073,7 +3099,7 @@ type
     ELevel: TSynLogLevel;
     {$ifdef OSWINDOWS}
     /// retrieve some DotNet CLR extended information about a given Exception
-    function AdditionalInfo(var dest: shortstring): boolean;
+    function AdditionalInfo(var dest: ShortString): boolean;
     {$endif OSWINDOWS}
   end;
 
@@ -3385,7 +3411,7 @@ type
   TFileStreamEx = class(THandleStream)
   protected
     fFileName : TFileName;
-    fDontReleaseHandle: boolean;
+    fDontReleaseHandle, fDeleteFileOnDestroy: boolean;
     function GetSize: Int64; override;
   public
     /// open or create the file from its name, depending on the supplied Mode
@@ -3404,6 +3430,9 @@ type
     /// Destroy calls FileClose(Handle) unless this property is true
     property DontReleaseHandle: boolean
       read fDontReleaseHandle write fDontReleaseHandle;
+    /// Destroy calls DeleteFile(FileName) if this property is true
+    property DeleteFileOnDestroy: boolean
+      read fDeleteFileOnDestroy write fDeleteFileOnDestroy;
     /// the file name assigned to this class constructor
     property FileName : TFileName
       read fFilename;
@@ -3423,6 +3452,21 @@ type
       var aFileName: TFileName; aAliases: integer = 3);
     /// this overriden function returns Count, as if it was always successful
     function Write(const Buffer; Count: Longint): Longint; override;
+  end;
+
+  /// file stream which deletes its own file once the instance is released
+  // - the temporary file lifetime is therefore bound to this instance, with no
+  // additional tracking needed by the caller
+  // - used e.g. as TOnHttpServerBodyDownload spool file
+  // - set DeleteFileOnDestroy := false e.g. once the file has been renamed or
+  // moved by the process, so should not be deleted any more
+  TFileStreamEventuallyDelete = class(TFileStreamEx)
+  public
+    /// open or create the file, which will be deleted by Destroy
+    // - Mode is typically fmCreate, but a spooled file meant to be read back
+    // by its name while this instance is still open needs a sharing mode, e.g.
+    // fmCreate or fmShareRead (which is mandatory on Windows)
+    constructor Create(const aFileName: TFileName; Mode: cardinal); reintroduce;
   end;
 
 /// a wrapper around FileRead() to ensure a whole memory buffer is retrieved
@@ -3794,8 +3838,26 @@ type
     procedure Close;
   end;
 
+  /// the executable formats recognized by FindExeSection() function
+  TExeFormat = (
+    efUnknown,
+    efPE32,
+    efPE32Plus,
+    efElf32,
+    efElf64);
+
 /// quickly check if a resource do exist - just cross-platform wrapper to FindResource()
 function ResourceExists(ResourceName, ResType: PChar; Instance: TLibHandle = 0): boolean;
+
+/// try to load a resourcestring from the current executable - used on Delphi
+procedure OsLoadResString(ResStringRec: PResStringRec; var Res: string);
+
+/// retrieve raw information about one section from a memory-mapped ELF/PE file
+// - cross-plaform function able to parse Little-Endian ELF32/ELF64 or PE files
+// - can optionally return the ImageBase value from COFF extended header
+// - is a much faster alternative to exeinfo FindExeSection()
+function FindExeSection(const exe: TMemoryMap; name: PUtf8Char;
+  var offset, size: integer; imgbase: PQWord = nil): TExeFormat;
 
 type
   /// store CPU and RAM usage for a given process
@@ -3893,6 +3955,19 @@ function ReserveExecutableMemory(size: cardinal
 // buffer, so its size should be < 4KB
 // - do nothing on Windows and Linux, but may be needed on OpenBSD / OSX
 procedure ReserveExecutableMemoryPageAccess(Reserved: pointer; Exec: boolean);
+
+/// allocate two pages of memory, the first R/W as usual, the second with GPF on access
+// - follow SystemInfo.dwPageSize value and VirtualProtect/mprotect raw API
+// - return a pointer to the access protected second page, for regression tests
+function GetmemDualAccessPagesLock: pointer; overload;
+
+/// make a copy of some text with GPF on any memory access just after it
+// - Content should be <= SystemInfo.dwPageSize - typically <= 4KB
+// - return a pointer to the copied Content bytes, for regression tests
+function GetmemDualAccessPagesLock(const Content: RawByteString): pointer; overload;
+
+/// to be called once GetmemDualAccessPagesLock() memory is not used any more
+procedure GetmemDualAccessPagesUnLock;
 
 /// check if the supplied pointer is actually pointing to some memory page
 // - will call slow but safe VirtualQuery API on Windows, or try a fpaccess()
@@ -4005,8 +4080,24 @@ function GetDiskAvailable(aDriveFolderOrFile: TFileName): QWord;
 /// retrieve low-level information about all mounted disk partitions of the system
 function GetDiskPartitions: TDiskPartitions;
 
-/// call several Operating System APIs to gather 512-bit of entropy information
+/// call several high-level Operating System APIs to XOR a 512-bit buffer
+// - in respect to XorEntropy() from mormot.core.base, call some more entropy-rich,
+// but also (much) slower APIs like /proc/* files on Linux or system times counters
+// - not to be called by itself, but as part of entropy gathering
+// - consider TAesPrng.GetEntropy() from mormot.crypt.core instead
 procedure XorOSEntropy(var e: THash512Rec);
+
+/// low-level function returning some random binary from the Operating System
+// - on Windows, calls ProcessPrng() since Windows 8 or fallback to RtlGenRandom()
+// - on POSIX, following "man urandom", only up to 256 bytes (2048-bits) are
+// retrieved from /dev/urandom or /dev/random or Linux 3.17+ getrandom syscall,
+// then any Len > 256 will be padded with "L'Ecuyer" gsl_rng_taus2 - so you
+// may consider that the output Buffer is always filled with randomness
+// - AllowBlocking=false would try /dev/random if /dev/urandom did fail
+// - you should not have to call this low-level procedure, but faster and broader
+// TAesPrng from mormot.crypt.core - also consider the TSystemPrng class
+// - if you need some entropy source, consider TAesPrng.GetEntropy() instead
+function FillSystemRandom(Buffer: PByteArray; Len: integer; AllowBlocking: boolean): boolean;
 
 type
   /// available console colors for TextColor/TextBackground functions
@@ -4086,13 +4177,13 @@ procedure ConsoleWriteRaw(const Text: RawUtf8; NoLineFeed: boolean = false); ove
 procedure ConsoleWriteLn;
 
 /// will wait for the ENTER key to be pressed, with all needed waiting process
-// - on the main thread, will call Synchronize() for proper work e.g. with
-// interface-based service implemented as optExecInMainThread
+// - on the main thread, doCheckSynchronize=true calls Synchronize() for proper
+// work e.g. with interface-based service implemented as optExecInMainThread
 // - on Windows, from a non-main Thread, respond to PostThreadMessage(WM_QUIT)
 // - on Windows, also properly respond to Ctrl-C or closing console events
 // - on POSIX, will call SynDaemonIntercept first, so that Ctrl-C or SIG_QUIT
 // will also be intercepted and let this procedure return
-procedure ConsoleWaitForEnterKey;
+procedure ConsoleWaitForEnterKey(doCheckSynchronize: boolean = false);
 
 /// read all available content from stdin
 // - could be used to retrieve some file piped to the command line
@@ -4116,11 +4207,11 @@ type
 // - supposed to be called in a loop, so expects ms value in [50..200] range
 // - can optionally call WaitForSingleObject(h) instead of plain Sleep()
 // - can intercept messages and return wwfQuit on WM_QUIT on a sub-thread
-// - running on the main thread, would properly call CheckSynchronize(ms) then
-// Application.ProcessMessages, as expected by a regular GUI application
+// - running on the main thread, calls Application.ProcessMessages, as expected
+// by a regular GUI application, and CheckSynchronize(ms) if checkSync is true
 // - outside the main thread, behave like a single Sleep/WaitForSingleObject
 function WinWaitFor(ms: cardinal; h: THandle = 0;
-  checkSubThreadQuit: boolean = false): TWinWaitFor;
+  checkSubThreadQuit: boolean = false; checkSync: boolean = false): TWinWaitFor;
 
 /// local RTL wrapper function which redirects to Unicode_ToUtf8()
 procedure Win32PWideCharToUtf8(P: PWideChar; Len: PtrInt; out res: RawUtf8);
@@ -4209,17 +4300,6 @@ function PosixUid: cardinal;
 function PosixGid: cardinal;
 {$endif OSLINUXANDROID}
 
-/// low-level function returning some random binary from the Operating System
-// - Windows version calling the CryptGenRandom API is in mormot.core.os.security
-// - on POSIX, only up to 256 bytes (2048-bits) are retrieved from /dev/urandom
-// or /dev/random (or Linux getrandom syscall) as stated by "man urandom" Usage -
-// then padded with our shared gsl_rng_taus2 "L'Ecuyer" random generator
-// - so you may consider that the output Buffer is always filled with random
-// - you should not have to call this low-level procedure, but faster and safer
-// TAesPrng from mormot.crypt.core - also consider the TSystemPrng class
-function FillSystemRandom(Buffer: PByteArray; Len: integer;
-  AllowBlocking: boolean): boolean;
-
 {$endif OSWINDOWS}
 
 /// will append the value as one-decimal number text and B/KB/MB/GB/TB suffix
@@ -4229,12 +4309,12 @@ procedure AppendKb(Size: Int64; var Dest: ShortString; WithSpace: boolean = fals
 
 /// convert a size to a human readable value
 // - append EB, PB, TB, GB, MB, KB or B symbol with preceding space
-function KB(Size: Int64): TShort16; overload;
+function KB(Size: Int64): TShort15; overload;
   {$ifdef FPC_OR_UNICODE}inline;{$endif} // Delphi 2007 is buggy as hell
 
 /// convert a size to a human readable value
 // - append EB, PB, TB, GB, MB, KB or B symbol without preceding space
-function KBNoSpace(Size: Int64): TShort16;
+function KBNoSpace(Size: Int64): TShort15;
   {$ifdef FPC_OR_UNICODE}inline;{$endif} // Delphi 2007 is buggy as hell
 
 /// return a date/time value as '2026-03-27 13:59:30' UTF-8 text
@@ -4285,8 +4365,12 @@ type
     fTryFromExecutableFolder: boolean;
     {$ifdef OSPOSIX}
     fLibraryPathTested: boolean;
+    {$else}
+    fDisableLibrarySetDirectory: boolean;
     {$endif OSPOSIX}
   public
+    /// setup this instance
+    constructor Create; virtual;
     /// cross-platform resolution of a function entry in this library
     // - if RaiseExceptionOnFailure is set, missing entry will call FreeLib then raise it
     // - ProcName can be a space-separated list of procedure names, to try
@@ -4329,6 +4413,12 @@ type
     // - see also the even more unsafe LibraryGlobalPath variable
     property TryFromExecutableFolder: boolean
       read fTryFromExecutableFolder write fTryFromExecutableFolder;
+    {$ifdef OSWINDOWS}
+    /// if set, will disable LibrarySetDirectory() Windows API logic in loading
+    // - see also DefaultDisableLibrarySetDirectory global variable
+    property DisableLibrarySetDirectory: boolean
+      read fDisableLibrarySetDirectory write fDisableLibrarySetDirectory;
+    {$endif OSWINDOWS}
   end;
 
   /// used to track e.g. a library or API availability at runtime
@@ -4348,6 +4438,12 @@ var
   // specify the expected full path of a library, if possible
   LibraryGlobalPath: TFileName;
 
+  {$ifdef OSWINDOWS}
+  /// the default value of TSynLibrary.DisableLibrarySetDirectory property
+  // - could be used if you want to call manually LibrarySetDirectory()
+  DefaultDisableLibrarySetDirectory: boolean;
+  {$endif OSWINDOWS}
+
 /// call once Init if State is in its default lsUntested (0) value
 function LibraryAvailable(var State: TLibraryState; Init: TProcedure): boolean;
   {$ifdef HASINLINE} inline; {$endif}
@@ -4357,28 +4453,36 @@ procedure DoLibraryAvailableInit(var State: TLibraryState; Init: TProcedure); //
 
 { *************** Per Class Properties O(1) Lookup via vmtAutoTable Slot }
 
-/// self-modifying code - change some memory buffer in the code segment
+/// self-modifying code - change some memory buffer in the code/data segment
 // - if Backup is not nil, it should point to a Size array of bytes, ready
 // to contain the overridden code buffer, for further hook disabling
-// - some systems do forbid such live patching: consider setting NOPATCHVMT
-// and NOPATCHRTL conditionals for such projects
-procedure PatchCode(Old, New: pointer; Size: PtrInt; Backup: pointer = nil;
-  LeaveUnprotected: boolean = {$ifdef OSLINUX} true {$else} false {$endif});
+// - some systems do forbid such live patching: your code should have a fallback
+// mechanism if the patch was not applied - also consider forcing NOPATCHVMT and
+// NOPATCHRTL conditionals at project level e.g. on SELinux or hardened containairs
+// - called with Size < 0 e.g. from PatchPointer() to mark it is not a code
+// segment but a data segment to call mprotect(RW) and not mprotect(RWX)
+// - Android and BSD/Mac will restore to R (Size<0) or RX (Size>0) immediately
+// - on Linux maintains a list of patched pages until PatchCodeProtectBack is called
+function PatchProcess(Old, New: pointer; Size: PtrInt; Backup: pointer = nil): boolean;
 
-/// self-modifying code - change one PtrUInt in the code segment
-procedure PatchCodePtrUInt(Code: PPtrUInt; Value: PtrUInt;
-  LeaveUnprotected: boolean = {$ifdef OSLINUX} true {$else} false {$endif});
+/// self-modifying code - change one PtrUInt/pointer value in a data segment
+// - typically one function redirection entry in a class VMT table
+function PatchPointer(Vmt: PPtrUInt; Value: PtrUInt): boolean;
 
 {$ifdef CPUINTEL}
 /// low-level i386/x86_64 asm routine patch and redirection
-procedure RedirectCode(Func, RedirectFunc: pointer);
+function RedirectCode(Func, RedirectFunc: pointer): boolean;
 {$endif CPUINTEL}
 
-/// close any LeaveUnprotected=true R/W/X memory-mapped paged back as R/X
-// - could be used to harden back all memory regions at once, when every RTTI,
-// ORM or SOA features are eventually initialized
-// - only implemented and tested on Linux by now
+/// close any RedirectCode() RWX memory-mapped paged back as RX
+// - could be used to harden back all memory regions at once, when every unit
+// has eventually been initialized and all RTL code has been patched
+// - won't restore PatchPointer(VMT) pages from RW to R since it triggers GPF
+// and is not unsafe by design (only the PROT_EXEC is involved for NX protection)
+// - only implemented and tested on Linux by now - Android BSD MacOS (and some
+// hardened SELinux/containers policy) do not allow mprotect() with RWX anyway
 procedure PatchCodeProtectBack;
+  {$ifndef OSLINUX} {$ifdef HASINLINE} inline; {$endif} {$endif}
 
 
 { **************** TSynLocker/TSynLocked and Low-Level Threading Features }
@@ -4716,8 +4820,8 @@ type
   PLockedListOne = ^TLockedListOne;
   /// abstract parent of one data entry in TLockedList, storing two PLockedListOne
   // - TLockedList should store unmanaged records starting with those fields
-  // - sequence field contains an incremental random-seeded 30-bit integer > 65535,
-  // to avoid ABA problems when instances are recycled
+  // - sequence field contains an incremental random-seeded 30-bit integer >
+  // 65535, to avoid ABA problems when instances are recycled
   TLockedListOne = record
     next, prev: pointer;
     sequence: PtrUInt;
@@ -4732,7 +4836,7 @@ type
   TLockedList = object
   {$endif USERECORDWITHMETHODS}
   public
-    /// thread-safe access to the list
+    /// thread-safe access to the list - single pointer size field
     Safe: TLightLock;
     /// how many TLockedListOne instances are currently stored in this list
     // - excluding the instances in the recycle bin
@@ -5026,17 +5130,14 @@ type
   end;
 
   /// our lightweight cross-platform TEvent-like component
-  // - on Windows, calls directly the CreateEvent/ResetEvent/SetEvent API
-  // - on Linux, will use eventfd() in blocking and non-semaphore mode
-  // - on other POSIX, will use PRTLEvent which is lighter than TEvent BasicEvent
-  // - WARNING: you should wait from a single thread at once
+  // - on Linux, use directly an atomic CAS and private futex syscall if needed
+  // - on Windows 8+, use an atomic CAS and WaitOnAddress() API
+  // - on BSD or WinXP-7, fallback to FPC PRTLEvent or CreateEvent() Win32 API
+  // - WARNING: by design, this class accept a single WaitFor() thread
   TSynEvent = class(TSynPersistent)
   protected
-    fHandle: pointer; // Windows THandle, FPC PRTLEvent or Delphi-POSIX TEvent
-    {$ifdef OSLINUX}
-    fFD: integer;     // for eventfd()
-    {$endif OSLINUX}
-    fNotified, fWaiting: boolean;
+    fRtlEvent: pointer; // Windows THandle, FPC PRTLEvent or Delphi-POSIX TEvent
+    fState: cardinal;   // 32-bit CAS futex (bit 1=signaled, bit 2=waiting)
   public
     /// initialize an instance of cross-platform event
     constructor Create; override;
@@ -5059,15 +5160,12 @@ type
     function WaitForSafe(TimeoutMS: cardinal; DisableSafe: boolean = false): boolean;
     /// calls SleepHiRes() in steps while checking terminated flag and this event
     function SleepStep(var start: Int64; terminated: PBoolean): Int64;
-    /// could be used to tune your algorithm if the eventfd() API is used
-    function IsEventFD: boolean;
-      {$ifdef HASINLINE} inline; {$endif}
     /// low-level read-only access to the internal SetEvent flag
-    property Notified: boolean
-      read fNotified;
+    // - only indicative, and not truly thread-safe by design
+    function Notified: boolean;
     /// low-level flag if WaitFor/WaitForEver/WaitForSafe are blocking
-    property Waiting: boolean
-      read fWaiting;
+    // - only indicative, and not truly thread-safe by design
+    function Waiting: boolean;
   end;
 
   /// a thread-safe class with a virtual constructor and properties persistence
@@ -5099,7 +5197,7 @@ type
   // - publishes our lightweight exclusive non-reentrant lock
   TObjectLightLock = class(TSynPersistent)
   protected
-    fSafe: TLightLock;
+    fSafe: TLightLock; // single pointer size field
   public
     /// access to the associated lightweight exclusive non-reentrant lock instance
     property Safe: TLightLock
@@ -5185,6 +5283,15 @@ type
 // - as used e.g. by TSynLocked/TSynLockedWithRttiMethods to reduce class instance size
 function NewSynLocker: PSynLocker;
 
+/// raw cross-platform futex-like to wait while Value^ = Expected
+// - use futex on Linux, WaitOnAddress() on Win8+, or equal nil otherwise
+// - caller should ensure Value <> nil and eventually make LockedExc32() CAS
+var OsWaitOnValue: procedure(Value: PCardinal; Expected, TimeoutMS: cardinal);
+
+/// raw cross-platform futex-like unlock of the next waiting OsWakeOnValue()
+// - use futex on Linux, WakeByAddresssingle() on Win8+, equal nil otherwise
+var OsWakeOnValue: procedure(Value: PCardinal); {$ifdef OSWINDOWS} stdcall; {$endif}
+
 type
   TCachedValueCall = function(Param: pointer): RawByteString;
   /// raw thread-safe cache of a RawByteString content
@@ -5194,7 +5301,7 @@ type
   TCachedValue = object
   {$endif USERECORDWITHMETHODS}
   public
-    Safe: TLightLock;
+    Safe: TLightLock; // single pointer size field
     Tix32: cardinal;
     Value: RawByteString;
     procedure Reset;
@@ -6203,12 +6310,14 @@ type
   // roWinNoProcessDetach is defined - e.g. as RUN_CMD for RunCommand/RunRedirect
   // - roWinNewConsole won't inherit the parent console, but have its own console
   // - roWinKeepProcessOnTimeout won't make Ctrl+C / WM_QUIT or TerminateProcess
+  // - roWinCheckSynchronize will call CheckSynchronize() from the main thread
   TRunOptions = set of (
     roEnvAddExisting,
     roWinJobCloseChildren,
     roWinNoProcessDetach,
     roWinNewConsole,
-    roWinKeepProcessOnTimeout);
+    roWinKeepProcessOnTimeout,
+    roWinCheckSynchronize);
 
 const
   /// the default options for RunCommand() and RunRedirect() transient execution
@@ -6478,13 +6587,13 @@ begin
   FastSetString(result, @tmp[1], ord(tmp[0]));
 end;
 
-function KB(Size: Int64): TShort16;
+function KB(Size: Int64): TShort15;
 begin
   result[0] := #0;
   AppendKb(Size, result, {withspace=}true);
 end;
 
-function KBNoSpace(Size: Int64): TShort16;
+function KBNoSpace(Size: Int64): TShort15;
 begin
   result[0] := #0;
   AppendKb(Size, result, {withspace=}false);
@@ -6537,7 +6646,7 @@ const // cf https://preview.changewindows.org/platforms/pc
      10240,  10586,  14393,  15063,  16299,  17134,  17763,  18362,  18363,
      19041,  19042,  19043,  19044,  19045,  22000,  22621,  22631,  26100,
      26200,  27881); // detect 26H2 Canary builds since 19/6/2025
-  DESKTOP_TXT: array[0 .. high(DESKTOP_INT), 0 .. 3] of AnsiChar = (
+  DESKTOP_TXT: array[0 .. high(DESKTOP_INT)] of TTemp4  = (
     '1507', '1511', '1607', '1703', '1709', '1803', '1809', '1903', '1909',
     '2004', '20H2', '21H1', '21H2', '22H2', '21H2', '22H2', '23H2', '24H2',
     '25H2', '26H2'); // stored as 32-bit cardinal = array[0..3] of AnsiChar
@@ -6740,7 +6849,7 @@ begin
   os := GetSystemError(error);
   if os in [seSuccess, seOther] then
     exit;
-  AppendShortTwoChars(ord(' ') + ord('[') shl 8, @result);
+  AppendShortTwoCharsSafe(ord(' ') + ord('[') shl 8, result);
   SystemErrorAppend(os, result);
   AppendShortCharSafe(']', result);
 end;
@@ -7088,7 +7197,7 @@ end;
 
 function GetErrorText(error: integer): RawUtf8;
 var
-  txt: shortstring;
+  txt: ShortString;
 begin
   if error = 0 then
     error := GetLastError;
@@ -7136,13 +7245,13 @@ end;
 
 { *************** Per Class Properties O(1) Lookup via vmtAutoTable Slot }
 
-procedure PatchCodePtrUInt(Code: PPtrUInt; Value: PtrUInt; LeaveUnprotected: boolean);
+function PatchPointer(Vmt: PPtrUInt; Value: PtrUInt): boolean;
 begin
-  PatchCode(Code, @Value, SizeOf(Code^), nil, LeaveUnprotected);
+  result := PatchProcess(Vmt, @Value, -SizeOf(Vmt^)); // < 0 for a data segment
 end;
 
 {$ifdef CPUINTEL}
-procedure RedirectCode(Func, RedirectFunc: pointer);
+function RedirectCode(Func, RedirectFunc: pointer): boolean;
 var
   rel: PtrInt;
   NewJump: packed record
@@ -7150,6 +7259,7 @@ var
     Distance: integer; // relative jump is 32-bit even on CPU64
   end;
 begin
+  result := false;
   if (Func = nil) or
      (RedirectFunc = nil) or
      (Func = RedirectFunc) then
@@ -7161,8 +7271,7 @@ begin
   if NewJump.Distance <> rel then
     exit; // RedirectFunc is too far away from the original code :(
   {$endif CPU64}
-  PatchCode(Func, @NewJump, SizeOf(NewJump));
-  assert(PByte(Func)^ = $e9);
+  result := PatchProcess(Func, @NewJump, SizeOf(NewJump));
 end;
 {$endif CPUINTEL}
 
@@ -7309,7 +7418,7 @@ end;
 
 procedure Unicode_CodePageName(CodePage: cardinal; var Name: ShortString);
 begin // cut-down and fixed version of FPC rtl/objpas/sysutils/syscodepages.inc
-  case codepage of
+  case CodePage of
     932:
       Name  := 'SHIFT_JIS';
     936:
@@ -7333,7 +7442,7 @@ begin // cut-down and fixed version of FPC rtl/objpas/sysutils/syscodepages.inc
     28591 .. 28606:
       begin
         Name := 'ISO-8859-';
-        AppendShortByte(codepage - 28590, @Name); // append '0'..'16'
+        AppendShortByte(CodePage - 28590, @Name); // append '0'..'16'
       end;
     50220, 50222:
       Name := 'ISO-2022-JP';
@@ -7355,8 +7464,10 @@ begin // cut-down and fixed version of FPC rtl/objpas/sysutils/syscodepages.inc
       Name := 'UTF8';
   else
     begin  // 'WINDOWS-####' is enough for most code pages
-      Name := 'WINDOWS-';
-      AppendShortCardinal(codepage, Name);
+      Name[0] := #0;
+      if (CodePage shr 16) = 0 then
+        Name := 'WINDOWS-';
+      AppendShortCardinal(CodePage, Name);
     end; // ICU expects 'CP####' for IBM codepages which are not Windows'
   end;
   Name[ord(Name[0]) + 1] := #0; // ensure is ASCIIZ - e.g. for ucnv_open()
@@ -7709,22 +7820,22 @@ begin
 end;
 
 const
-  // faHidden is supported by the FPC RTL on POSIX, by checking an initial '.'
-  faInvalid = faDirectory + {$ifdef OSWINDOWS} faVolumeID{%H-} + {$endif} faSysFile{%H-};
+  // faHiddenFile is supported by the FPC RTL on POSIX, by checking an initial '.'
+  faInvalid = faDirectory + {$ifdef OSWINDOWS} faVolumeLabel + {$endif} faSystemFile;
 
 function SearchRecValidFile(const F: TSearchRec; IncludeHidden: boolean): boolean;
 begin
   result := (F.Name <> '') and
             (F.Attr and faInvalid = 0) and
             (IncludeHidden or
-             (F.Attr and faHidden{%H-} = 0));
+             (F.Attr and faHiddenFile = 0));
 end;
 
 function SearchRecValidFolder(const F: TSearchRec; IncludeHidden: boolean): boolean;
 begin
   result := (F.Attr and faDirectory <> 0) and
             (IncludeHidden or
-             (F.Attr and faHidden{%H-} = 0)) and
+             (F.Attr and faHiddenFile = 0)) and
             (F.Name <> '') and
             (F.Name <> '.') and
             (F.Name <> '..');
@@ -7735,7 +7846,7 @@ function FindFirstDirectory(const Path: TFileName; IncludeHidden: boolean;
 begin
   result := faDirectory;
   if IncludeHidden then
-    result := result or faHidden{%H-};
+    result := result or faHiddenFile;
   result := FindFirst(Path, result, F);
 end;
 
@@ -7746,6 +7857,7 @@ constructor TFileStreamEx.Create(const aFileName: TFileName; Mode: cardinal);
 var
   h: THandle;
 begin
+  SetLastError(0);
   if Mode and fmCreate = fmCreate then
     h := FileCreate(aFileName, Mode and $00ff) // fmCreate=$ffff on oldest Delphi
   else
@@ -7785,11 +7897,24 @@ destructor TFileStreamEx.Destroy;
 begin
   if not fDontReleaseHandle then
     FileClose(Handle); // otherwise file remains opened (FPC RTL inconsistency)
+  if fDeleteFileOnDestroy and
+     (fFileName <> '') then
+    DeleteFile(fFileName);
 end;
 
 function TFileStreamEx.GetSize: Int64;
 begin
   result := FileSize(Handle); // faster than 3 FileSeek() calls - and threadsafe
+end;
+
+
+{ TFileStreamEventuallyDelete }
+
+constructor TFileStreamEventuallyDelete.Create(
+  const aFileName: TFileName; Mode: cardinal);
+begin
+  inherited Create(aFileName, Mode); // raise EOSException on invalid handle
+  fDeleteFileOnDestroy := true;      // delete if no EOSException did happen
 end;
 
 
@@ -8789,6 +8914,237 @@ begin
   result := FindResource(Instance, ResourceName, ResType) <> 0;
 end;
 
+procedure OsLoadResString(ResStringRec: PResStringRec; var Res: string);
+begin
+  {$ifdef FPC}
+  res := ResStringRec^; // FPC pre-loads all its resources in memory
+  {$else}
+  _OsLoadResString(ResStringRec, Res); // DELPHI Windows/LLVM cut-down version
+  {$endif FPC}
+end;
+
+type
+  TDosHeader = packed record
+    e_magic: word;
+    padding: array[0..28] of word;
+    e_lfanew: cardinal;
+  end;
+  PDosHeader = ^TDosHeader;
+  TPeHeader = packed record
+    Signature: cardinal;
+    Machine, NumberOfSections: word;
+    TimeDateStamp, PointerToSymbolTable, NumberOfSymbols: cardinal;
+    SizeOfOptionalHeader, Characteristics: word;
+  end;
+  TPeSection = packed record
+    Name8: QWord;
+    VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData,
+    PointerToRelocations, PointerToLinenumbers: cardinal;
+    NumberOfRelocations, NumberOfLinenumbers: word;
+    Characteristics: cardinal;
+  end;
+  TPeOptHeader = packed record
+    Magic, Linker: word;
+    SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData,
+    AddressOfEntryPoint, BaseOfCode: cardinal;
+    case integer of
+      0: (BaseOfData32, ImageBase32: cardinal);
+      1: (ImageBase64: QWord);
+  end;
+
+  TElfHeader = packed record
+    magic: cardinal;
+    file_class, data_encoding, file_version, os_abi: byte;
+    padding: array[0..7] of byte;
+    e_type, e_machine: word;
+    e_version: cardinal;
+    case integer of
+      0: (entry32, phoff32, shoff32, flags32: cardinal;
+          ehsize32, phentsize32, phnum32, shentsize32, shnum32, shstrndx32: word);
+      1: (entry64, phoff64, shoff64: QWord;
+          flags64: cardinal;
+          ehsize64, phentsize64, phnum64, shentsize64, shnum64, shstrndx64: word);
+  end;
+  TElfProg32 = packed record
+    p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align: cardinal;
+  end;
+  TElfProg64 = packed record
+    p_type, p_flags: cardinal;
+    p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align: QWord;
+  end;
+  TElfSection32 = packed record
+    sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
+    sh_link, sh_info, sh_addralign, sh_entsize: cardinal;
+  end;
+  TElfSection64 = packed record
+    sh_name, sh_type: cardinal;
+    sh_flags, sh_addr, sh_offset, sh_size: QWord;
+    sh_link, sh_info: cardinal;
+    sh_addralign, sh_entsize: QWord;
+  end;
+
+function FindExeSection(const exe: TMemoryMap; name: PUtf8Char;
+  var offset, size: integer; imgbase: PQWord): TExeFormat;
+var
+  e: ^TElfHeader;
+  es32, estr32: ^TElfSection32;
+  es64, estr64: ^TElfSection64;
+  ep32: ^TElfProg32;
+  ep64: ^TElfProg64;
+  pe: ^TPeHeader;
+  coff: ^TPeOptHeader;
+  ps: ^TPeSection;
+  ef: TExeFormat;
+  tmp: TTemp16;
+  names, one: PAnsiChar;
+  n, a, c: PtrUInt;
+begin
+  result := efUnknown;
+  if imgbase <> nil then
+    imgbase^ := 0; // reset to 0
+  e := pointer(exe.Buffer);
+  if (e = nil) or
+     (name = nil) then
+    exit;
+  if (exe.Size > SizeOf(e^)) and
+     (e^.magic = $464c457f) and  // ELF
+     (e^.file_version = 1) and
+     (e^.data_encoding = 1) then // Little Endian
+  case e^.file_class of
+    1: // ELFCLASS32
+      begin
+        n := e^.shnum32;
+        if (n = 0) or
+           (e^.shoff32 = 0) or
+           (e^.shstrndx32 >= n) or
+           (e^.shentsize32 <> SizeOf(es32^)) or
+           (Int64(e^.shoff32) + PtrInt(n * SizeOf(es32^)) > exe.Size) then
+          exit;
+        if (imgbase <> nil) and
+           (Int64(e^.phoff32) + PtrInt(e^.phnum32) * SizeOf(ep32^) <= exe.Size) then
+        begin
+          ep32 := pointer(exe.Buffer + e^.phoff32);
+          a := high(a);
+          for c := 1 to e^.phnum32 do
+          begin
+            if ep32^.p_type = 1 then
+              a := MinPtrUInt(a, ep32^.p_vaddr);
+            inc(ep32);
+          end;
+          if a <> high(a) then
+            imgbase^ := a;
+        end;
+        es32 := pointer(exe.Buffer + e^.shoff32);
+        estr32 := @PByteArray(es32)[e^.shstrndx32 * SizeOf(es32^)];
+        names := exe.Buffer + estr32^.sh_offset;
+        repeat
+          if (es32^.sh_name < estr32^.sh_size) and
+             (mormot.core.base.StrComp(names + es32^.sh_name, name) = 0) then
+          begin
+            if Int64(es32^.sh_offset) + PtrInt(es32^.sh_size) > exe.Size then
+              exit;
+            offset := es32^.sh_offset;
+            size := es32^.sh_size;
+            result := efElf32;
+            exit;
+          end;
+          inc(es32);
+          dec(n);
+        until n = 0;
+      end;
+    2: // ELFCLASS64
+      begin
+        n := e^.shnum64;
+        if (n = 0) or
+           (e^.shoff64 = 0) or
+           (e^.shstrndx64 >= n) or
+           (e^.shentsize64 <> SizeOf(es64^)) or
+           (Int64(e^.shoff64) + PtrInt(n * SizeOf(es64^)) > exe.Size) then
+          exit;
+        if (imgbase <> nil) and
+           (Int64(e^.phoff64) + PtrInt(e^.phnum64) * SizeOf(ep64^) <= exe.Size) then
+        begin
+          ep64 := pointer(exe.Buffer + e^.phoff64);
+          a := high(a);
+          for c := 1 to e^.phnum64 do
+          begin
+            if ep64^.p_type = 1 then
+              a := MinPtrUInt(a, ep64^.p_vaddr);
+            inc(ep64);
+          end;
+          if a <> high(a) then
+            imgbase^ := a;
+        end;
+        es64 := pointer(exe.Buffer + e^.shoff64);
+        estr64 := @PByteArray(es64)[e^.shstrndx64 * SizeOf(es64^)];
+        names := exe.Buffer + estr64^.sh_offset;
+        repeat
+          if (es64^.sh_name < estr64^.sh_size) and
+             (mormot.core.base.StrComp(names + es64^.sh_name, name) = 0) then
+          begin
+            if (Int64(es64^.sh_offset) + PtrInt(es64^.sh_size) > exe.Size) or
+               (es64^.sh_offset > MaxInt) or // output args are 32-bit integers
+               (es64^.sh_size > MaxInt) then
+              exit;
+            offset := es64^.sh_offset;
+            size := es64^.sh_size;
+            result := efElf64;
+            exit;
+          end;
+          inc(es64);
+          dec(n);
+        until n = 0;
+      end;
+  end
+  else if (PDosHeader(e)^.e_magic = $5A4D) and // DOS
+          (PDosHeader(e)^.e_lfanew + SizeOf(pe^) < exe.Size) then
+  begin
+    pe := pointer(exe.Buffer + PDosHeader(e)^.e_lfanew); // COFF
+    n := pe^.NumberOfSections; // pe^.NumberOfSymbols=0 if external .dbg file
+    if (pe^.Signature <> $00004550) or
+       (pe^.SizeOfOptionalHeader < SizeOf(coff^)) or
+       (n = 0) or
+       (Int64(PDosHeader(e)^.e_lfanew) + SizeOf(pe^) +
+        pe^.SizeOfOptionalHeader + PtrInt(n * SizeOf(ps^)) > exe.Size) then
+      exit;
+    coff := @PByteArray(pe)[SizeOf(pe^)]; // optional header
+    case coff^.Magic of
+      $010b:
+        begin
+          if imgbase <> nil then
+            imgbase^ := coff^.ImageBase32;
+          ef := efPE32;
+        end;
+      $020b:
+        begin
+          if imgbase <> nil then
+            imgbase^ := coff^.ImageBase64;
+          ef := efPE32Plus;
+        end;
+    else
+      exit;
+    end;
+    names := exe.Buffer + pe^.PointerToSymbolTable + pe^.NumberOfSymbols * 18;
+    tmp[8] := #0; // ensure ps^.Name8 with 8 chars are #0 terminated
+    ps := @PByteArray(coff)[pe^.SizeOfOptionalHeader];
+    repeat
+      one := @tmp;
+      PQWord(one)^ := ps^.Name8;
+      if one^ = '/' then // length>8 stored as /asciioffset
+        one := names + GetCardinal(pointer(one + 1));
+      if mormot.core.base.StrComp(one, name) = 0 then
+      begin
+        offset := ps^.PointerToRawData;
+        size := MinPtrUInt(ps^.VirtualSize, ps^.SizeOfRawData);
+        if Int64(offset) + size < exe.Size then
+          result := ef;
+        exit;
+      end;
+      inc(ps);
+      dec(n)
+    until n = 0;
+  end;
+end;
 
 { ReserveExecutableMemory() / TFakeStubBuffer }
 
@@ -8865,6 +9221,38 @@ begin
   end;
 end;
 
+var
+  __GetmemDualAccessPagesLock: TLightLock; // single pointer field
+  __GetmemDualAccessPages: pointer;
+
+function GetmemDualAccessPagesLock: pointer;
+begin
+  __GetmemDualAccessPagesLock.Lock;
+  if __GetmemDualAccessPages = nil then
+    __GetmemDualAccessPages := _GetmemDualAccessPages; // VirtualAlloc/mmap once
+  result := __GetmemDualAccessPages; // nil or pointer for GPF on read
+end;
+
+function GetmemDualAccessPagesLock(const Content: RawByteString): pointer;
+var
+  len: PtrUInt;
+begin
+  len := length(Content);
+  result := nil;
+  if len > SystemInfo.dwPageSize then
+    exit;
+  result := GetmemDualAccessPagesLock;
+  if result = nil then
+    exit;
+  dec(PByte(result), len);
+  MoveFast(pointer(Content)^, result^, len);
+end;
+
+procedure GetmemDualAccessPagesUnLock;
+begin
+  __GetmemDualAccessPagesLock.UnLock;
+end;
+
 const
   OS_ALIGNED = 128 shl 10; // call the OS for any block >= 128KB
 
@@ -8902,6 +9290,14 @@ begin
   FreeMem(p);
 end;
 
+const
+  // = the deprecated System.vmtDestroy, which Delphi replaced by the asm-only
+  // VMTOFFSET operator - verified to match the RTL value on 32-bit and 64-bit
+  // - CPP_ABI_ADJUST was introduced with Delphi XE3, and the RTL constant is
+  // not deprecated on older compilers, so it is used as-is there and on FPC
+  VMT_DESTROY = {$ifdef ISDELPHIXE3} -SizeOf(pointer) - CPP_ABI_ADJUST
+                {$else} vmtDestroy {$endif ISDELPHIXE3};
+
 function SeemsRealObject(p: pointer): boolean;
 var
   i: PtrInt;
@@ -8912,7 +9308,7 @@ begin
     p := PPointer(p)^; // p = vmt
     if (not SeemsRealPointer(p)) or
        (PPtrInt(PAnsiChar(p) + vmtInstanceSize)^ < sizeof(pointer)) or
-       (PPtrInt(PAnsiChar(p) + vmtDestroy)^ = 0) then
+       (PPtrInt(PAnsiChar(p) + VMT_DESTROY)^ = 0) then
       exit;
     p := PPointer(PAnsiChar(p) + vmtClassName)^; // p = ClassName: PShortString
     if (not SeemsRealPointer(p)) or
@@ -8974,7 +9370,7 @@ begin
   AppendFreeTotalKB(info.memtotal - info.memfree, info.memtotal, result);
   AppendShortChar('(', @result);
   AppendShortByte(info.percent, @result); // append '0'..'99' range
-  AppendShortTwoChars(ord('%') + ord(')') shl 8, @result);
+  AppendShortTwoCharsSafe(ord('%') + ord(')') shl 8, result);
 end;
 
 function GetDiskAvailable(aDriveFolderOrFile: TFileName): QWord;
@@ -9002,6 +9398,8 @@ end;
 var
   _Shell: RawUtf8;
   _SystemInfoText: TCachedValue;
+  _SysInfoTix: cardinal;
+  _SysInfoCache: TSysInfo;
 
 function GetSystemInfoText: RawUtf8;
 begin
@@ -9015,13 +9413,29 @@ begin
     _SetShell(_Shell, result);
 end;
 
+function RetrieveSysInfo(var si: TSysInfo): boolean;
+var
+  tix: cardinal;
+begin
+  tix := GetTickSec;
+  OSSafe.Lock;
+  if _SysInfoTix <> tix then
+  begin
+    _SysInfoTix := tix;
+    _RetrieveSysInfo(_SysInfoCache)
+  end;
+  si := _SysInfoCache;
+  OSSafe.UnLock;
+  result := si.uptime <> 0;
+end;
+
 procedure RetrieveSysInfoText(var text: ShortString);
 var
   si: TSysInfo;  // Linuxism, but properly emulated in thit unit on Win/Mac/BSD
 begin
   text[0] := #0;
-  AppendShortCardinal(CpuThreads, text);
-  if not RetrieveSysInfo(si) then // single syscall on Linux/Android
+  AppendShortCardinal(SystemInfo.dwNumberOfProcessors, text); // no syscall
+  if not RetrieveSysInfo(si) then // single syscall on Linux - 1 second cache
     exit;
   AppendShortChar(' ', @text); // si.loads[0/1] = user kern on Windows
   AppendShortCurr64((Int64(si.loads[0]) * CURR_RES + 5000) shr 16, text, 2);
@@ -9095,6 +9509,13 @@ var
 
 { TSynLibrary }
 
+constructor TSynLibrary.Create;
+begin
+  {$ifdef OSWINDOWS}
+  fDisableLibrarySetDirectory := DefaultDisableLibrarySetDirectory; // global
+  {$endif OSWINDOWS}
+end;
+
 function TSynLibrary.Resolve(const Prefix: RawUtf8; ProcName: PAnsiChar;
   Entry: PPointer; RaiseExceptionOnFailure: ExceptionClass; SilentError: PString): boolean;
 var
@@ -9102,9 +9523,6 @@ var
   name, search: RawUtf8;
   ignoremissing: boolean;
   error: string;
-  {$ifdef OSPOSIX}
-  dlinfo: dl_info;
-  {$endif OSPOSIX}
 begin
   result := false;
   if (Entry = nil) or
@@ -9133,11 +9551,8 @@ begin
   if result and
      not fLibraryPathTested then
   begin
-    fLibraryPathTested := true;
-    FillCharFast(dlinfo, SizeOf(dlinfo), 0);
-    dladdr(Entry^, @dlinfo);
-    if dlinfo.dli_fname <> nil then
-      fLibraryPath := TFileName(dlinfo.dli_fname);
+    fLibraryPath := GetExecutableName(Entry^);
+    fLibraryPathTested := fLibraryPath <> '';
   end;
   {$endif OSPOSIX}
   result := result or ignoremissing;
@@ -9234,7 +9649,8 @@ var
     // change the current folder at loading on Windows
     {$ifdef OSWINDOWS}
     try
-      if nwd <> '' then
+      if (nwd <> '') and
+         not fDisableLibrarySetDirectory then
       begin
         GlobalLock; // SetDllDirectoryW() is for the whole process not thread
         if not LibrarySetDirectory(nwd) then // as documented on microsoft.com
@@ -9245,7 +9661,8 @@ var
       end;
       fHandle := LibraryOpen(lib); // preserve x87 flags and prevent msg box
     finally
-      if nwd <> '' then
+      if (nwd <> '') and
+         not fDisableLibrarySetDirectory then
       begin
         SetDllDirectoryW(nil); // revert to default
         GlobalUnLock;
@@ -9603,12 +10020,12 @@ begin
   for i := high(CpuCache) downto low(CpuCache) do
   begin
     CpuCacheSize := CpuCache[i].Size;
-    if CpuCacheSize = 0 then // append the highest level Cache size
+    if CpuCacheSize < 1024 then // may = 64 on WinArm/KVM
       continue;
     AppendShortTwoChars(32 + ord('[') shl 8, @tmp);
     AppendKb(CpuCacheSize, tmp);
     AppendShortChar(']', @tmp);
-    break;
+    break; // stop at first/highest proper level Cache size
   end;
   AppendShort(' (' + CPU_ARCH_TEXT + ')', tmp);
   ShortStringToAnsi7String(tmp, CpuInfoText);
@@ -9643,28 +10060,29 @@ begin
   {$endif OSLINUXANDROID}
   with Executable do            // retrieve Executable + Host/User info
   begin
+    ProgramFileName := ExpandFileName(ParamStr(0)); // main executable from RTL
+    ProgramFilePath := ExtractFilePath(ProgramFileName);
+    ProgramName := GetFileNameWithoutExtOrPath(ProgramFileName);
     dt := 0;
     {$ifdef OSWINDOWS}
-    ProgramFileName := ParamStr(0); // RTL seems just fine here
-    {$else}
-    dladdr(@InitializeProcessInfo, @PosixProgramInfo);
-    crcblock(@SystemEntropy.Startup, @PosixProgramInfo); // won't hurt
-    GetDlInfoName(PosixProgramInfo, ProgramFileName);
-    if ProgramFileName <> '' then
-    begin
-      dt := FileAgeToDateTime(ProgramFileName);
-      if dt = 0 then
-        ProgramFileName := '';
-    end;
-    if ProgramFileName = '' then
-      ProgramFileName := ExpandFileName(ParamStr(0));
-    {$endif OSWINDOWS}
-    ProgramFilePath := ExtractFilePath(ProgramFileName);
     if IsLibrary then
       InstanceFileName := GetModuleName(HInstance)
     else
       InstanceFileName := ProgramFileName;
-    ProgramName := GetFileNameWithoutExtOrPath(ProgramFileName);
+    {$else}
+    dladdr(@InitializeProcessInfo, @PosixProgramInfo);   // function in this .so
+    crcblock(@SystemEntropy.Startup, @PosixProgramInfo); // won't hurt
+    GetDlInfoName(PosixProgramInfo, InstanceFileName);
+    if InstanceFileName <> '' then
+    begin // could be e.g. './mormot2tests'
+      InstanceFileName := ExpandFileName(InstanceFileName); // expand at startup
+      dt := FileAgeToDateTime(InstanceFileName); // TFileVersion needs it anyway
+      if dt = 0 then
+        InstanceFileName := '';
+    end;
+    if InstanceFileName = '' then
+      InstanceFileName := ProgramFileName; // fallback (unlikely)
+    {$endif OSWINDOWS}
     GetUserHost(User, Host);
     if Host = '' then
       Host := 'unknown';
@@ -9688,7 +10106,6 @@ begin
   crcblock(rnd, @Executable.Hash);
   crcblocks(rnd, @CpuCache, SizeOf(CpuCache) div SizeOf(THash128));
 end;
-
 
 
 { TExecutableCommandLine }
@@ -10808,12 +11225,12 @@ end;
 { **************** TSynLocker Threading Features }
 
 const
-  // default value for all spining, up to 993 "pause" opcode calls
-  // - on Intel, taking around 5us on old CPU, but modern Intel have bigger pause
-  // latency (up to 100 cycles) so takes up to 50us
-  // - AMD Zen 3 and later has a latency of only 1-2 cycles so we identify them
-  // via CPUID and adjust a SpinFactor global variable at startup to reach 5us
-  // - 5..50us range seems consistent with our eventual nanosleep(10us) syscall
+  // default adaptive spin count: up to 992 "pause"/"yield" instructions
+  // - on Intel, this is typically a few microseconds on older CPUs, but newer
+  // CPUs may have longer pause latency (tens of cycles)
+  // - AMD Zen 3+ has shorter pause latency, detected via CPUID at startup
+  // to adjust SpinFactor variable and keep a similar waiting duration
+  // - this 5-50us range matches the eventual nanosleep(10us) fallback
   SPIN_COUNT = pred(6 shl 5); // = 191
 
 // as reference, take a look at Linus insight (TL&WR: better use futex)
@@ -10887,9 +11304,9 @@ begin
   end;
   {$endif SPINADAPT}
   dec(spin);
-  if spin = 0 then // eventually call the OS for long wait
+  if spin = 0 then      // eventually call the OS for long wait
   begin
-    SwitchToThread; // homonymous Win API call or proper POSIX call
+    SwitchToThread;     // proper OS yield API
     spin := SPIN_COUNT; // try again
   end;
   result := spin;
@@ -10900,7 +11317,7 @@ end;
 
 procedure TLightLock.Init;
 begin
-  Flags := 0;
+  Flags := 0; // single pointer size field
 end;
 
 procedure TLightLock.Done;
@@ -11426,14 +11843,16 @@ end;
 
 function TLockedList.Free(one: pointer): boolean;
 var
-  o: PLockedListOne absolute one;
+  o: PLockedListOne;
 begin
   result := false;
-  if (o = nil) or
-     (o^.sequence = 0) then
+  if one = nil then
     exit;
+  o := one;
   Safe.Lock;
   try
+    if o^.sequence = 0 then // already garbage collected (paranoid)
+      exit;
     // remove from main double-linked list
     if o = fHead then
       fHead := o.next;
@@ -11940,6 +12359,117 @@ end;
 
 { TSynEvent }
 
+const // fState CAS bits for the TSynEvent futex API
+  EV_SIGNAL = 1;
+  EV_WAIT   = 2;
+
+constructor TSynEvent.Create;
+begin
+  if not Assigned(OsWaitOnValue) then // futex API only on Linux or Win8+
+    fRtlEvent := RTLEventCreate;      // fallback to PRTLEvent
+end;
+
+destructor TSynEvent.Destroy;
+begin
+  if Assigned(fRtlEvent) then
+    RTLEventDestroy(fRtlEvent); // release PRTLEvent handle
+  inherited Destroy;
+end;
+
+function TSynEvent.Notified: boolean;
+begin
+  result := (fState and EV_SIGNAL) <> 0; // only informative
+end;
+
+function TSynEvent.Waiting: boolean;
+begin
+  result := (fState and EV_WAIT) <> 0;   // only informative
+end;
+
+procedure TSynEvent.ResetEvent;
+var
+  state: cardinal;
+begin
+  if Assigned(fRtlEvent) then
+  begin
+    fState := fState and not EV_SIGNAL;
+    RTLEventResetEvent(fRtlEvent); // use PRTLEvent fallback
+  end
+  else
+    repeat
+      state := fState;
+    until ((state and EV_SIGNAL) = 0) or // not yet signaled
+          LockedExc32(fState, state and not EV_SIGNAL, state);
+end;
+
+procedure TSynEvent.SetEvent;
+var
+  state: cardinal;
+begin
+  if Assigned(fRtlEvent) then
+  begin
+    fState := fState or EV_SIGNAL;
+    RTLEventSetEvent(fRtlEvent);
+  end
+  else
+    repeat
+      state := fState;
+      if (state and EV_SIGNAL) <> 0 then
+        exit; // already signaled
+      if LockedExc32(fState, state or EV_SIGNAL, state) then
+      begin
+        if (state and EV_WAIT) <> 0 then
+          OsWakeOnValue(@fState); // release pending WaitFor()
+        exit;
+      end;
+    until false;
+end;
+
+function TSynEvent.WaitFor(TimeoutMS: cardinal): boolean;
+var
+  ending, remain: Int64;
+begin
+  if Assigned(fRtlEvent) then // PRTLEvent fallback
+  begin
+    fState := fState or EV_WAIT;
+    result := RtlWaitFor(fRtlEvent, TimeoutMS, (fState and EV_SIGNAL) <> 0);
+    if result then
+      fState := fState and not EV_SIGNAL; // we consumed the signal
+    fState := fState and not EV_WAIT;
+    exit;
+  end;
+  result := LockedExc32(fState, 0, EV_SIGNAL); // fast CAS path
+  if result or
+     (TimeoutMS = 0) then
+    exit;
+  result := true;
+  if LockedExc32(fState, EV_WAIT, 0) then // we acquired fState = EV_WAIT
+    if TimeoutMS = INFINITE then
+      repeat
+        OsWaitOnValue(@fState, EV_WAIT, INFINITE); // may be spurious wake
+      until LockedExc32(fState, 0, EV_WAIT or EV_SIGNAL)
+    else
+    begin
+      ending := GetTickCount64 + TimeoutMS;
+      remain := TimeoutMS;
+      repeat
+        OsWaitOnValue(@fState, EV_WAIT, remain);
+        if LockedExc32(fState, 0, EV_WAIT or EV_SIGNAL) then
+          break; // was a true notification, not a spurious wake
+        remain := ending - GetTickCount64;
+        if remain > 0 then
+          continue;
+        result := false; // timeout
+        break;
+      until false;
+    end
+  else // there should be a single waiter: check again if was signaled
+    result := LockedExc32(fState, 0, EV_SIGNAL);
+  if not result then
+    if not LockedExc32(fState, 0, EV_WAIT) then
+      result := LockedExc32(fState, 0, EV_WAIT or EV_SIGNAL); // last chance
+end;
+
 function TSynEvent.SleepStep(var start: Int64; terminated: PBoolean): Int64;
 var
   ms: integer;
@@ -11976,15 +12506,18 @@ begin
     result := WaitFor(TimeoutMS);
     exit;
   end;
+  result := WaitFor(1);
+  if result then
+    exit; // quick path if the event was notified
   endtix := 0;
   if TimeoutMS <> INFINITE then
     endtix := GetTickCount64 + TimeoutMS;
   repeat
     CheckSynchronize(1); // make UI responsive enough
-  until WaitFor(10) or
+    result := WaitFor(10);
+  until result or
         ((endtix <> 0) and
          (GetTickCount64 > endtix));
-  result := fNotified;
 end;
 
 
@@ -12662,6 +13195,7 @@ end;
 procedure FinalizeUnit;
 var
   i: PtrInt;
+  p: PByte;
 begin
   with InternalGarbageCollection do
   begin
@@ -12670,6 +13204,12 @@ begin
       FreeAndNilSafe(Instances[i]); // before GlobalCriticalSection deletion
   end;
   ObjArrayClear(CurrentFakeStubBuffers);
+  p := __GetmemDualAccessPages;
+  if p <> nil then // need VirtualFree() or unmap()
+  begin
+    dec(p, SystemInfo.dwPageSize); // from GPF page to R/W start page
+    _FreeLargeMem(p, SystemInfo.dwPageSize * 2); // release both pages
+  end;
   Executable.Version.Free;
   Executable.Command.Free;
   FinalizeSpecificUnit; // in mormot.core.os.posix/windows.inc files

@@ -770,7 +770,7 @@ type
   public
     /// load the ODBC library
     // - and retrieve all SQL*() addresses for ODBC_ENTRIES[] items
-    constructor Create;
+    constructor Create; override;
     /// raise an exception on error
     procedure Check(Conn: TSqlDBConnection; Stmt: TSqlDBStatement; Status: SqlReturn;
       HandleType: SqlSmallint; Handle: SqlHandle; InfoRaiseException: boolean = false;
@@ -1042,6 +1042,7 @@ end;
 
 constructor TOdbcLib.Create;
 begin
+  inherited Create;
   try
     TryLoadResolve([ODBC_LIB], 'SQL', @ODBC_ENTRIES, @@AllocEnv, EOdbcException);
   except
@@ -1055,7 +1056,7 @@ end;
 
 function TOdbcLib.GetDiagField(StatementHandle: SqlHStmt): RawUtf8;
 var
-  Status: array[0..7] of AnsiChar;
+  Status: TTemp8;
   StringLength: SqlSmallint;
 begin
   if ODBC.GetDiagFieldA(SQL_HANDLE_STMT, StatementHandle, 1, SQL_DIAG_SQLSTATE,
@@ -1085,7 +1086,7 @@ const
   FMT: PUtf8Char = '%[%] % (%)'#13#10;
 var
   Sqlstate: array[0..6] of WideChar;
-  MessageText: array[0..1023] of WideChar;
+  MessageText: TWide1K;
   RecNum, NativeError: SqlInteger;
   TextLength: SqlSmallint;
   msg: RawUtf8;
