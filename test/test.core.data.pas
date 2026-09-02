@@ -512,6 +512,9 @@ var
   vd: TVarData absolute v;
   info: TGetJsonField;
   t: pointer;
+  s: RawUtf8;
+  r: RawByteString;
+  rc: integer;
   dt: TDateTime;
   ni: TNullableInteger;
   nt: TNullableUtf8Text;
@@ -530,9 +533,16 @@ begin
   TextToVariant('1e308', true, v);
   Check(VarIsStr(v));
   Check(VarIsString(v));
+  FormatUtf8('value-%', [123], s); // ensure a regular ref-counted string
+  TextToVariant(s, true, v);
+  VariantToRawByteString(v, r);
+  rc := GetRefCount(r);
+  Check(rc > 1);
   t := nil; // makes the compiler happy
   ValueVarToVariant(nil, 0, oftBoolean, vd, false, t);
   CheckEqual(TVarData(v).VType, varNull);
+  CheckEqual(GetRefCount(r), rc - 1);
+  r := '';
   ValueVarToVariant('0', 1, oftBoolean, vd, false, t);
   Check(not boolean(v));
   Check(VariantTypeName(v)^ = 'Boolean');
@@ -11432,7 +11442,7 @@ begin
     with TZipWrite.CreateFromIgnore(
       FN2, TFileNameDynArray(deleted), 1 shl 20, onprog) do
     try
-      Check(Count = length(json) - length(deleted));
+      CheckEqual(Count, length(json) - length(deleted));
     finally
       Free;
     end;

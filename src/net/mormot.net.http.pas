@@ -1885,9 +1885,9 @@ type
   {$endif USERECORDWITHMETHODS}
   public
     Rotating: TLightLock;
+    Files: integer;
     FileName: TFileName;
     Trigger: THttpRotaterTrigger;
-    Files: integer;
     NextTix32: cardinal;  // = GetTickSec
     TriggerDate: integer; // = next Trunc(NowUtc)
     OnRotate: procedure(Event: THttpRotaterEvent) of object; // owner access
@@ -2000,6 +2000,7 @@ type
   protected
     fWriterSingle: TTextDateWriter; // from CreateWithWriter/CreateWithFile
     fWriterHostSafe: TLightLock;
+    fTimeTix32: cardinal; // = GetTickSec
     fWriterHost: THttpLoggerWriterDynArray; // from Create + DefineHost
     fSettings: THttpLoggerSettings;
     fWriterHostLast, fWriterHostMain, fWriterHostError: TTextDateWriter;
@@ -2007,7 +2008,6 @@ type
     fUnknownPosLen: TIntegerDynArray; // matching hlvUnknown occurrence
     fFlags: set of (ffHadDefineHost, ffOwnWriterSingle);
     fVariables: THttpLogVariables;
-    fTimeTix32: cardinal; // = GetTickSec
     fTimeText: array[hlvTime_Iso8601 .. hlvTime_Http] of THttpDateNowUtc;
     procedure SetTimeText(Tix32: cardinal; Tix64: Int64);
     procedure SetSettings(aSettings: THttpLoggerSettings);
@@ -3297,6 +3297,12 @@ begin
       c := byte(P^) - 48;
       if c > 9 then
         break
+      else if (result > Qword(High(Int64)) div 10) or
+              ((result = Qword(High(Int64)) div 10) and
+               (c > Qword(High(Int64)) mod 10)) then
+        // clamp to High(Int64): RangeOffset/RangeLength are signed Int64, and
+        // a wrapped result would be negative, so would bypass ValidateRange()
+        result := Qword(High(Int64)) // no file would be so big anyway
       else
         result := result * 10 + Qword(c);
       inc(P);
@@ -3581,13 +3587,16 @@ function THttpRequestContext.ValidateRange: boolean;
 var
   tosend: Int64;
 begin
-  if RangeOffset >= ContentLength then
+  if (RangeOffset < 0) or // paranoid: a negative offset would make ContentLength
+                          // bigger than the actual content, and never complete
+     (RangeOffset >= ContentLength) then
     result := false // invalid offset: return error or void response
   else
   begin
     tosend := RangeLength;
     if (tosend < 0) or // -1 for end of file 'Range: 1024-'
-       (RangeOffset + tosend > ContentLength) then
+       (tosend > ContentLength - RangeOffset) then // no RangeOffset + tosend
+       // overflow here: 0 <= RangeOffset < ContentLength has just been checked
       tosend := ContentLength - RangeOffset; // truncate
     RangeLength := ContentLength; // contains size for Content-Range: header
     ContentLength := tosend;
@@ -3766,9 +3775,17 @@ begin
           if P1^ in ['0'..'9'] then
           begin
             // "Range: bytes=0-499" -> start=0, len=500
-            RangeLength := Int64(GetNextRange(P1)) - RangeOffset + 1;
-            if RangeLength < 0 then
-              RangeLength := 0;
+            RangeLength := Int64(GetNextRange(P1));
+            if RangeLength >= High(Int64) - RangeOffset then
+              // last-byte-pos above any possible size: up to end of file, as
+              // RFC 9110 does expect - and no RangeLength + 1 overflow
+              RangeLength := -1
+            else
+            begin
+              RangeLength := RangeLength - RangeOffset + 1;
+              if RangeLength < 0 then
+                RangeLength := 0;
+            end;
           end;
           // "bytes=1000-" -> start=1000, keep RangeLength=-1 to eof
           if P1^ = ',' then
@@ -4399,6 +4416,9 @@ begin
   begin
     Process.Reserve(MaxSize);
     MaxSize := ContentStream.Read(Process.Buffer^, MaxSize);
+    if MaxSize <= 0 then
+      exit; // unexpected EOF (e.g. file truncated meanwhile): abort, since
+            // returning hrpSend would loop forever on this missing content
     Dest.Append(Process.Buffer, MaxSize);
   end
   else
@@ -6270,7 +6290,7 @@ begin
           fSafe.Lock;
           try
             fUniqueIPDepth := value;
-            fUniqueIPSeed := Random32Not0; // avoid hash flooding
+            fUniqueIPSeed := NetRandom32; // just to avoid hash flooding
             Finalize(fUniqueIP);  // release up to 128KB with max value=65536
             value := value shr 3; // from bits to bytes
             if value <> 0 then

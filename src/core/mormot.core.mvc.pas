@@ -199,7 +199,7 @@ type
 
   // mustache view status for one fFactory.Methods[]
   TMvcViewMustache = record
-    Safe: TOSLightLock; // = TOSLightMutex = SRW lock or direct pthread mutex
+    Safe: TOSLightLock; // = TOSLightMutex = futex on Linux and Win8+
     Mustache: TSynMustache;
     Template: RawUtf8;
     MethodName: TFileName;

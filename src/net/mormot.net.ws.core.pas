@@ -304,6 +304,7 @@ type
     fEncryption: IProtocol;
     fCustomData: TObject;
     procedure AfterUpgrade(aProcess: TWebSocketProcess); virtual;
+    procedure SetName(const aProtocolName: RawUtf8); virtual;
     // focText/focBinary or focContinuation/focConnectionClose from ProcessStart/Stop
     procedure ProcessIncomingFrame(Sender: TWebSocketProcess;
       var Request: TWebSocketFrame; const Info: RawUtf8); virtual; abstract;
@@ -340,7 +341,8 @@ type
     /// recognize a supported sub-protocol (on both client and server sides)
     // - should return true on success, i.e. if aProtocolName has been recognized
     // - check against Name by default, but could be e.g. 'synopsebin, synopsebinary'
-    function SetSubprotocol(const aProtocolName: RawUtf8): boolean; virtual;
+    // - protocols with multiple name should set their Name onced cloned/created
+    function IsSubprotocol(const aProtocolName: RawUtf8): boolean; virtual;
     /// create the internal Encryption: IProtocol according to the supplied key
     // - any asymmetric algorithm needs to know its side, i.e. client or server
     // - use aKey='password#xxxxxx.private' for efAesCtr128 calling
@@ -397,7 +399,7 @@ type
     /// the Sec-WebSocket-Protocol application name currently involved
     // - e.g. 'synopsejson', 'synopsebin' or 'synopsebinary'
     property Name: RawUtf8
-      read fName write fName;
+      read fName write SetName;
     /// the optional URI on which this protocol would be enabled
     // - leave to '' if any URI should match
     property URI: RawUtf8
@@ -511,6 +513,7 @@ type
     fFramesInBytesSocket: QWord;
     fFramesOutBytesSocket: QWord;
     fOptions: TWebSocketProtocolBinaryOptions;
+    procedure SetName(const aProtocolName: RawUtf8); override;
     procedure FrameCompress(const Head: RawUtf8;
       const Values: array of const; const Content, ContentType: RawByteString;
       var frame: TWebSocketFrame); override;
@@ -564,7 +567,7 @@ type
     /// overriden to return 'synopsebin, synopsebinary' sub-protocols
     function GetSubprotocols: RawUtf8; override;
     /// recognize our 'synopsebin, synopsebinary' sub-protocols
-    function SetSubprotocol(const aProtocolName: RawUtf8): boolean; override;
+    function IsSubprotocol(const aProtocolName: RawUtf8): boolean; override;
   published
     /// how compression / encryption is implemented during the transmission
     // - is set to [pboSynLzCompress] by default
@@ -671,7 +674,7 @@ type
     // specified WebSockets protocl
     // - this method is thread-safe
     function Pop(protocol: TWebSocketProtocol; const head: RawUtf8;
-      out frame: TWebSocketFrame; currentSec: cardinal): boolean;
+      var frame: TWebSocketFrame; currentSec: cardinal): boolean;
     /// how many 'answer' frames are to be ignored
     // - incdec should be either 0, -1 or +1
     // - this method is thread-safe
@@ -1286,8 +1289,8 @@ type
   protected
     fSid, fHandshakeData: RawUtf8;
     fCallbackSafe: TLightLock;
-    fCallbacks: array of TSocketIOCallback;
     fAckIdCursor: TSocketIOAckID;
+    fCallbacks: array of TSocketIOCallback;
     /// Generate a new event acknowledgment ID, incrementing the internal cursor
     function GenerateAckId(const aOnAck: TOnSocketIOAck): TSocketIOAckID;
   public
@@ -1406,7 +1409,7 @@ type
   public
     // overriden to return '' i.e. recognize by URI, not "Sec-WebSocket-Protocol:"
     function GetSubprotocols: RawUtf8; override;
-    function SetSubprotocol(const aProtocolName: RawUtf8): boolean; override;
+    function IsSubprotocol(const aProtocolName: RawUtf8): boolean; override;
     /// true when Engine.IO messages can be processed
     // - i.e. after OPEN (eioOpen) and before CLOSE (eioClose)
     property Opened: boolean
@@ -1556,7 +1559,7 @@ begin
   begin
     // https://tools.ietf.org/html/rfc6455#section-10.3
     // client-to-server masking is mandatory (but not from server to client)
-    Header.mask32 := Random32Not0;
+    Header.mask32 := NetRandom32;
     Header.masksize := 4;
   end
   else
@@ -1803,7 +1806,12 @@ begin
   result := fName;
 end;
 
-function TWebSocketProtocol.SetSubprotocol(const aProtocolName: RawUtf8): boolean;
+procedure TWebSocketProtocol.SetName(const aProtocolName: RawUtf8);
+begin
+  fName := aProtocolName; // could be overriden to setup the instance by-name
+end;
+
+function TWebSocketProtocol.IsSubprotocol(const aProtocolName: RawUtf8): boolean;
 begin
   result := PropNameEquals(aProtocolName, fName);
 end;
@@ -1836,7 +1844,7 @@ begin
 end;
 
 function TWebSocketFrameList.Pop(protocol: TWebSocketProtocol;
-  const head: RawUtf8; out frame: TWebSocketFrame; currentSec: cardinal): boolean;
+  const head: RawUtf8; var frame: TWebSocketFrame; currentSec: cardinal): boolean;
 var
   i: PtrInt;
   item: PWebSocketFrame;
@@ -2590,18 +2598,16 @@ begin
   result := 'synopsebin, synopsebinary';
 end;
 
-function TWebSocketProtocolBinary.SetSubprotocol(const aProtocolName: RawUtf8): boolean;
+procedure TWebSocketProtocolBinary.SetName(const aProtocolName: RawUtf8);
 begin
-  result := false;
-  case FindPropName(['synopsebin', 'synopsebinary'], aProtocolName) of
-    0:
-      fSequencing := true;
-    1:
-      fSequencing := false;
-  else
-    exit;
-  end;
-  result := true;
+  inherited SetName(aProtocolName); // set fName
+  fSequencing := PropNameEquals(aProtocolName, 'synopsebin'); // setup protocol
+end;
+
+function TWebSocketProtocolBinary.IsSubprotocol(const aProtocolName: RawUtf8): boolean;
+begin
+  result := PropNameEquals(aProtocolName, 'synopsebin') or
+            PropNameEquals(aProtocolName, 'synopsebinary');
 end;
 
 
@@ -2696,10 +2702,10 @@ begin
       p := fProtocols[i];
       if ((p.fUri = '') or
           PropNameEquals(p.fUri, u)) and
-         p.SetSubprotocol(aProtocolName) then
+         p.IsSubprotocol(aProtocolName) then
       begin
         result := p.Clone(u);
-        result.fName := aProtocolName;
+        result.SetName(aProtocolName); // setup e.g. synopsebin/synopsebinary
         exit;
       end;
     end;
@@ -4370,7 +4376,7 @@ begin
   FastAssignNew(result); // no "Sec-WebSocket-Protocol:" header
 end;
 
-function TWebSocketEngineIOProtocol.SetSubprotocol(const aProtocolName: RawUtf8): boolean;
+function TWebSocketEngineIOProtocol.IsSubprotocol(const aProtocolName: RawUtf8): boolean;
 begin
   result := false; // should never be called
 end;
@@ -4441,7 +4447,7 @@ begin
   // sid        <sid>      None here - direct websockets, not from HTTP polling
   // t          <random>   Ensure that the request is not cached by the browser
   FormatUtf8('%?EIO=4&transport=websocket&t=%',
-    [r, CardinalToHexShort(Random32Not0)], result);
+    [r, CardinalToHexShort(NetRandom32)], result);
   if PollingUpgradeSid <> '' then
     Append(result, '&sid=', PollingUpgradeSid);
 end;
