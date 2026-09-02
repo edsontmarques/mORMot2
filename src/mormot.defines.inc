@@ -37,7 +37,8 @@
 // serialization) - left undefined by default to ensure minimal impact
 
 {.$define FPCUSEVERSIONINFO}
-// link POSIX fileinfo/machoreader/elfreader units to retrieve more information
+// link POSIX fileinfo/machoreader/elfreader units to call TFileVersion.Create()
+// on any TFileName and not only the local executable resource
 
 {.$define NOSETTHREADNAME}
 // Delphi Wintel only: if defined, SetThreadName() would not raise the "thread
@@ -153,7 +154,7 @@
     OSWINDOWS OSWINTEL OSWINARM
     OSPOSIX OSBSD OSDARWIN OSBSDDARWIN OSOPENBSD OSFREEBSD
     OSLINUX OSANDROID OSLINUXINTEL OSLINUXX64 OSLINUXX86
-    OSLINUXANDROID OSANDROIDARM64 OSELF
+    OSLINUXANDROID OSANDROIDARM64 OSELF OSFUTEX
     PUREMORMOT2
 
   FPC only:
@@ -458,9 +459,16 @@
     {$define FPC_OLDRTTI}
   {$endif}
 
+  {$ifdef UNICODERTL}
+    // an FPC Unicode RTL build (-dUNICODERTL) expects UnicodeString=string
+    // units, exactly as every unit of that RTL declares for itself
+    // see https://wiki.freepascal.org/Unicode_Support_in_Lazarus
+    {$MODESWITCH UNICODESTRINGS}
+  {$endif UNICODERTL}
+
   {$ifdef FPC_HAS_CPSTRING}
     // see http://wiki.freepascal.org/FPC_Unicode_support
-    {$define HASCODEPAGE} // UNICODE means {$mode delphiunicode}
+    {$define HASCODEPAGE} // UNICODE means {$MODESWITCH UNICODESTRINGS}
   {$endif FPC_HAS_CPSTRING}
 
   {$ifdef ISFPC27}
@@ -936,13 +944,17 @@
     {$define OSWINARM}
   {$endif ABIARM}
   {$define THREADID32}    // TThreadID always 32-bit DWORD on all Windows archs
+  {$define OSFUTEX}       // WaitForValue() futex-like API appeared with Win8
 {$else}
   {$ifdef CPU32}
-    {$define THREADID32}    // TThreadID 32-bit on 32-bit systems
+    {$define THREADID32}  // TThreadID is 32-bit on 32-bit POSIX systems
   {$endif CPU32}
   {$ifdef OSLINUX}
     {$define OSLINUXANDROID}
     {$define OSELF}
+    {$ifdef FPC}
+      {$define OSFUTEX}   // direct futex syscall on FPC Linux
+    {$endif FPC}
     {$ifdef ABIX86}
       {$define OSLINUXINTEL}
       {$define OSLINUXX86}
@@ -961,6 +973,7 @@
   {$ifdef OSANDROID}
     {$define OSLINUXANDROID}
     {$define OSELF}
+    {.$define OSFUTEX}        // untested
     {$ifdef ABIA64}
       {$define OSANDROIDARM64}
     {$endif ABIA64}

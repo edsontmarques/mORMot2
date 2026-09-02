@@ -31,8 +31,9 @@ uses
   mormot.core.zip,
   mormot.crypt.core,
   mormot.crypt.secure,
-  {$ifdef OSPOSIX}
+  mormot.net.tftp.client,
   mormot.net.tftp.server,
+  {$ifdef OSPOSIX}
   mormot.lib.curl, // client code for TFTP server validation
   {$endif OSPOSIX}
   mormot.net.sock,
@@ -72,6 +73,8 @@ type
     request: integer;
     reqthree: boolean;
     reqfour: Int64;
+    // for FileRange
+    rangefile: TFileName;
     // for BodyDownload
     bodyfile: TFileName;
     bodytype: RawUtf8;
@@ -87,17 +90,17 @@ type
      const r: ITunnelTransmit; const sc, vc: ICryptCert): TLoggedWorkThread;
     procedure CheckBlocks(const log: ISynLog; const sent, recv: RawByteString;
       num: integer);
-    procedure TunnelTest(var rnd: TLecuyer;
-      const clientcert, servercert: ICryptCert; packets: integer = 100);
-    procedure TunnelSocket(const log: ISynLog; var rnd: TLecuyer;
-      clientinstance, serverinstance: TTunnelLocal; packets: integer);
+    procedure TunnelTest(const clientcert, servercert: ICryptCert; packets: integer = 100);
+    procedure TunnelSocket(const log: ISynLog; clientinstance, serverinstance: TTunnelLocal; packets: integer);
     procedure TunnelRelay(relay: TTunnelRelay; const agent: array of ITunnelAgent;
-      const console: array of ITunnelConsole; var rnd: TLecuyer; packets: integer);
+      const console: array of ITunnelConsole; packets: integer);
     procedure RunLdapClient(Sender: TObject);
     procedure RunPeerCacheDirect(Sender: TObject);
     function OnPeerCacheDirect(var aUri: TUri; var aHeader: RawUtf8;
       var aOptions: THttpRequestExtendedOptions): integer;
     function OnPeerCacheRequest(Ctxt: THttpServerRequestAbstract): cardinal;
+    // event used by FileRange
+    function DoRangeRequest(Ctxt: THttpServerRequestAbstract): cardinal;
     // both events used by BodyDownload
     function DoBodyDownload(const aUrl, aMethod, aInHeaders, aInContentType,
       aRemoteIP: RawUtf8; aContentLength: Int64): TStream;
@@ -113,14 +116,18 @@ type
     procedure DoRtspOverHttp(options: TAsyncConnectionsOptions);
     // helper invoked from OpenAPI to verify YAML dispatch
     procedure OpenApiYamlDispatch;
-    {$ifdef OSPOSIX}
     /// validate mormot.net.tftp.server using libcurl (so only POSIX by now)
     procedure DoTFTPServer(Sender: TObject);
+    /// validate that a TFTP server owns all connection threads until shutdown
+    procedure DoTFTPShutdown;
+    {$ifdef OSPOSIX}
     /// validate Unix domain socket server bind and stale .socket file cleanup
     procedure DoUnixDomainSocket(Sender: TObject);
     {$endif OSPOSIX}
     /// validate THttpServerGeneric.OnBodyDownload streamed body upload
     procedure DoHttpBodyDownload(Sender: TObject);
+    /// validate 'Range:' file responses, especially against invalid offsets
+    procedure DoHttpFileRange(Sender: TObject);
   published
     /// Engine.IO and Socket.IO regression tests
     procedure _SocketIO;
@@ -151,6 +158,97 @@ type
 
 implementation
 
+var
+  TftpConnectionStarted: integer;
+  TftpConnectionDestroyed: integer;
+  TftpOwnerAccessed: integer;
+
+type
+  TSlowTftpConnection = class(TTftpConnectionThread)
+  protected
+    procedure DoExecute; override;
+  public
+    destructor Destroy; override;
+  end;
+
+  TTestTftpServer = class(TTftpServerThread)
+  public
+    procedure AddTestConnection(Connection: TTftpConnectionThread);
+    procedure TerminateAndWaitFinished(TimeOutMs: integer = 5000); override;
+  end;
+
+procedure TSlowTftpConnection.DoExecute;
+begin
+  InterlockedIncrement(TftpConnectionStarted);
+  while not Terminated do
+    SleepHiRes(1);
+  // remain alive past the deliberately short server timeout, then access owner
+  SleepHiRes(100);
+  if fOwner.MaxRetry >= 0 then
+    InterlockedIncrement(TftpOwnerAccessed);
+end;
+
+destructor TSlowTftpConnection.Destroy;
+begin
+  inherited Destroy;
+  InterlockedIncrement(TftpConnectionDestroyed);
+end;
+
+procedure TTestTftpServer.AddTestConnection(
+  Connection: TTftpConnectionThread);
+begin
+  fConnection.Add(Connection);
+  if Connection.Suspended then
+    Connection.Start;
+end;
+
+procedure TTestTftpServer.TerminateAndWaitFinished(TimeOutMs: integer);
+begin
+  inherited TerminateAndWaitFinished(1);
+end;
+
+procedure TNetworkProtocols.DoTFTPShutdown;
+var
+  context: TTftpContext;
+  connection: TSlowTftpConnection;
+  server: TTestTftpServer;
+  started: Int64;
+  destroyed: integer;
+begin
+  TftpConnectionStarted := 0;
+  TftpConnectionDestroyed := 0;
+  TftpOwnerAccessed := 0;
+  FillCharFast(context, SizeOf(context), 0);
+  context.BlockSize := 512;
+  context.FrameLen := 2;
+  GetMem(context.Frame, context.FrameLen);
+  FillCharFast(context.Frame^, context.FrameLen, 0);
+  server := nil;
+  try
+    context.FileStream := TMemoryStream.Create;
+    server := TTestTftpServer.Create('', [], nil, '127.0.0.1', '0',
+      'tftp-lifetime', {CacheTimeoutSecs=}0);
+    connection := TSlowTftpConnection.Create(context, server);
+    context.FileStream := nil; // ownership moved into connection.fContext
+    server.AddTestConnection(connection);
+    started := GetTickCount64;
+    while (TftpConnectionStarted = 0) and
+          (GetTickCount64 - started < 5000) do
+      SleepHiRes(1);
+    CheckEqual(TftpConnectionStarted, 1, 'connection started');
+  finally
+    server.Free;
+    FreeMem(context.Frame);
+    context.FileStream.Free;
+  end;
+  destroyed := TftpConnectionDestroyed;
+  if destroyed <> 1 then
+    // let a broken pre-fix worker finish before the test process continues
+    SleepHiRes(250);
+  CheckEqual(destroyed, 1, 'connection outlived its owner');
+  CheckEqual(TftpOwnerAccessed, 1, 'owner access after terminate');
+end;
+
 procedure TNetworkProtocols._SocketIO;
 var
   m: TSocketIOMessage;
@@ -160,9 +258,10 @@ var
 begin
   // start some slow tests in background if /multithread is enabled
   Run(DoHttpBodyDownload, self, 'HttpBodyDownload', true, false);
+  Run(DoHttpFileRange, self, 'HttpFileRange', true, false);
+  Run(DoTFTPServer, self, 'TFTPServer', true, false);
   {$ifdef OSPOSIX}
   Run(DoUnixDomainSocket, self, 'UnixDomainSocket', true, false);
-  Run(DoTFTPServer, self, 'TFTPServer', true, false);
   {$endif OSPOSIX}
   // from https://datatracker.ietf.org/doc/html/rfc6455#section-1.3
   ComputeChallenge('dGhlIHNhbXBsZSBub25jZQ==', ws);
@@ -1204,8 +1303,12 @@ begin
       Run(RunLdapClient, self, 'ldap', true, false); // fails in the background
   end;
   // validate LDAP distinguished name conversion (no client)
-  CheckEqual(DNToCN('CN=User1,OU=Users,OU=London,DC=xyz,DC=local'),
-    'xyz.local/London/Users/User1');
+  u := 'CN=User1,OU=Users,OU=London,DC=xyz,DC=local';
+  CheckEqual(DNToCN(u), 'xyz.local/London/Users/User1');
+  CheckEqual(DNToCN(u, false, [dnDC]), 'xyz.local');
+  CheckEqual(DNToCN(u, false, [dnDC, dnOU]), 'xyz.local/London/Users');
+  CheckEqual(DNToCN(u, false, [dnOU]), '/London/Users');
+  CheckEqual(DNToCN(u, false, [dnCN]), '/User1');
   CheckEqual(DNToCN(
     'cn=JDoe,ou=Widgets,ou=Manufacturing,dc=USRegion,dc=OrgName,dc=com'),
     'USRegion.OrgName.com/Manufacturing/Widgets/JDoe');
@@ -1760,7 +1863,7 @@ var
   timer: TPrecisionTimer;
   f: PAnsiChar;
   hostname, option: TShort15;
-  rnd: TLecuyer;
+  rnd: PLecuyer;
   nfo: TMacIP;
   m1, m2: TDhcpMetrics;
   rv: TRuleValue;
@@ -1862,6 +1965,7 @@ var
   end;
 
 begin
+  rnd := ThreadRandom; // use the TLecuyer of this thread
   // validate some DHCP protocol definitions
   CheckEqual(ord(dmtTls), 18, 'dmt');
   CheckEqual(SizeOf(TDhcpPacket), 1468, 'TDhcpPacket');
@@ -1874,7 +1978,6 @@ begin
   CheckEqual(DHCP_OPTION[doRouters], 'routers');
   CheckEqual(DHCP_OPTION[doTftpServerName], 'tftp-server-name');
   CheckEqual(DHCP_OPTION[doRelayAgentInformation], 'relay-agent-information');
-  RandomLecuyer(rnd);
   for dmt := low(dmt) to high(dmt) do
   begin
     dmt2 := pred(dmt);
@@ -2890,7 +2993,7 @@ begin
   end;
 end;
 
-procedure TNetworkProtocols.TunnelSocket(const log: ISynLog; var rnd: TLecuyer;
+procedure TNetworkProtocols.TunnelSocket(const log: ISynLog;
   clientinstance, serverinstance: TTunnelLocal; packets: integer);
 var
   i: integer;
@@ -2901,7 +3004,9 @@ var
   sent, sent2: RawUtf8;
   received, received2: RawByteString;
   nfo: variant;
+  rnd: PLecuyer;
 begin
+  rnd := ThreadRandom; // use the TLecuyer of this thread
   local := clientinstance.Port;
   remote := serverinstance.Port;
   Check(local <> 0, 'no local');
@@ -2981,8 +3086,8 @@ begin
   SleepHiRes(1000, closed^);
 end;
 
-procedure TNetworkProtocols.TunnelTest(var rnd: TLecuyer;
-  const clientcert, servercert: ICryptCert; packets: integer);
+procedure TNetworkProtocols.TunnelTest(const clientcert, servercert: ICryptCert;
+  packets: integer);
 var
   log: ISynLog;
   sess: TTunnelSession;
@@ -2990,7 +3095,9 @@ var
   clienttunnel, servertunnel: ITunnelLocal;
   local, remote: TNetPort;
   worker: TLoggedWorkThread;
+  rnd: PLecuyer;
 begin
+  rnd := ThreadRandom; // use the TLecuyer of this thread
   // setup the two instances with the specified options and certificates
   TSynLogTestLog.EnterLocal(log, 'TunnelTest [%]', [ToText(tunneloptions)], self);
   clientinstance := TTunnelLocalClient.Create(TSynLog);
@@ -3020,7 +3127,7 @@ begin
   Check(clienttunnel.Encrypted = (toEncrypted * tunneloptions <> []), 'cEncrypted');
   Check(servertunnel.Encrypted = (toEncrypted * tunneloptions <> []), 'sEncrypted');
   // create two local sockets and let them play with the tunnel
-  TunnelSocket(log, rnd, clientinstance, serverinstance, packets);
+  TunnelSocket(log, clientinstance, serverinstance, packets);
   // avoid circular references memory leak (not needed over SOA websockets)
   clientinstance.RawTransmit := nil;
 end;
@@ -3031,7 +3138,7 @@ const
 
 procedure TNetworkProtocols.TunnelRelay(relay: TTunnelRelay;
   const agent: array of ITunnelAgent; const console: array of ITunnelConsole;
-  var rnd: TLecuyer; packets: integer);
+  packets: integer);
 var
   log: ISynLog;
   a: ITunnelAgent;
@@ -3137,7 +3244,7 @@ begin
     if Assigned(log) then
       log.Log(sllInfo, 'Tunnel: actual sockets relay on loopback', self);
     for i := 0 to AGENT_COUNT - 1 do
-      TunnelSocket(log, rnd, agentlocal[i], consolelocal[i], packets);
+      TunnelSocket(log, agentlocal[i], consolelocal[i], packets);
   finally
     for i := 0 to AGENT_COUNT - 1 do
       worker[i].Free;
@@ -3158,7 +3265,6 @@ var
   clientcert, servercert: ICryptCert;
   bak: TSynLogLevels;
   relay: TTunnelRelay;
-  rnd: TLecuyer;
   i: PtrInt;
   agent: array of ITunnelAgent;     // single instance (sicShared mode)
   console: array of ITunnelConsole; // one per console (sicPerSession)
@@ -3166,29 +3272,28 @@ var
   httpserver: TRestHttpServer;
   agentclient, consoleclient: array of TRestHttpClientWebsockets;
 begin
+  // 1. validate TTunnelLocal and all its handshaking options
   bak := TSynLog.Family.Level;
   //TSynLog.Family.Level := LOG_VERBOSE; // for convenient LUTI debugging
-  // 1. validate TTunnelLocal and all its handshaking options
-  RandomLecuyer(rnd);
   // plain tunnelling
-  TunnelTest(rnd, nil, nil);
+  TunnelTest(nil, nil);
   // symmetric secret encrypted tunnelling
   tunneloptions := [toEncrypt];
-  TunnelTest(rnd, nil, nil);
+  TunnelTest(nil, nil);
   // ECDHE encrypted tunnelling
   tunneloptions := [toEcdhe];
-  TunnelTest(rnd, nil, nil);
+  TunnelTest(nil, nil);
   // tunnelling with mutual authentication
   tunneloptions := [];
   clientcert := Cert('syn-es256').Generate([cuDigitalSignature]);
   servercert := Cert('syn-es256').Generate([cuDigitalSignature]);
-  TunnelTest(rnd, clientcert, servercert);
+  TunnelTest(clientcert, servercert);
   // symmetric secret encrypted tunnelling with mutual authentication
   tunneloptions := [toEncrypt];
-  TunnelTest(rnd, clientcert, servercert);
+  TunnelTest(clientcert, servercert);
   // ECDHE encrypted tunnelling with mutual authentication
   tunneloptions := [toEcdhe];
-  TunnelTest(rnd, clientcert, servercert);
+  TunnelTest(clientcert, servercert);
   // options (e.g. encryption/ecdhe) are now considered validated
   tunneloptions := [];
   // 2. validate TTunnelRelay and its associated TTunnelAgent/TTunnelConsole
@@ -3203,7 +3308,7 @@ begin
     CheckEqual(relay.ConsoleCount, 0);
     for i := 0 to high(console) do
       Check(relay.Resolve(ITunnelConsole, console[i]), 'sicPerSession');
-    TunnelRelay(relay, agent, console, rnd, {packets=}10);
+    TunnelRelay(relay, agent, console, {packets=}10);
     agent := nil;
     console := nil;
     // 2.2. setup a SOA WebSockets server as actual relay over WebSockets
@@ -3256,7 +3361,7 @@ begin
           consoleclient[i].Resolve(ITunnelConsole, console[i]);
         end;
         TSynLog.Add.Log(sllInfo, 'Tunnel: call TunnelRelay', self);
-        TunnelRelay(relay, agent, console, rnd, {packets=}5);
+        TunnelRelay(relay, agent, console, {packets=}5);
       finally
         agent := nil; // keep refcount clean
         console := nil;
@@ -4000,6 +4105,9 @@ var
   l: PtrInt;
   dig: THashDigest;
   s32: TShort32;
+  ctx: THttpRequestContext;
+  dest: TRawByteStringBuffer;
+  ms: TRawByteStringStream;
 
   procedure Check4;
   begin
@@ -4302,6 +4410,73 @@ begin
   checkEqual(U.Address, 'toto/titi#ignore=10');
   Check(HttpRequestHashBase32(U, @s32, nil));
   CheckEqualShort(s32, 'na3q2n4gw6cly5fvf5da4frmek667zk2');
+  // validate GetNextRange() overflow clamping
+  s := '0-1';
+  v := pointer(s);
+  Check(GetNextRange(v) = 0, 'range 0');
+  s := '1024-2047';
+  v := pointer(s);
+  Check(GetNextRange(v) = 1024, 'range 1024');
+  Check(v^ = '-', 'range stops on non digit');
+  s := '9223372036854775800-'; // last digits below High(Int64) are not clamped
+  v := pointer(s);
+  Check(GetNextRange(v) = 9223372036854775800, 'range below maxint64');
+  s := '9223372036854775806-';
+  v := pointer(s);
+  Check(GetNextRange(v) = 9223372036854775806, 'range maxint64 - 1');
+  s := '9223372036854775807-'; // = High(Int64)
+  v := pointer(s);
+  Check(GetNextRange(v) = Qword(High(Int64)), 'range maxint64');
+  s := '9223372036854775808-'; // = High(Int64) + 1 -> clamped
+  v := pointer(s);
+  Check(GetNextRange(v) = Qword(High(Int64)), 'range above maxint64');
+  s := '18446744073709551615-'; // = High(Qword): would wrap to -1 as Int64
+  v := pointer(s);
+  Check(GetNextRange(v) = Qword(High(Int64)), 'range clamped');
+  Check(v^ = '-', 'range clamped stops on non digit');
+  s := '99999999999999999999999999-'; // way above High(Qword)
+  v := pointer(s);
+  Check(GetNextRange(v) = Qword(High(Int64)), 'range clamped huge');
+  // validate ValidateRange() against such an out-of-range offset
+  FillCharFast(ctx, SizeOf(ctx), 0);
+  ctx.Reset;
+  ctx.ContentLength := 1000;
+  ctx.RangeOffset := High(Int64);
+  ctx.RangeLength := -1;
+  Check(not ctx.ValidateRange, 'offset above size');
+  ctx.ContentLength := 1000;
+  ctx.RangeOffset := -1; // paranoid: never from GetNextRange() any more
+  ctx.RangeLength := -1;
+  Check(not ctx.ValidateRange, 'negative offset');
+  ctx.ContentLength := 1000;
+  ctx.RangeOffset := 100;
+  ctx.RangeLength := -1;
+  Check(ctx.ValidateRange, 'valid offset');
+  CheckEqual(ctx.ContentLength, 900, 'range tosend');
+  CheckEqual(ctx.RangeLength, 1000, 'range total');
+  ctx.ContentLength := 1000;
+  ctx.RangeOffset := 100;
+  ctx.RangeLength := High(Int64) - 99; // 'Range: bytes=100-18446744073709551615'
+  Check(ctx.ValidateRange, 'huge end offset'); // RangeOffset + RangeLength would
+  CheckEqual(ctx.ContentLength, 900, 'huge end tosend'); // overflow to negative
+  CheckEqual(ctx.RangeLength, 1000, 'huge end total');
+  // validate ProcessBody() abort on a stream shorter than ContentLength
+  ctx.Reset;
+  ctx.CommandMethod := 'GET';
+  ms := TRawByteStringStream.Create('12345'); // 5 bytes only
+  try
+    ctx.ContentStream := ms;
+    ctx.ContentLength := 8; // claim 3 bytes more than the stream can supply
+    dest.Reset;
+    Check(ctx.ProcessBody(dest, 100) = hrpSend, 'body avail');
+    CheckEqual(dest.Len, 5, 'body avail len');
+    dest.Reset;
+    Check(ctx.ProcessBody(dest, 100) = hrpAbort, 'body eof aborts');
+    CheckEqual(dest.Len, 0, 'body eof len');
+  finally
+    ctx.ContentStream := nil;
+    ms.Free;
+  end;
 end;
 
 type
@@ -4522,6 +4697,117 @@ begin
   end;
   Ctxt.OutContent := Make(['ok ', CardinalToHexShort(h)]);
   Ctxt.OutContentType := TEXT_CONTENT_TYPE;
+end;
+
+function TNetworkProtocols.DoRangeRequest(
+  Ctxt: THttpServerRequestAbstract): cardinal;
+begin
+  result := Ctxt.SetOutFile(rangefile, {Handle304NotModified=}false,
+    BINARY_CONTENT_TYPE);
+end;
+
+procedure TNetworkProtocols.DoHttpFileRange(Sender: TObject);
+var
+  srv: THttpServerSocketGeneric;
+  clt: THttpClientSocket;
+  fam: integer;
+  data: RawByteString; // not RawUtf8: RandomWinAnsi() is no UTF-8 content
+  datahash: cardinal;
+  hosthead: RawUtf8;
+
+  procedure RawRange(const range, expected, context: RawUtf8;
+    expectedlength: Int64 = -1);
+  var
+    raw: TCrtSocket;
+    cmd, len: RawUtf8;
+  begin
+    // THttpClientSocket.RangeStart is an Int64, so such an offset needs to be
+    // sent from a raw socket - with a timeout, so that a regression of the
+    // send loop shows up as a failure here instead of hanging the whole suite
+    raw := TCrtSocket.Open('127.0.0.1', srv.SockPort, nlTcp, 5000);
+    try
+      raw.CreateSockIn; // needed for proper SockRecvLn() below
+      raw.SockSend('GET /file HTTP/1.1');
+      raw.SockSend(hosthead);
+      raw.SockSend(['Range: bytes=', range]);
+      raw.SockSend('Connection: close');
+      raw.SockSendCRLF; // void line: end of headers
+      raw.SockSendFlush;
+      cmd := '';
+      raw.SockRecvLn(cmd);
+      CheckUtf8(PosEx(expected, cmd) > 0, '% [%] got %', [context, range, cmd]);
+      if expectedlength < 0 then
+        exit;
+      // the announced body size should never exceed the actual file content
+      len := '';
+      repeat
+        cmd := '';
+        raw.SockRecvLn(cmd);
+        if IdemPChar(pointer(cmd), 'CONTENT-LENGTH: ') then
+          len := copy(cmd, 17, 30);
+      until cmd = ''; // end of response headers
+      CheckUtf8(GetInt64(pointer(len)) = expectedlength,
+        '% [%] length=% expected=%', [context, range, len, expectedlength]);
+    finally
+      raw.Free;
+    end;
+  end;
+
+begin
+  // this file is bigger than HttpContentFromFileSizeInMemory, so that it is
+  // served from a ContentStream by the send loop - which is where an invalid
+  // range used to announce more bytes than the file actually holds
+  data := RandomWinAnsi(3 shl 20); // 3MB
+  CheckEqual(length(data), 3 shl 20, 'range data');
+  datahash := crc32cHash(data);
+  // use a temporary file, not WorkDir: other background tests do scan that
+  // folder (e.g. the TFTP server root), and would see this one appear
+  rangefile := TemporaryFileName;
+  Check(FileFromString(data, rangefile), 'range file');
+  try
+    for fam := 0 to 1 do
+    begin
+      // validate both socket server families with the very same steps
+      if fam = 0 then
+        srv := THttpServer.Create('8893', nil, nil, 'filerange', 2)
+      else
+        srv := THttpAsyncServer.Create('8894', nil, nil, 'filerange', 2);
+      try
+        Join(['Host: 127.0.0.1:', srv.SockPort], hosthead);
+        srv.OnRequest := DoRangeRequest;
+        srv.WaitStarted(10);
+        // an offset which does not fit in an Int64 should be rejected as 416,
+        // not wrap into a negative offset and pass the ValidateRange() check
+        RawRange('18446744073709551615-', ' 416 ', 'high qword');
+        RawRange('99999999999999999999999999-', ' 416 ', 'above qword');
+        // a plain out-of-range offset was already rejected, and still is
+        RawRange('4194304-', ' 416 ', 'above size');
+        // a huge END offset is valid: it should be truncated to the actual
+        // file size, and not overflow the RangeOffset + RangeLength check
+        RawRange('100-18446744073709551615', ' 206 ', 'huge end',
+          (3 shl 20) - 100);
+        RawRange('0-18446744073709551615', ' 206 ', 'huge end from 0', 3 shl 20);
+        // the server must still serve regular requests after those rejections
+        clt := THttpClientSocket.Open('127.0.0.1', srv.SockPort);
+        try
+          clt.RangeStart := 100;
+          clt.RangeEnd := 199;
+          CheckEqual(clt.Get('/file'), HTTP_PARTIALCONTENT, 'range status');
+          CheckEqual(length(clt.Content), 100, 'range length');
+          CheckEqual(clt.Content, copy(data, 101, 100), 'range content');
+          CheckEqual(clt.Get('/file'), HTTP_SUCCESS, 'full status');
+          CheckEqual(length(clt.Content), length(data), 'full length');
+          CheckEqual(crc32cHash(clt.Content), datahash, 'full content');
+        finally
+          clt.Free;
+        end;
+      finally
+        srv.Free;
+      end;
+    end;
+  finally
+    Check(DeleteFile(rangefile), 'range file deleted');
+  end;
 end;
 
 procedure TNetworkProtocols.DoHttpBodyDownload(Sender: TObject);
@@ -4977,6 +5263,7 @@ var
   timer: TPrecisionTimer;
   orig, rd: RawByteString;
 begin
+  DoTFTPShutdown; // this test needs no TFTP client
   {$ifdef OSDARWINARM}
   if true then // mac M1 libcurl seems not tftp compatible
   {$else}
@@ -5071,6 +5358,11 @@ begin
     Check(DeleteFile(fn), 'delete tmp');
     http.Free;
   end;
+end;
+{$else}
+procedure TNetworkProtocols.DoTFTPServer(Sender: TObject);
+begin
+  DoTFTPShutdown; // no real TFTP client is needed
 end;
 {$endif OSPOSIX}
 

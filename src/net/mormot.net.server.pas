@@ -1774,7 +1774,7 @@ type
   THttpPeerCrypt = class(TInterfacedPersistent)
   protected
     fAesSafe: TLightLock; // topmost to ensure proper aarch64 alignment
-    fClientSafe: TLightLock; // if try to download with background direct mode
+    fClientSafe: TOSLightLock; // if try to download with background direct mode
     fSettings: THttpPeerCacheSettings;
     fSharedMagic, fFrameSeqLow: cardinal;
     fFrameSeq: integer;
@@ -2503,10 +2503,10 @@ type
   THttpApiWebSocketServer = class(THttpApiServer)
   protected
     fOwnedProtocolsSafe: TLightLock;
+    fPingTimeout: integer;
     fThreadPoolServer: TSynThreadPoolHttpApiWebSocketServer;
     fGuard: TSynWebSocketGuard;
     fLastConnection: PHttpApiWebSocketConnection;
-    fPingTimeout: integer;
     fOnWSThreadStart: TOnNotifyThread;
     fOnWSThreadTerminate: TOnNotifyThread;
     fSendOverlaped: TOverlapped;
@@ -6148,6 +6148,7 @@ var
   key: THash256Rec;
 begin
   // setup internal processing status
+  fClientSafe.Init; // mandatory for TOSLightLock
   fFrameSeqLow := Random31Not0; // 31-bit random start value set at startup
   fFrameSeq := fFrameSeqLow;
   // setup internal cryptography
@@ -6180,6 +6181,7 @@ begin
   fSharedMagic := 0;
   inherited Destroy;
   FillZero(fDirectSecret);
+  fClientSafe.Done; // mandatory for TOSLightLock
 end;
 
 function THttpPeerCrypt.NetworkInterfaceChanged: boolean;
@@ -7294,6 +7296,7 @@ var
 
   procedure HandleCleanup; // sub-function for FPC Win64-aarch64 compilation
   begin
+    fPartials.Safe.WriteLock; // safely move file without background access
     try
       if ToRename <> '' then
       begin
@@ -7396,7 +7399,6 @@ begin
       'OnDownloaded: % copied % into % in %', [KBNoSpace(sourcesize),
       Partial, local, MicroSecToString(stop - start)], self);
   finally
-    fPartials.Safe.WriteLock; // safely move file without background access
     HandleCleanup;
     if (PartialID <> 0) and
        (sourcesize = 0) then

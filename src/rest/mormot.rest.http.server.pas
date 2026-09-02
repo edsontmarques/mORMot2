@@ -1237,7 +1237,7 @@ begin
     match := rmNoMatch;
     matchcase := rsoRedirectServerRootUriForExactCase in fOptions;
     // thread-safe TLS + URI match from fRestServers[].Server.Model array
-    fSafe.ReadLock;
+    fSafe.ReadLock; // protect fRestServers[]
     {$ifdef HASFASTTRYFINALLY}
     try
     {$else}
@@ -1584,7 +1584,7 @@ begin
         inc(one);
       end;
   finally
-    fSafe.ReadLock;
+    fSafe.ReadUnLock;
   end;
 end;
 

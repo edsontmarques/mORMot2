@@ -3303,7 +3303,7 @@ var
   {$endif CPUX86NOTPIC}
 label
   quit, nosource, by2;
-begin // slightly slower overload with explicit destlen
+begin // slightly slower overload with explicit dest length as MaxDestChars
   result := 0;
   if dest = nil then
     exit;
@@ -3321,8 +3321,9 @@ begin // slightly slower overload with explicit destlen
     until source[sourcebytes] = #0;
     {$endif ASMX86}
   end;
-  inc(sourceBytes, PtrUInt(source)); // PUtf8Char(sourceBytes)  = endSource
-  inc(MaxDestChars, PtrUInt(dest));  // PUtf8Char(MaxDestChars) = endDest
+  inc(sourceBytes, PtrUInt(source)); // PUtf8Char(sourceBytes) = endSource
+  // MaxDestChars is a WideChar count: compute PUtf8Char(MaxDestChars) = endDest
+  MaxDestChars := PtrUInt(@dest[MaxDestChars]);
   {$ifndef CPUX86NOTPIC}
   utf8 := @UTF8_TABLE;
   {$endif CPUX86NOTPIC}
@@ -5157,7 +5158,7 @@ function AnyTextFileToRawUtf8(const FileName: TFileName; AssumeUtf8IfNoBom: bool
 var
   tmp: RawByteString;
   buf: pointer;
-  chars: PtrInt;
+  chars: PtrInt; // not integer
 begin
   case StringFromBomFile(FileName, tmp, buf, chars) of
     bomNone: // most common case, especially on POSIX
@@ -5188,7 +5189,7 @@ function AnyTextFileToSynUnicode(const FileName: TFileName; ForceUtf8: boolean):
 var
   tmp: RawByteString;
   buf: pointer;
-  chars: PtrInt;
+  chars: PtrInt; // not integer
 begin
   case StringFromBomFile(FileName, tmp, buf, chars) of
     bomNone: // most common case, especially on POSIX
@@ -5220,7 +5221,7 @@ function AnyTextFileToString(const FileName: TFileName; ForceUtf8: boolean): str
 var
   tmp: RawByteString;
   buf: pointer;
-  chars: PtrInt;
+  chars: PtrInt; // not integer
 begin
   case StringFromBomFile(FileName, tmp, buf, chars) of
     bomNone: // most common case, especially on POSIX
@@ -10502,7 +10503,7 @@ begin
     for result := 0 to ValuesCount do
       if (PtrUInt(Values^) <> 0) and
          ({%H-}PStrLen(PtrUInt(Values^) - _STRLEN)^ = len) and
-         CompareMemFixed(pointer(PtrInt(Values^)), pointer(Value), len) then
+         CompareMemFixed(pointer(PtrUInt(Values^)), pointer(Value), len) then
         exit
       else
         inc(Values)

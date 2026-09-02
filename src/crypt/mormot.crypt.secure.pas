@@ -8316,7 +8316,7 @@ type
 constructor TCryptRandomEntropy.Create(const name: RawUtf8);
 begin
   fSource := TAesPrngGetEntropySource(InternalResolve(name, RndAlgosText));
-  RandomByteString(16, fNonce); // good enough for per-instance naming
+  Random128(fNonce);
   inherited Create(name);       // should be done after InternalResolve()
 end;
 
@@ -8350,12 +8350,12 @@ type
 
 procedure TCryptRandomLecuyerPrng.Get(dst: pointer; dstlen: PtrInt);
 begin
-  SharedRandom.Fill(dst, dstlen); // global TLecuyer gsl_rng_taus2 generator
+  ThreadRandom.Fill(dst, dstlen); // per-thread TLecuyer gsl_rng_taus2 generator
 end;
 
 function TCryptRandomLecuyerPrng.Get32: cardinal;
 begin
-  result := SharedRandom.Next;
+  result := ThreadRandom.Next;
 end;
 
 { TCryptRandom32 }
@@ -11845,7 +11845,7 @@ end;
 class procedure TSynMustacheCryptoHelpers.PasswordGenerate(const Value: variant;
   out Result: variant);
 begin // {{ passwordgenerate len }}
-  RawUtf8ToVariant(TAesPrng.Main.RandomPassword(AnyVariantToIntegerDef(Value)));
+  RawUtf8ToVariant(TAesPrng.Main.RandomPassword(AnyVariantToIntegerDef(Value, 24)));
 end;
 
 // some callbacks for custom JSON serialization of security related types
