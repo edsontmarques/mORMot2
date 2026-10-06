@@ -116,6 +116,7 @@ type
     fOnCallbackRequestProcess: TOnHttpServerRequest;
     fOnBeforeIncomingFrame: TOnWebSocketProtocolIncomingFrame;
     fOnWebSocketsClosed: TNotifyEvent;
+    procedure DoCreate(aTimeOut: integer); override;
     procedure SetReceiveTimeout(aReceiveTimeout: integer); override;
   public
     /// low-level client WebSockets connection factory for host and port
@@ -134,9 +135,6 @@ type
       aProtocol: TWebSocketProtocol; aLog: TSynLogClass = nil;
       const aLogContext: RawUtf8 = ''; const aCustomHeaders: RawUtf8 = '';
       aTLSContext: PNetTlsContext = nil): THttpClientWebSockets; overload;
-    /// common initialization of all constructors
-    // - this overridden method will set the UserAgent with some default value
-    constructor Create(aTimeOut: integer = 10000); override;
     /// finalize the connection
     destructor Destroy; override;
     /// process low-level REST request, either on HTTP/1.1 or via WebSockets
@@ -453,7 +451,7 @@ begin
   RequestProcess := ws.fOnCallbackRequestProcess;
   if Assigned(RequestProcess) then
     result := THttpServerRequest.Create(
-      nil, 0, fOwnerThread, 0, ws.fProcess.Protocol.ConnectionFlags, nil)
+      nil, 0, fOwnerThread, 0, fProtocol.ConnectionFlags, nil)
   else
     result := nil;
 end;
@@ -538,11 +536,11 @@ end;
 
 { THttpClientWebSockets }
 
-constructor THttpClientWebSockets.Create(aTimeOut: integer);
+procedure THttpClientWebSockets.DoCreate(aTimeOut: integer);
 begin
-  inherited Create(aTimeOut);
+  inherited DoCreate(aTimeOut);
   fSettings.SetDefaults;
-  fSettings.CallbackAnswerTimeOutMS := aTimeOut;
+  fSettings.CallbackAnswerTimeOutMS := fReceiveTimeout; // from aTimeOut
 end;
 
 class function THttpClientWebSockets.WebSocketsConnect(
@@ -597,7 +595,7 @@ end;
 
 destructor THttpClientWebSockets.Destroy;
 begin
-  FreeAndNil(fProcess);
+  FreeAndNilSafe(fProcess); // prefer Safe variant here
   inherited;
 end;
 
@@ -662,7 +660,7 @@ end;
 procedure THttpClientWebSockets.SetReceiveTimeout(aReceiveTimeout: integer);
 begin
   inherited SetReceiveTimeout(aReceiveTimeout);
-  fSettings.CallbackAnswerTimeOutMS := aReceiveTimeout;
+  fSettings.CallbackAnswerTimeOutMS := fReceiveTimeout;
 end;
 
 function THttpClientWebSockets.Settings: PWebSocketProcessSettings;

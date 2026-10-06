@@ -74,6 +74,10 @@ type
     procedure _SynDBRemote;
     /// test TSqlDBConnectionProperties persistent as JSON
     procedure DBPropertiesPersistence;
+    /// NewStatementPrepared() when NewStatement itself raises an exception
+    procedure NewStatementFailure;
+    /// EngineLockedNextID() when 'select max(ID)' fails (e.g. connection lost)
+    procedure NextIDSelectMaxFailure;
     /// initialize needed RESTful client (and server) instances
     // - i.e. a RESTful direct access to an external DB
     procedure ExternalRecords;
@@ -178,6 +182,28 @@ type
   // class hooks to access DMBS property for TTestExternalDatabase.AutoAdaptSQL
   TSqlDBConnectionPropertiesHook = class(TSqlDBConnectionProperties);
   TRestStorageExternalHook = class(TRestStorageExternal);
+
+  // a connection whose NewStatement always fails - as TSqlDBZeosConnection
+  // does when its implicit Connect raises (e.g. database server unreachable)
+  TSqlDBSQLite3ConnectionNoStatement = class(TSqlDBSQLite3Connection)
+  public
+    function NewStatement: TSqlDBStatement; override;
+  end;
+
+  TSqlDBSQLite3ConnectionPropertiesNoStatement = class(TSqlDBSQLite3ConnectionProperties)
+  public
+    function NewConnection: TSqlDBConnection; override;
+  end;
+
+function TSqlDBSQLite3ConnectionNoStatement.NewStatement: TSqlDBStatement;
+begin
+  raise ESynLogSilent.Create('NewStatement failed');
+end;
+
+function TSqlDBSQLite3ConnectionPropertiesNoStatement.NewConnection: TSqlDBConnection;
+begin
+  result := TSqlDBSQLite3ConnectionNoStatement.Create(self);
+end;
 
 
 { TTestExternalDatabase }
@@ -1017,6 +1043,96 @@ begin
     end;
   finally
     Props.Free;
+  end;
+end;
+
+procedure TTestExternalDatabase.NewStatementFailure;
+var
+  props: TSqlDBConnectionProperties;
+  conn: TSqlDBConnection;
+  raised: TClass;
+  level: TSynLogLevels;
+begin
+  // TryPrepare() logged stmt.SqlWithInlinedParams in its except block, with
+  // stmt=nil when NewStatement raised: an EAccessViolation replaced the
+  // original error, and LastErrorMessage was never set
+  level := SynDBLog.Family.Level;
+  SynDBLog.Family.Level := level + [sllError]; // force the logging branch
+  props := TSqlDBSQLite3ConnectionPropertiesNoStatement.Create(
+    SQLITE_MEMORY_DATABASE_NAME, '', '', '');
+  try
+    conn := props.NewConnection;
+    try
+      Check(conn.NewStatementPrepared('select 1', true, false) = nil);
+      Check(PosEx('NewStatement failed', conn.LastErrorMessage) > 0,
+        'LastErrorMessage');
+      raised := nil;
+      try
+        conn.NewStatementPrepared('select 1', true, true);
+      except
+        on E: Exception do
+          raised := E.ClassType;
+      end;
+      Check(raised = ESynLogSilent, 'original exception re-raised');
+    finally
+      conn.Free;
+    end;
+  finally
+    props.Free;
+    SynDBLog.Family.Level := level;
+  end;
+end;
+
+procedure TTestExternalDatabase.NextIDSelectMaxFailure;
+var
+  model: TOrmModel;
+  server: TRestServerFullMemory;
+  props: TSqlDBConnectionProperties;
+  ext: TRestStorageExternalHook;
+  ndx: PtrInt;
+begin
+  // when 'select max(ID)' failed (e.g. "MySQL server has gone away"), the
+  // counter silently restarted from 0, so the next INSERT used ID=1, then 2, 3..
+  // with a "Duplicate entry for key PRIMARY" error until the next reset
+  model := TOrmModel.Create([TOrmPeopleExt]);
+  try
+    server := TRestServerFullMemory.Create(model);
+    try
+      DeleteFile('maxidtest.db3');
+      props := TSqlDBSQLite3ConnectionProperties.Create(
+        'maxidtest.db3', '', '', '');
+      try
+        OrmMapExternal(model, TOrmPeopleExt, props, 'MaxIDTest');
+        ext := TRestStorageExternalHook.Create(
+          TOrmPeopleExt, server.OrmInstance as TRestOrmServer);
+        try
+          ndx := model.GetTableIndexExisting(TOrmPeopleExt);
+          props.ExecuteNoResult('insert into MaxIDTest (ID) values (?)', [10]);
+          // make 'select max(ID)' fail: ExecuteDirect() returns nil
+          props.ExecuteNoResult('alter table MaxIDTest rename to MaxIDAway', []);
+          CheckEqual(ext.EngineLockedNextID, 0, 'no ID on select failure');
+          CheckEqual(ext.EngineLockedNextID, 0, 'no counter from 0');
+          CheckEqual(ext.EngineAdd(ndx, '{"FirstName":"a"}'), 0, 'add');
+          // once the database is back, max(ID) is retrieved again
+          props.ExecuteNoResult('alter table MaxIDAway rename to MaxIDTest', []);
+          CheckEqual(ext.EngineLockedNextID, 11, 'recovered');
+          CheckEqual(ext.EngineAdd(ndx, '{"FirstName":"b"}'), 12, 'add ok');
+          // void table: max(ID)=NULL is no error -> first ID is 1
+          props.ExecuteNoResult('delete from MaxIDTest', []);
+          ext.EngineAddForceSelectMaxID;
+          CheckEqual(ext.EngineLockedNextID, 1, 'void table');
+        finally
+          ext.Free;
+        end;
+      finally
+        props.Free;
+        DeleteFile('maxidtest.db3');
+      end;
+    finally
+      server.Free;
+    end;
+  finally
+    model.Free;
   end;
 end;
 

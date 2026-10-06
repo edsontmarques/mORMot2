@@ -332,6 +332,7 @@ const // some time conversion constants with Milli/Micro/NanoSec resolution
   SecsPerMonth = 2629746; // rough approximation of SecsPerDay * 365.2425 / 12
   SecsPerYear  = 12 * SecsPerMonth;
 
+  TicksPerMillisecond  = 10000; // 100 ns e.g. for Windows TimeSpan or FileTime
   MilliSecsPerSec      = 1000;
   MilliSecsPerMin      = MilliSecsPerSec  * SecsPerMin;
   MilliSecsPerHour     = MilliSecsPerMin  * MinsPerHour;
@@ -465,13 +466,15 @@ type
 
   /// Windows specific detected context e.g. WOW64 translation, PRISM or Wine
   TWindowsSpecs = set of (
-   wsWow64,
-   wsWow64Emulation,
-   wsPrism,
-   wsWine,
-   wsFavorFewThreads,
-   wsWeakDpApi,
-   wsWeakHttpApi);
+    wsWow64,
+    wsWow64Emulation,
+    wsPrism,
+    wsWine,
+    wsFavorFewThreads,
+    wsWeakDpApi,
+    wsWeakCng,
+    wsWeakHttpApi,
+    wsWeakHttpSys);
 
   /// notable Linux distributions, organized by their package management system
   TLinuxDistribution = (
@@ -485,18 +488,18 @@ type
 
 const
   /// OSVersion32.utsrelease[2] indexed MacOS versions, as number
-  MACOS_NUM: array[8 .. 26] of TShort7 = (
+  MACOS_NUM: array[8 .. 27] of TShort7 = (
     '10.4',  '10.5',  '10.6',  '10.7',  '10.8',  '10.9',  '10.10', '10.11',
     '10.12', '10.13', '10.14', '10.15', '11',    '12',    '13',    '14',
-    '15',    '26',    '27'); // MacOS 27 expected in 2026, ARM-only
+    '15',    '26',    '27',    '28');
 
   /// OSVersion32.utsrelease[2] indexed MacOS versions, as plain text
   // - see https://en.wikipedia.org/wiki/MacOS_version_history#Releases
-  MACOS_NAME: array[8 .. 26] of TShort15 = (
+  MACOS_NAME: array[8 .. 27] of TShort15 = (
     'Tiger', 'Leopard', 'Snow Leopard', 'Lion', 'Mountain Lion', 'Mavericks',
     'Yosemite', 'El Capitan', 'Sierra', 'High Sierra', 'Mojave', 'Catalina',
     'Big Sur', 'Monterey', 'Ventura', 'Sonoma', 'Sequoia', 'Tahoe',
-    'Next'); // expected in 2026, ARM-only
+    'Golden Gate', 'Next');
 
   /// the recognized Windows versions, as plain text
   // - defined even outside OSWINDOWS to allow process e.g. from monitoring tools
@@ -686,9 +689,9 @@ const
       'x86'
     {$else} {$ifdef CPUX64}
       'x64'
-    {$else} {$ifdef CPUARM}
+    {$else} {$ifdef ABIA32}  // NOASMBLOCK undefines CPUARM on Delphi
       'arm' +
-    {$else} {$ifdef CPUAARCH64}
+    {$else} {$ifdef ABIA64} // not CPUAARCH64: NOASMBLOCK undefines it on Delphi
       'aarch' +
     {$ifdef CPUPOWERPC}
       'ppc' +
@@ -697,7 +700,7 @@ const
     {$endif CPUSPARC}
     {$endif CPUPOWERPC}
     {$endif CPUARM}
-    {$endif CPUAARCH64}
+    {$endif ABIA64}
     {$ifdef CPU32}
       '32'
     {$else}
@@ -837,6 +840,9 @@ function MatchOS(os: TOperatingSystem): boolean;
 
 /// recognize the Linux distribution for a given Operating System
 function LinuxDistribution(os: TOperatingSystem): TLinuxDistribution;
+
+/// convert the raw utsrelease[2] Kernel number into human MACOS_NAME[] index
+function MacKernel(const osv: TOperatingSystemVersion): PtrUInt;
 
 /// return the best known ERROR_* system error message constant texts
 // - without the 'ERROR_' prefix, but in a cross-platform way
@@ -1981,6 +1987,7 @@ type
   HWND          = Windows.HWND;
   BOOL          = Windows.BOOL;
   LARGE_INTEGER = Windows.LARGE_INTEGER;
+  HLOCAL        = Windows.HLOCAL;
   TFileTime     = Windows.FILETIME;
   PFileTime     = ^TFileTime;
 
@@ -2145,6 +2152,7 @@ const
   ERROR_INVALID_HANDLE      = Windows.ERROR_INVALID_HANDLE;
   ERROR_INSUFFICIENT_BUFFER = Windows.ERROR_INSUFFICIENT_BUFFER;
   ERROR_INVALID_PARAMETER   = Windows.ERROR_INVALID_PARAMETER;
+  ERROR_INVALID_DATA        = Windows.ERROR_INVALID_DATA;
   ERROR_HANDLE_EOF          = Windows.ERROR_HANDLE_EOF;
   ERROR_ALREADY_EXISTS      = Windows.ERROR_ALREADY_EXISTS;
   ERROR_MORE_DATA           = Windows.ERROR_MORE_DATA;
@@ -2188,8 +2196,7 @@ function GetModuleHandle(lpModuleName: PChar): HMODULE;
 // - redefined in mormot.core.os to avoid dependency to the Windows unit
 function PostMessage(hWnd: HWND; Msg: UINT; wParam: WPARAM; lParam: LPARAM): BOOL;
 
-/// retrieves the current stack trace
-// - only available since Windows XP
+/// retrieves the current stack trace, using Windows XP+ official API
 // - FramesToSkip + FramesToCapture should be <= 62
 function RtlCaptureStackBackTrace(FramesToSkip, FramesToCapture: cardinal;
   BackTrace, BackTraceHash: pointer): byte; stdcall;
@@ -2216,6 +2223,7 @@ function FreeEnvironmentStringsW(EnvBlock: PWideChar): BOOL; stdcall;
 function SysAllocString(psz: PWideChar): pointer; stdcall;
 function SysAllocStringLen(psz: PWideChar; len: cardinal): pointer; stdcall;
 procedure SysFreeString(bstr: pointer); stdcall;
+function LocalFree(hMem: pointer): pointer; stdcall;
 
 /// try to enter a Critical Section (Lock)
 // - returns 1 if the lock was acquired, or 0 if the mutex is already locked
@@ -3090,7 +3098,7 @@ type
     EStackCount: integer;
     /// the address where the exception occurred
     EAddr: PtrUInt;
-    /// the optional stack trace
+    /// the optional stack trace - only <> nil within the exception handler
     EStack: PPtrUIntArray;
     /// timestamp of this exception, as number of seconds since UNIX Epoch
     // - UnixTimeUtc is faster than NowUtc or GetSystemTime
@@ -3107,10 +3115,13 @@ type
 
   /// the global function signature expected by RawExceptionIntercept()
   // - assigned e.g. to SynLogException() in mormot.core.log.pas
+  // - warning: the function should ignore any potential nested call, as
+  // SynLogException() does with PerThreadInfo.ExceptionIgnore
   TOnRawLogException = procedure(const Ctxt: TSynLogExceptionContext);
 
 /// setup Exception interception for the whole process
 // - the first to call this procedure will be elected until the process ending
+// - RawExceptionIntercept(nil) would disable any existing interception function
 // - returns true on success, false if there is already an handler
 function RawExceptionIntercept(const Handler: TOnRawLogException): boolean;
 
@@ -4048,6 +4059,9 @@ function RetrieveLoadAvg: TShort23;
 // or 'ncores user kern [updays] used/totalram [used/totalswap] osint32' on Windows
 procedure RetrieveSysInfoText(var text: ShortString);
 
+/// used by RetrieveSysInfoText() from text = ''
+procedure AppendSysInfo(var text: ShortString);
+
 /// retrieve low-level information about current memory usage
 // - as used e.g. by TSynMonitorMemory or GetMemoryInfoText
 // - under BSD, only memtotal/memfree/percent are properly returned
@@ -4180,6 +4194,12 @@ procedure ConsoleWriteRaw(const Text: RawUtf8; NoLineFeed: boolean = false); ove
 // - similar to writeln but redirect to ConsoleWrite() with proper thread safety
 procedure ConsoleWriteLn;
 
+/// redirect to the reentrant TOsLock.Lock for clean ConsoleWrite/TextColor
+procedure ConsoleLock;
+
+/// redirect to the reentrant TOsLock.UnLock for clean ConsoleWrite/TextColor
+procedure ConsoleUnLock;
+
 /// will wait for the ENTER key to be pressed, with all needed waiting process
 // - on the main thread, doCheckSynchronize=true calls Synchronize() for proper
 // work e.g. with interface-based service implemented as optExecInMainThread
@@ -4250,7 +4270,7 @@ function GetFileNameFromUrl(const Uri: RawUtf8): TFileName;
 {$else}
 
 /// internal function just wrapping fppoll(POLLIN or POLLPRI)
-function WaitReadPending(fd, timeout: integer): boolean;
+function WaitReadPending(fd, timeout: integer): integer;
 
 type
   /// optional callback used by PosixFileNames()
@@ -4380,6 +4400,7 @@ type
     // - ProcName can be a space-separated list of procedure names, to try
     // alternate API names (e.g. for OpenSSL 1.1.1/3.x/4.x compatibility)
     // - if ProcName starts with '?' then RaiseExceptionOnFailure = nil is set
+    // for this identifier to make it optional and won't fail the whole loading
     function Resolve(const Prefix: RawUtf8; ProcName: PAnsiChar; Entry: PPointer;
       RaiseExceptionOnFailure: ExceptionClass = nil; SilentError: PString = nil): boolean;
     /// cross-platform resolution of all function entries in this library
@@ -4548,9 +4569,9 @@ type
   TMultiLightLock = object
   {$endif USERECORDWITHMETHODS}
   private
-    Flags: PtrUInt;     // is also the reentrant > 0 counter
-    ThreadID: pointer;  // TThreadID is pointer on POSIX, DWord on Windows
-    procedure LockSpin; // called by the Lock method when inlined
+    Flags: cardinal;     // is also the reentrant > 0 counter
+    ThreadID: TThreadID; // PtrUInt on POSIX, DWord on Windows
+    procedure LockSpin;  // called by the Lock method when inlined
   public
     /// to be called if the instance has not been filled with 0
     // - e.g. not needed if TMultiLightLock is defined as a class field
@@ -4668,9 +4689,7 @@ type
     Flags: PtrUInt; // bit 0 = WriteLock, 1 = ReadWriteLock, >1 = ReadOnlyLock
     LastReadWriteLockThread, LastWriteLockThread: TThreadID; // to be reentrant
     LastReadWriteLockCount,  LastWriteLockCount: cardinal;
-    {$ifndef ASMX64NOTPIC}
     procedure ReadOnlyLockSpin;
-    {$endif ASMX64NOTPIC}
   public
     /// initialize the R/W lock
     // - not needed if TRWLock is part of a class - i.e. if was filled with 0
@@ -4690,7 +4709,7 @@ type
     // !   rwlock.ReadOnlyUnLock;
     // ! end;
     procedure ReadOnlyLock;
-      {$ifdef HASINLINE} {$ifndef ASMX64NOTPIC} inline; {$endif} {$endif}
+      {$ifdef HASINLINE} inline; {$endif}
     /// release a previous ReadOnlyLock call
     procedure ReadOnlyUnLock;
       {$ifdef HASINLINE} inline; {$endif}
@@ -4813,7 +4832,7 @@ type
     // would deadlock
     procedure Lock;
       {$ifdef HASINLINE} inline; {$endif}
-    /// access to raw pthread_mutex_trylock() method
+    /// try once to acquire the raw futex or call pthread_mutex_trylock() method
     function TryLock: boolean;
       {$ifdef HASINLINE} inline; {$endif}
     /// leave an OS lock
@@ -5359,6 +5378,7 @@ var OsWakeAllOnValue: procedure(Value: PCardinal); {$ifdef OSWINDOWS} stdcall; {
 type
   TCachedValueCall = function(Param: pointer): RawByteString;
   /// raw thread-safe cache of a RawByteString content
+  // - should be filled with 0 before usage, e.g. as class field or global var
   {$ifdef USERECORDWITHMETHODS}
   TCachedValue = record
   {$else}
@@ -5369,8 +5389,8 @@ type
     Tix32: cardinal;
     Value: RawByteString;
     procedure Reset;
-    procedure Cache(Call: TCachedValueCall; CallParam: pointer; TixShr: cardinal;
-      var Dest; Flush: boolean = false);
+    procedure Cache(Call: TCachedValueCall; CallParam: pointer;
+      TixShr: cardinal; var Dest; Flush: boolean = false);
   end;
 
 /// thread-safe cache of a File content with default 1 shl 6 = 64 secs timeout
@@ -5560,7 +5580,7 @@ function RawKillThread(Thread: TThread): boolean;
 type
   /// store a bitmask of logical CPU cores, as used by SetThreadMaskAffinity
   // - has 32/64-bit pointer-size on Windows, or 1024 bits on POSIX
-  TCpuSet = {$ifdef OSWINDOWS} PtrUInt {$else} array[0..127] of byte {$endif};
+  TCpuSet = {$ifdef OSWINDOWS} PtrUInt {$else} THash1024 {$endif};
   TCpuSets = array of TCpuSet;
 
 /// low-level bitmasks of logical CPU cores hosted on each hardware CPU socket
@@ -5619,7 +5639,7 @@ var
   // resulting length - which is convenient e.g. with POSIX truncation to 16 chars
   // - you can retrieve the name later on using CurrentThreadNameShort
   // - this method will register TSynLog.LogThreadName(), so threads calling it
-  // should also call TSynLogFamily.OnThreadEnded/TSynLog.NotifyThreadEnded
+  // should also call TSynLog.NotifyThreadEnded or inherit from TThreadAbstract
   SetThreadName: procedure(ThreadID: TThreadID; const Format: RawUtf8;
     const Args: array of const);
   /// retrieve the thread name, as set by SetThreadName()
@@ -6235,6 +6255,10 @@ function RunUntilSigTerminatedState: TServiceState;
 var
   /// once SynDaemonIntercept has been called, this global variable
   // contains the SIGQUIT / SIGTERM / SIGINT received signal
+  // - on Linux you could even write:
+  // ! if Assigned(OsWaitOnValue) then
+  // !   OsWaitOnValue(@SynDaemonTerminated, 0, INFINITE); // clean futex wait
+  // - so never assign directly this variable unless you call OsWakeAllOnValue()
   SynDaemonTerminated: integer;
 {$else}
 /// compatibility function for Delphi POSIX - only SIGINT/SIGQUIT are tracked
@@ -6250,8 +6274,8 @@ function SynDaemonTerminated: integer;
 procedure SynDaemonIntercept(const onlog: TSynLogProc = nil);
 
 /// disable SIGPIPE signal for the current process
-// - is called e.g. by NewOpenSslNetTls since the OpenSsl TLS layer does not
-// (yet) use MSG_NOSIGNAL when accessing the socket
+// - is called e.g. by NewOpenSslNetTls since the OpenSsl 1.x/3.x TLS layer does
+// not use MSG_NOSIGNAL when accessing the socket - not needed since OpenSsl 4.x
 procedure SigPipeIntercept;
 
 {$endif OSWINDOWS}
@@ -6696,20 +6720,20 @@ end;
 { ****************** Gather Operating System Information }
 
 const // cf https://preview.changewindows.org/platforms/pc
-  DESKTOP_INT: array[0 .. 19] of cardinal = (
+  DESKTOP_INT: array[0 .. 20] of cardinal = (
      10240,  10586,  14393,  15063,  16299,  17134,  17763,  18362,  18363,
      19041,  19042,  19043,  19044,  19045,  22000,  22621,  22631,  26100,
-     26200,  27881); // detect 26H2 Canary builds since 19/6/2025
+     26200,  26300, 29570); // detect 27H2 Canary builds since 17/4/2026
   DESKTOP_TXT: array[0 .. high(DESKTOP_INT)] of TTemp4  = (
     '1507', '1511', '1607', '1703', '1709', '1803', '1809', '1903', '1909',
     '2004', '20H2', '21H1', '21H2', '22H2', '21H2', '22H2', '23H2', '24H2',
-    '25H2', '26H2'); // stored as 32-bit cardinal = array[0..3] of AnsiChar
-  SERVER_INT: array[0 .. 10] of cardinal = (
+    '25H2', '26H2', '27H2'); // stored as 32-bit cardinal = TTemp4
+  SERVER_INT: array[0 .. 11] of cardinal = (
     14393,  16299,  17134,  17763,  18362,  18363,  19041,  19042,  20348,
-    25398,  26100);
+    25398,  26100, 29651);   // detect 26H2 Canary builds since 24/8/2026
   SERVER_TXT: array[0 .. high(SERVER_INT), 0 .. 3] of AnsiChar = (
     '1607', '1709', '1803', '1809', '1903', '1909', '2004', '20H2', '21H2',
-    '23H2', '24H2');
+    '23H2', '24H2', '26H2');
 
 function FindOsBuild(c: cardinal; hi: PtrInt; b, t: PCardinalArray): cardinal;
 begin
@@ -6754,7 +6778,17 @@ begin
   AppendOsBuild(osv, @result, sep);
 end;
 
+function MacKernel(const osv: TOperatingSystemVersion): PtrUInt;
+begin
+  result := osv.utsrelease[2]; // e.g. macOS 15  -> Darwin 24
+  if result > 26 then
+    dec(result); // Darwin 26 is skipped in the MACOS_NAME[] sequence
+  result := MinPtrUInt(high(MACOS_NAME), MaxPtrUInt(low(MACOS_NAME), result));
+end; // 'Tiger' or 'Next' as lower/higher fallback
+
 procedure AppendOsv(const osv: TOperatingSystemVersion; var dest: TShort47);
+var
+  kern: PtrUInt;
 begin
   case osv.os of
     osWindows:
@@ -6765,12 +6799,12 @@ begin
         exit;
       end;
     osOSX: // guess end-user MacOS Name from Darwin version number
-      if osv.utsrelease[2] in [low(MACOS_NAME) .. high(MACOS_NAME)] then
       begin
+        kern := MacKernel(osv); // e.g. macOS 15  -> Darwin 24
         AppendShort('macOS ', dest);
-        AppendShort(MACOS_NUM[osv.utsrelease[2]], dest);
+        AppendShort(MACOS_NUM[kern], dest);
         AppendShortChar(' ', @dest);
-        AppendShort(MACOS_NAME[osv.utsrelease[2]], dest);
+        AppendShort(MACOS_NAME[kern], dest);
         exit;
       end;
   end;
@@ -6799,8 +6833,7 @@ begin
     osWindows:
       result := @WINDOWS_NAME[osv.win];
     osOSX:
-      if osv.utsrelease[2] in [low(MACOS_NAME) .. high(MACOS_NAME)] then
-        result := @MACOS_NAME[osv.utsrelease[2]];
+      result := @MACOS_NAME[MacKernel(osv)];
   end;
   if (result = nil) or
      (result^[0] = #0) then
@@ -7025,15 +7058,25 @@ type
   TWinErrorSorted = (
     // some EXCEPTION_* in range $80000000 .. $800000ff
     DATATYPE_MISALIGNMENT, BREAKPOINT, SINGLE_STEP,
+    // some NTE_* errors as returned by CNG
+    BAD_KEY, BAD_LEN, BAD_DATA, BAD_ALGID, BAD_FLAGS, NO_KEY, NO_MEMORY, PERM,
+    NOT_FOUND, BAD_PUBLIC_KEY, BAD_KEYSET, FAIL, SYS_ERR, SILENT_CONTEXT,
+    INVALID__HANDLE, INVALID__PARAMETER, BUFFER_TOO_SMALL, NOT__SUPPORTED,
+    NO_MORE_ITEMS, DECRYPTION_FAILURE, INTERNAL_ERROR, UI_REQUIRED,
+    DEVICE_NOT_READY, INCORRECT_PASSWORD,
     // some SEC_E_* errors as returned by SSPI
-    E_UNSUPPORTED_FUNCTION, E_INVALID_TOKEN, E_MESSAGE_ALTERED,
+    E_UNSUPPORTED_FUNCTION, E_INVALID_TOKEN, E_NO_CREDENTIALS, E_MESSAGE_ALTERED,
     E_CONTEXT_EXPIRED, E_INCOMPLETE_MESSAGE, E_BUFFER_TOO_SMALL,
     E_ILLEGAL_MESSAGE, E_CERT_UNKNOWN, E_CERT_EXPIRED, E_ENCRYPT_FAILURE,
     E_DECRYPT_FAILURE, E_ALGORITHM_MISMATCH,
     // some security-related HRESULT errors (negative 32-bit values first)
-    CRYPT_E_BAD_ENCODE, CRYPT_E_SELF_SIGNED, CRYPT_E_BAD_MSG, CRYPT_E_REVOKED,
-    CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE, TRUST_E_BAD_DIGEST,
-    TRUST_E_NOSIGNATURE, CERT_E_EXPIRED, CERT_E_CHAINING, CERT_E_REVOKED,
+    CRYPT_E_BAD_ENCODE, CRYPT_E_NOT_FOUND, CRYPT_E_SELF_SIGNED, CRYPT_E_BAD_MSG,
+    CRYPT_E_REVOKED, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE,
+    TRUST_E_CERT_SIGNATURE, TRUST_E_BAD_DIGEST, TRUST_E_BASIC_CONSTRAINTS,
+    TRUST_E_NOSIGNATURE, CERT_E_EXPIRED, CERT_E_ROLE, CERT_E_PURPOSE,
+    CERT_E_UNTRUSTEDROOT, CERT_E_CHAINING, CERT_E_REVOKED,
+    CERT_E_UNTRUSTEDTESTROOT, CERT_E_CN_NO_MATCH, CERT_E_WRONG_USAGE,
+    CERT_E_INVALID_POLICY, CERT_E_INVALID_NAME,
     // some EXCEPTION_* in range $c0000000 .. $c00000ff
     ACCESS_VIOLATION, IN_PAGE_ERROR, INVALID_HANDLE_,
     NONCONTINUABLE_EXCEPTION, ILLEGAL_INSTRUCTION,
@@ -7059,12 +7102,19 @@ const
   WINERR_SORTED: array[TWinErrorSorted] of cardinal = (
     // some EXCEPTION_* in range $80000000 .. $800000ff
     $80000002, $80000003, $80000004,
+    // some NTE_* errors as returned by CNG
+    $80090003, $80090004, $80090005, $80090008, $80090009, $8009000d, $8009000e,
+    $80090010, $80090011, $80090015, $80090016, $80090020, $80090021, $80090022,
+    $80090026, $80090027, $80090028, $80090029, $8009002a, $8009002c, $8009002d,
+    $8009002e, $80090030, $80090033,
     // some SEC_E_* errors as returned by SSPI
-    $80090302, $80090308, $8009030F, $80090317, $80090318, $80090321,
+    $80090302, $80090308, $8009030e, $8009030f, $80090317, $80090318, $80090321,
     $80090326, $80090327, $80090328, $80090329, $80090330, $80090331,
     // some security-related HRESULT errors (negative 32-bit values first)
-    $80092002, $80092007, $8009200d, $80092010, $80092012, $80092013, $80096010,
-    $800b0100, $800b0101, $800b010a, $800b010c,
+    $80092002, $80092004, $80092007, $8009200d, $80092010, $80092012, $80092013,
+    $80096004, $80096010, $80096019,
+    $800b0100, $800b0101, $800b0103, $800b0106, $800b0109, $800b010a,
+    $800b010c, $800b010d, $800b010f, $800b0110, $800b0113, $800b0114,
     // some EXCEPTION_* in range $c0000000 .. $c00000ff
     $c0000005, $c0000006, $c0000008, $c000001d, $c0000025, $c0000026,
     $c000008c, $c000008d, $c000008e, $c000008f, $c0000090, $c0000091,
@@ -7125,8 +7175,8 @@ begin
 end;
 
 const
-  _PREFIX: array[0..5] of TShort15 = (
-    'WSA', 'ERROR_WINHTTP_', '', 'EXCEPTION_', 'SEC_', 'ERROR_');
+  _PREFIX: array[0 .. 6] of TShort15 = (
+    'WSA', 'ERROR_WINHTTP_', '', 'EXCEPTION_', 'SEC_', 'NTE_', 'ERROR_');
 
 function AppendWinErrorText(Code: cardinal; var Dest: ShortString;
   Sep: AnsiChar): boolean;
@@ -7144,15 +7194,17 @@ begin
       Code := 0;  // main Windows Socket API errors
     12000 .. 12152:
       Code := 1;  // most common WinHttp API errors
-    1722, $80092002 .. $800b010c:
+    1722, $80092002 .. $800b0114:
       Code := 2;  // no prefix for security-related HRESULT errors
     $80000000 .. $800000ff, $c0000000 .. $c00000ff:
       Code := 3;  // EXCEPTION_* constants
     $00090312 .. $00090321,
     $80090302 .. $80090331:
       Code := 4; // SEC_* SSPI constants
+    $80090000 .. $800900ff:
+      Code := 5; // NTE_* CNG constants
   else
-    Code := 5;   // regular Windows ERROR_* constant
+    Code := 6;   // regular Windows ERROR_* constant
   end;
   AppendShort(_PREFIX[Code], Dest);
   AppendShort(txt^, Dest);
@@ -7560,7 +7612,7 @@ begin
 end;
 
 const
-  MilliSecsPerFileTime = 10000; // a tick is 100ns
+  MilliSecsPerFileTime = TicksPerMillisecond; // a tick is 100ns
   SecsPerFileTime      = 10000000;
 
 procedure UnixTimeToFileTime(I64: TUnixTime; out FT: TFileTime);
@@ -8706,15 +8758,20 @@ end;
 
 {$ifndef NOEXCEPTIONINTERCEPT}
 
+{$ifndef KEEP_STACKFRAMES}
+{$STACKFRAMES ON} // we need {$W+} stack frame for the backtrace API calls below
+{$endif KEEP_STACKFRAMES}
+
 {$ifdef WITH_RAISEPROC} // for FPC on Win32 + Linux (Win64=WITH_VECTOREXCEPT)
 var
   OldRaiseProc: TExceptProc;
+{$endif WITH_RAISEPROC}
 
-procedure SynRaiseProc(Obj: TObject; Addr: CodePointer;
-  FrameCount: integer; Frame: PCodePointer);
+procedure SynRaiseProc(Obj: TObject; Addr: pointer;
+  FrameCount: integer = 0; Frame: pointer = nil);
 var
   ctxt: TSynLogExceptionContext;
-  backuplasterror: DWord;
+  backuplasterror: integer;
 begin
   if (Obj <> nil) and
      Obj.InheritsFrom(Exception) and
@@ -8728,27 +8785,49 @@ begin
       if Obj.InheritsFrom(EExternal) then // e.g. EDivByZero or EMathError
         ctxt.ELevel := sllExceptionOS
       else
-        ctxt.ELevel := sllException; // regular "raise" exception
-      ctxt.ETimestamp := UnixTimeUtc;
-      ctxt.EStack := pointer(Frame);
+        ctxt.ELevel := sllException;      // regular "raise" exception
+      ctxt.EStack := Frame;
       ctxt.EStackCount := FrameCount;
+      ctxt.ETimestamp := UnixTimeUtc;     // the fastest API call possible
       _RawLogException(ctxt); // e.g. SynLogException() from mormot.core.log
-      // note that SynLogException() will use PerThreadInfo.ExceptionIgnore
-      // to avoid recursive exception loggin: _RawLogException should not be set
-      // to nil or exceptions on concurrent threads would not be logged
     except
       { ignore any nested exception }
     end;
     SetLastError(backuplasterror); // may have changed above
   end;
+  {$ifdef WITH_RAISEPROC}
   if Assigned(OldRaiseProc) then
     OldRaiseProc(Obj, Addr, FrameCount, Frame);
+  {$endif WITH_RAISEPROC}
 end;
 
+{$ifndef WITH_RAISEPROC}
+{$ifdef WITH_RAISEEXCEPTOBJPROC} // Delphi 2009+ Delphi Exceptions interceptor
+var
+  OldRaiseExceptObjProc: procedure(P: PExceptionRecord);
+
+procedure SynRaiseExceptObj(P: PExceptionRecord);
+begin
+  // preserve SysUtils.Exception.RaisingException(), third-party hooks, etc.
+  if Assigned(OldRaiseExceptObjProc) then
+    OldRaiseExceptObjProc(P);
+  if (P <> nil) and
+     Assigned(_RawLogException) then
+    {$ifdef OSWINDOWS}
+    SynRaiseProc(P^.ExceptObject, pointer(P^.ExceptAddr));
+    {$else} // modern Delphi LLVM ZCX/SJLJ targets left Addr unset with garbage
+    SynRaiseProc(P^.ExceptObject, nil);
+    {$endif OSWINDOWS}
+end;
+{$endif WITH_RAISEEXCEPTOBJPROC}
 {$endif WITH_RAISEPROC}
 
 var
   RawExceptionIntercepted: boolean; // single global Exception interception
+
+// note that SynLogException() will use PerThreadInfo.ExceptionIgnore to avoid
+// recursive exception logging: global _RawLogException should not be set
+// temporarly to nil or exceptions on concurrent threads would not be logged
 
 function RawExceptionIntercept(const Handler: TOnRawLogException): boolean;
 begin
@@ -8760,8 +8839,7 @@ begin
        not Assigned(Handler) then
       exit;
     RawExceptionIntercepted := true; // intercept once
-    {$ifdef WITH_RAISEPROC}
-    // FPC RTL redirection function
+    {$ifdef WITH_RAISEPROC} // FPC RTL redirection function
     if not Assigned(OldRaiseProc) then
     begin
       OldRaiseProc := RaiseProc;
@@ -8777,8 +8855,7 @@ begin
       result := true;
     end;
     {$endif WITH_VECTOREXCEPT}
-    {$ifdef WITH_RTLUNWINDPROC}
-    // Delphi x86 RTL redirection function
+    {$ifdef WITH_RTLUNWINDPROC} // oldest Delphi x86 RTL redirection function
     if not Assigned(OldUnWindProc) then
     begin
       OldUnWindProc := RTLUnwindProc;
@@ -8786,10 +8863,22 @@ begin
       result := true;
     end;
     {$endif WITH_RTLUNWINDPROC}
+    {$ifdef WITH_RAISEEXCEPTOBJPROC} // Delphi 2009+ Win32 redirection function
+    if not Assigned(OldRaiseExceptObjProc) then
+    begin
+      OldRaiseExceptObjProc := RaiseExceptObjProc;
+      RaiseExceptObjProc := @SynRaiseExceptObj;
+      result := true;
+    end;
+    {$endif WITH_RAISEEXCEPTOBJPROC}
   finally
     GlobalUnLock;
   end;
 end;
+
+{$ifndef KEEP_STACKFRAMES}
+{$STACKFRAMES OFF} // back to {$W-} normal state, as in mormot.defines.inc
+{$endif KEEP_STACKFRAMES}
 
 {$endif NOEXCEPTIONINTERCEPT}
 
@@ -8941,6 +9030,8 @@ function TExecutableResource.Open(ResourceName, ResType: PChar;
 begin
   result := false;
   {$ifdef DELPHIPOSIX}
+  if PtrUInt(ResourceName) < $10000 then
+    exit; // only string, no MAKEINTRESOURCE() ordinals on Delphi POSIX
   if Instance = 0 then
     Instance := HInstance; // always 0 on FPC POSIX for the current process
   {$endif DELPHIPOSIX}
@@ -8970,6 +9061,9 @@ end;
 function ResourceExists(ResourceName, ResType: PChar; Instance: TLibHandle): boolean;
 begin
   {$ifdef DELPHIPOSIX}
+  result := false;
+  if PtrUInt(ResourceName) < $10000 then
+    exit; // only string on Delphi POSIX - see TExecutableResource.Open() above
   if Instance = 0 then
     Instance := HInstance; // always 0 on FPC POSIX for the current process
   {$endif DELPHIPOSIX}
@@ -9460,8 +9554,10 @@ end;
 var
   _Shell: RawUtf8;
   _SystemInfoText: TCachedValue;
+  _SysInfoSafe: TLightLock;
   _SysInfoTix: cardinal;
   _SysInfoCache: TSysInfo;
+  _SysInfoText: TShort95;  // e.g. '20 0.45 1.02 1.31 5 17.5GB/62.4GB 060c6b08'
 
 function GetSystemInfoText: RawUtf8;
 begin
@@ -9475,51 +9571,79 @@ begin
     _SetShell(_Shell, result);
 end;
 
-function RetrieveSysInfo(var si: TSysInfo): boolean;
+function RetrieveSysInfo(si: PSysInfo; txt: PAnsiChar; max: PtrInt): boolean;
 var
   tix: cardinal;
+  s: PSysInfo;
+  p: PShortString;
 begin
-  tix := GetTickSec;
-  OSSafe.Lock;
+  tix := GetTickSec; // cached for 1 second
+  _SysInfoSafe.Lock;
   if _SysInfoTix <> tix then
   begin
     _SysInfoTix := tix;
-    _RetrieveSysInfo(_SysInfoCache)
+    _RetrieveSysInfo(_SysInfoCache);
+    _SysInfoText[0] := #0; // recompute text cache when needed
   end;
-  si := _SysInfoCache;
-  OSSafe.UnLock;
-  result := si.uptime <> 0;
+  if si <> nil then
+    si^ := _SysInfoCache;
+  result := _SysInfoCache.uptime <> 0;
+  if txt <> nil then
+  begin
+    p := @_SysInfoText;
+    if p^[0] = #0 then
+    begin
+      AppendShortCardinal(SystemInfo.dwNumberOfProcessors, p^);
+      if result then
+      begin
+        s := @_SysInfoCache;
+        AppendShortChar(' ', pointer(p)); // s^.loads[0/1] = user kern on Windows
+        AppendShortCurr64((Int64(s^.loads[0]) * CURR_RES + 5000) shr 16, p^, 2);
+        AppendShortChar(' ', pointer(p));
+        AppendShortCurr64((Int64(s^.loads[1]) * CURR_RES + 5000) shr 16, p^, 2);
+        AppendShortChar(' ', pointer(p));
+        {$ifdef OSPOSIX} // s^.loads[0/1/2] = avg1 avg5 avg15 on POSIX
+        AppendShortCurr64((Int64(s^.loads[2]) * CURR_RES + 5000) shr 16, p^, 2);
+        AppendShortChar(' ', pointer(p));
+        inc(s^.freeram, s^.bufferram);
+        {$endif OSPOSIX}
+        if s^.uptime > SecsPerDay then // optional [ndays]
+        begin
+          AppendShortCardinal(cardinal(s^.uptime) div SecsPerDay, p^);
+          AppendShortChar(' ', pointer(p));
+        end;
+        AppendFreeTotalKB(QWord(s^.totalram - s^.freeram) * s^.mem_unit,
+                          QWord(s^.totalram) * s^.mem_unit, p^);
+        if s^.freeswap < s^.totalswap shr 2 then // include swap if free below 25%
+          AppendFreeTotalKB(QWord(s^.totalswap - s^.freeswap) * s^.mem_unit,
+                            QWord(s^.totalswap) * s^.mem_unit, p^);
+        AppendShortIntHex(OSVersionInt32, p^); // identify and OS version
+      end;
+    end;
+    AppendShortBuffer(@p^[1], ord(p^[0]), max, txt);
+  end;
+  _SysInfoSafe.UnLock;
 end;
 
 procedure RetrieveSysInfoText(var text: ShortString);
-var
-  si: TSysInfo;  // Linuxism, but properly emulated in thit unit on Win/Mac/BSD
 begin
   text[0] := #0;
-  AppendShortCardinal(SystemInfo.dwNumberOfProcessors, text); // no syscall
-  if not RetrieveSysInfo(si) then // single syscall on Linux - 1 second cache
-    exit;
-  AppendShortChar(' ', @text); // si.loads[0/1] = user kern on Windows
-  AppendShortCurr64((Int64(si.loads[0]) * CURR_RES + 5000) shr 16, text, 2);
-  AppendShortChar(' ', @text);
-  AppendShortCurr64((Int64(si.loads[1]) * CURR_RES + 5000) shr 16, text, 2);
-  AppendShortChar(' ', @text);
-  {$ifdef OSPOSIX} // si.loads[0/1/2] = avg1 avg5 avg15 on POSIX
-  AppendShortCurr64((Int64(si.loads[2]) * CURR_RES + 5000) shr 16, text, 2);
-  AppendShortChar(' ', @text);
-  inc(si.freeram, si.bufferram);
-  {$endif OSPOSIX}
-  if si.uptime > SecsPerDay then // optional [ndays]
-  begin
-    AppendShortCardinal(cardinal(si.uptime) div SecsPerDay, text);
-    AppendShortChar(' ', @text);
-  end;
-  AppendFreeTotalKB(QWord(si.totalram - si.freeram) * si.mem_unit,
-                    QWord(si.totalram) * si.mem_unit, text);
-  if si.freeswap < si.totalswap shr 2 then // include swap if free below 25%
-    AppendFreeTotalKB(QWord(si.totalswap - si.freeswap) * si.mem_unit,
-                      QWord(si.totalswap) * si.mem_unit, text);
-  AppendShortIntHex(OSVersionInt32, text); // identify and OS version
+  AppendSysInfo(text);
+end;
+
+procedure AppendSysInfo(var text: ShortString);
+begin // Linuxism, but properly emulated in thit unit on Win/Mac/BSD
+  RetrieveSysInfo(nil, @text, high(text)); // syscall on Linux - 1 second cache
+end;
+
+procedure ConsoleLock;
+begin
+  ConsoleCriticalSection.Lock;
+end;
+
+procedure ConsoleUnLock;
+begin
+  ConsoleCriticalSection.UnLock;
 end;
 
 procedure ConsoleWrite(const Text: RawUtf8; Color: TConsoleColor;
@@ -10053,6 +10177,47 @@ begin
   TrimSelf(s);
 end;
 
+{$ifdef OSANDROID}
+// an Android app is a .so library loaded by app_process64, so ParamStr(0) is
+// void: use this .so, the package name and the application files folder
+procedure SetAndroidProgramInfo;
+var
+  pkg: RawByteString;
+  i: PtrInt;
+  dir: TFileName;
+begin
+  with Executable do
+  begin
+    ProgramFileName := InstanceFileName; // e.g. /data/app/.../lib/arm64/libApp.so
+    ProgramFilePath := ExtractFilePath(ProgramFileName);
+    ProgramName := GetFileNameWithoutExtOrPath(ProgramFileName);
+    pkg := StringFromFileNoSize('/proc/self/cmdline'); // e.g. 'com.company.app'#0
+    for i := 1 to length(pkg) do
+      if pkg[i] in [#0, ':'] then // ':' for secondary processes of the app
+      begin
+        SetLength(pkg, i - 1);
+        break;
+      end
+      else if pkg[i] = '/' then // not an Android package name
+        exit;
+    if pkg = '' then
+      exit;
+    FastSetString(ProgramName, pointer(pkg), length(pkg));
+    // same as Context.getFilesDir(): the application private writable folder
+    // - so that log files, pid files or data can be written as usual
+    dir := Format('/data/user/%d/%s/', [FpGetuid div 100000, string(pkg)]);
+    if not DirectoryExists(dir) then
+      dir := Format('/data/data/%s/', [string(pkg)]);
+    if not DirectoryExists(dir) then
+      exit;
+    dir := dir + 'files/'; // may not exist yet on a fresh install
+    if DirectoryExists(dir) or
+       CreateDir(dir) then
+      ProgramFilePath := dir;
+  end;
+end;
+{$endif OSANDROID}
+
 procedure InitializeProcessInfo; // called once at startup
 var
   dt: TDateTime;
@@ -10144,6 +10309,11 @@ begin
     end;
     if InstanceFileName = '' then
       InstanceFileName := ProgramFileName; // fallback (unlikely)
+    {$ifdef OSANDROID}
+    if (ProgramFileName = '') and
+       (InstanceFileName <> '') then
+      SetAndroidProgramInfo;
+    {$endif OSANDROID}
     {$endif OSWINDOWS}
     GetUserHost(User, Host);
     if Host = '' then
@@ -11365,7 +11535,8 @@ end;
 procedure TCachedValue.Cache(Call: TCachedValueCall; CallParam: pointer;
   TixShr: cardinal; var Dest; Flush: boolean);
 begin
-  TixShr := (GetTickSec shr TixShr) + 1; // big shr may get 0 just after boot
+  if TixShr <> 0 then
+    TixShr := (GetTickSec shr TixShr) + 1; // big shr may get 0 just after boot
   Safe.Lock;
   if (TixShr = Tix32) and
      not Flush then
@@ -11374,10 +11545,10 @@ begin
     Safe.UnLock;
     exit;
   end;
+  Tix32 := TixShr; // set inside the lock
   Safe.UnLock;
-  RawByteString(Dest) := Call(CallParam);
+  RawByteString(Dest) := Call(CallParam); // slow method outside of the lock
   Safe.Lock;
-  Tix32 := TixShr;
   Value := RawByteString(Dest);
   Safe.UnLock;
 end;
@@ -11388,13 +11559,13 @@ end;
 procedure TMultiLightLock.Init;
 begin
   Flags := 0;
-  ThreadID := nil;
+  ThreadID := TThreadID(0);
 end;
 
 procedure TMultiLightLock.Done;
 begin
   Flags := MaxInt;
-  ThreadID := nil; // invalid combination to let TryLock fail
+  ThreadID := TThreadID(0); // invalid combination to let TryLock fail
 end;
 
 procedure TMultiLightLock.Lock;
@@ -11406,17 +11577,17 @@ end;
 procedure TMultiLightLock.UnLock;
 begin
   if Flags = 1 then
-    ThreadID := nil; // paranoid
-  LockedDec(Flags, 1);
+    ThreadID := TThreadID(0); // paranoid
+  LockedDec32(@Flags);
 end;
 
 function TMultiLightLock.TryLock: boolean;
 var
-  tid: pointer;
+  tid: TThreadID;
 begin
-  tid := pointer(PtrUInt(GetCurrentThreadId));
+  tid := GetCurrentThreadId;
   if Flags = 0 then    // is not locked
-    if LockedExc(Flags, {to=}1, {from=}0) then // try atomic acquisition
+    if LockedExc32(Flags, {to=}1, {from=}0) then // try atomic acquisition
     begin
       ThreadID := tid;
       result := true;  // acquired the lock
@@ -11435,7 +11606,7 @@ end;
 procedure TMultiLightLock.ForceLock;
 begin
   Flags := MaxInt; // forced acquisition, whatever the current state is
-  ThreadID := pointer(PtrUInt(GetCurrentThreadId));
+  ThreadID := GetCurrentThreadId;
 end;
 
 function TMultiLightLock.IsLocked: boolean;
@@ -11556,35 +11727,6 @@ begin
     {$ifdef FPC} at get_caller_addr(get_frame), get_caller_frame(get_frame) {$endif}
 end;
 
-// dedicated asm for this most simple (and used) method
-{$ifdef ASMX64NOTPIC}
-
-procedure TRWLock.ReadOnlyLock;
-// stack frame is required (at least on Windows) since it may call SwitchToThread
-var
-  backup: pointer; // better than push/pop since we have a stack frame
-asm
-        {$ifdef ABISYSVX64}
-        mov     rcx, rdi      // rcx = self
-        {$endif ABISYSVX64}
-@retry: mov     r8d, SPIN_COUNT
-@spin:  mov     rax, qword ptr [rcx + TRWLock.Flags]
-        and     rax, not 1
-        lea     rdx, [rax + 4]
-   lock cmpxchg qword ptr [rcx + TRWLock.Flags], rdx
-        jz      @done
-        pause
-        dec     r8d
-        jnz     @spin
-        mov     qword ptr [backup], rcx
-        call    SwitchToThread
-        mov     rcx, qword ptr [backup] // restore for the wait loop
-        jmp     @retry
-@done:  // restore the stack frame
-end;
-
-{$else}
-
 procedure TRWLock.ReadOnlyLock;
 var
   f: PtrUInt;
@@ -11598,16 +11740,14 @@ end;
 procedure TRWLock.ReadOnlyLockSpin;
 var
   spin, f: PtrUInt;
-begin
+begin // we removed the initial X86_64 asm which seemed to GPF on WinArm PRISM
   spin := SPIN_COUNT;
   repeat
-    spin := SpinAndWait(spin);
+    spin := SpinAndWait(spin); // adaptative spinning
     f := Flags and not 1; // retry ReadOnlyLock
   until (Flags = f) and
         LockedExc(Flags, {to=}f + 4, {from=}f);
 end;
-
-{$endif ASMX64NOTPIC}
 
 procedure TRWLock.ReadOnlyUnLock;
 begin

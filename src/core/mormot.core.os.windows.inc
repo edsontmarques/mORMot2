@@ -493,6 +493,7 @@ procedure SetEndOfFile;               external kernel32;
 procedure FlushFileBuffers;           external kernel32;
 function  GetLastError;               external kernel32;
 procedure SetLastError;               external kernel32;
+function  LocalFree;                  external kernel32;
 function  IocpCreate;                 external kernel32 name 'CreateIoCompletionPort';
 function  IocpGetQueuedStatus;        external kernel32 name 'GetQueuedCompletionStatus';
 function  IocpPostQueuedStatus;       external kernel32 name 'PostQueuedCompletionStatus';
@@ -1906,26 +1907,30 @@ end;
 var
   _RawLogException: TOnRawLogException;
 
-{$ifdef FPC}
-  {$ifdef WIN64}
-    {$define WITH_VECTOREXCEPT} // use AddVectoredExceptionHandler Win64 API
-  {$else}
-    {$ifdef FPC_USE_WIN32_SEH}
-      {$define WITH_VECTOREXCEPT} // new since FPC 3.2
-    {$else}
-      // Win32, Linux: intercept via the RaiseProc global variable
-      {$define WITH_RAISEPROC} // RaiseProc is set in main mormot.core.os.pas
-    {$endif FPC_USE_WIN32_SEH}
-  {$endif WIN64}
+{$ifdef CPU64}
+  {$define WITH_VECTOREXCEPT}     // Win64 SEH AddVectoredExceptionHandler API
 {$else}
-  {$ifdef CPU64}
-    {$define WITH_VECTOREXCEPT}
+  {$ifdef FPC}
+    {$ifdef FPC_USE_WIN32_SEH}
+      {$define WITH_VECTOREXCEPT} // Win32 SEH since FPC 3.2
+    {$else}                       // Win32 < FPC 3.2, Linux/POSIX
+      {$define WITH_RAISEPROC}    // RaiseProc is set in main mormot.core.os.pas
+    {$endif FPC_USE_WIN32_SEH}
   {$else}
-    {$define WITH_RTLUNWINDPROC} //  use x86_64 asm -> Win32 only
-  {$endif CPU64}
-{$endif FPC}
+    {$define WITH_RTLUNWINDPROC}  // global raw i386 asm on Delphi Win32
+  {$endif FPC}
+{$endif CPU64}
+{$ifdef HASRAISEEXCEPTOBJPROC}    // Delphi 2009+ new global variable
+  {$define WITH_RAISEEXCEPTOBJPROC} // direct support of Delphi exceptions
+{$endif HASRAISEEXCEPTOBJPROC}      // (also with WITH_VECTOREXCEPT)
 
-{$ifndef WITH_RAISEPROC}
+{$ifndef KEEP_STACKFRAMES}
+{$STACKFRAMES ON} // we need {$W+} stack frame for the backtrace API calls below
+{$endif KEEP_STACKFRAMES}
+
+{$ifdef WITH_RAISEPROC}
+  // RaiseProc redirection is implemented in the main mormot.core.os.pas
+{$else}
 
 type
   PExceptionRecord = ^TExceptionRecord;
@@ -1937,65 +1942,77 @@ type
     NumberParameters: integer;
     case {IsOsException:} boolean of
       true:
-        (ExceptionInformation: array[0..14] of PtrUInt);
+        (ExceptionInformation: array[0 .. 14] of PtrUInt);
       false: // ExceptionCode = cRtlException
         (ExceptAddr: PtrUInt;
          ExceptObject: Exception);
   end;
-  GetExceptionClass = function(const P: TExceptionRecord): ExceptClass;
+  TOnGetExceptionClass = function(const P: TExceptionRecord): ExceptClass;
 
 const
   {$ifdef FPC}
-  cRtlException = $E0465043; // $E0 F P C
+  cRtlException  = $E0465043; // $E0 F P C
   {$else}
-  cRtlException = $0EEDFADE; // Delphi exception
+  cRtlException  = $0EEDFADE; // Delphi exception
+  cLastException = $0EEDFAE5; // Delphi last fake exception (cDelphiExitFinally)
   {$endif FPC}
 
 procedure LogExcept(stack: PPtrUInt; const Exc: TExceptionRecord);
 var
   ctxt: TSynLogExceptionContext;
   backuplasterror: DWord;
-  backuphandler: TOnRawLogException;
 begin
-  if Exc.ExceptionCode = cSetThreadNameException then
+  if (Exc.ExceptionCode = cSetThreadNameException) or
+     {$ifdef ISDELPHI}
+     ((Exc.ExceptionCode > cRtlException) and
+      (Exc.ExceptionCode <= cLastException)) or
+     {$endif ISDELPHI}
+     not Assigned(_RawLogException) then
     exit;
   backuplasterror := GetLastError;
-  backuphandler := _RawLogException;
-  if Assigned(backuphandler) then // paranoid check (tested before calling)
-    try
-      _RawLogException := nil; // disable nested exception at API level
-      ctxt.ECode := Exc.ExceptionCode;
-      if (Exc.ExceptionCode = cRtlException) and
-         (Exc.ExceptObject <> nil) then
+  try
+    ctxt.EStack := pointer(stack); // for manual unwinding on Delphi x86
+    ctxt.EStackCount := 0;
+    ctxt.ECode := Exc.ExceptionCode;
+    if (Exc.ExceptionCode = cRtlException) and
+       (Exc.ExceptObject <> nil) then
+    begin
+      if Exc.ExceptObject.InheritsFrom(Exception) then
       begin
-        if Exc.ExceptObject.InheritsFrom(Exception) then
-          ctxt.EClass := PPointer(Exc.ExceptObject)^
-        else
-          ctxt.EClass := EExternalException;
-        ctxt.EInstance := Exc.ExceptObject;
-        ctxt.ELevel := sllException;
-        ctxt.EAddr := Exc.ExceptAddr;
+        ctxt.EClass := PPointer(Exc.ExceptObject)^;
+        {$ifdef FPC} // fpc_RaiseException() calls GetBacktrace() as needed
+        if (Exc.NumberParameters >= 4) and
+           (Exc.ExceptionInformation[2] < 63) and
+           (Exc.ExceptionInformation[3] <> 0) then
+        begin
+          ctxt.EStackCount := Exc.ExceptionInformation[2];
+          ctxt.EStack := pointer(Exc.ExceptionInformation[3]);
+        end;
+        {$endif FPC}
       end
       else
-      begin
-        {$ifndef LLVM}
-        if Assigned(ExceptClsProc) then
-          ctxt.EClass := GetExceptionClass(ExceptClsProc)(Exc)
-        else
-        {$endif LLVM}
-          ctxt.EClass := EExternal;
-        ctxt.EInstance := nil;
-        ctxt.ELevel := sllExceptionOS;
-        ctxt.EAddr := Exc.ExceptionAddress;
-      end;
-      ctxt.EStack := pointer(stack);
-      ctxt.EStackCount := 0;
-      ctxt.ETimestamp := UnixTimeUtc; // fast API call
-      backuphandler(ctxt);
-    except
-      { ignore any nested exception }
+        ctxt.EClass := EExternalException;
+      ctxt.EInstance := Exc.ExceptObject;
+      ctxt.ELevel := sllException;
+      ctxt.EAddr := Exc.ExceptAddr;
+    end
+    else
+    begin
+      {$ifndef LLVM}
+      if Assigned(ExceptClsProc) then
+        ctxt.EClass := TOnGetExceptionClass(ExceptClsProc)(Exc)
+      else
+      {$endif LLVM}
+        ctxt.EClass := EExternal;
+      ctxt.EInstance := nil;
+      ctxt.ELevel := sllExceptionOS;
+      ctxt.EAddr := Exc.ExceptionAddress;
     end;
-  _RawLogException := backuphandler;
+    ctxt.ETimestamp := UnixTimeUtc; // the fastest API call possible
+    _RawLogException(ctxt);
+  except
+    { ignore any nested exception }
+  end;
   SetLastError(backuplasterror); // code above could have changed this
 end;
 
@@ -2008,6 +2025,9 @@ type
     ContextRecord: pointer;
   end;
 
+const
+  EXCEPTION_CONTINUE_SEARCH = 0;
+
 var // to register SynLogVectoredHandler once
   AddVectoredExceptionHandlerCalled: boolean;
   // RemoveVectoredContinueHandler() is available under 64 bit editions only
@@ -2016,17 +2036,22 @@ function AddVectoredExceptionHandler(FirstHandler: cardinal;
   VectoredHandler: pointer): PtrInt; stdcall; external kernel32;
 
 function SynLogVectoredHandler(ExceptionInfo: PExceptionInfo): PtrInt; stdcall;
-const
-  EXCEPTION_CONTINUE_SEARCH = 0;
 begin
   if Assigned(_RawLogException) then
-    LogExcept(nil, ExceptionInfo^.ExceptionRecord^);
+    {$ifdef WITH_RAISEEXCEPTOBJPROC}
+    if ExceptionInfo^.ExceptionRecord^.ExceptionCode <> cRtlException then
+    {$endif WITH_RAISEEXCEPTOBJPROC}
+      LogExcept(nil, ExceptionInfo^.ExceptionRecord^);
   result := EXCEPTION_CONTINUE_SEARCH;
 end;
 
 {$endif WITH_VECTOREXCEPT}
 
-{$ifdef WITH_RTLUNWINDPROC}
+{$ifndef KEEP_STACKFRAMES}
+{$STACKFRAMES OFF} // back to {$W-} normal state, as in mormot.defines.inc
+{$endif KEEP_STACKFRAMES}
+
+{$ifdef WITH_RTLUNWINDPROC} // Delphi Win32 general exception interceptor
 
 var
   OldUnWindProc: pointer;
@@ -2037,11 +2062,21 @@ asm
         cmp     dword ptr _RawLogException, 0
         jz      @old
         pushad
+        mov     edx, ExceptionRecord
+        test    edx, edx
+        jz      @done
+        {$ifdef WITH_RAISEEXCEPTOBJPROC} // duplicate no RaiseExceptObjProc
+        mov     eax, dword ptr [edx].TExceptionRecord.ExceptionCode
+        cmp     eax, cRtlException
+        jb      @ok
+        cmp     eax, cLastException
+        jbe     @done                    // internal Delphi fake exceptions
+@ok:    {$endif WITH_RAISEEXCEPTOBJPROC}
         mov     eax, TargetFrame
         mov     edx, ExceptionRecord
         call    LogExcept
-        popad
-@old:   pop     ebp // hidden push ebp at asm level
+@done:  popad
+@old:   pop     ebp                      // hidden push ebp at asm level
         jmp     OldUnWindProc
 end;
 
@@ -2050,6 +2085,7 @@ end;
 {$endif WITH_RAISEPROC}
 
 {$endif NOEXCEPTIONINTERCEPT}
+
 
 { TMemoryMap }
 
@@ -2524,7 +2560,7 @@ begin
   if (Buffer = nil) or
      (Len <= 0) then
     exit;
-  // try the newest per-processor ProcessPrng() AES-CTR-DRBG first
+  // try the Win8+ per-processor ProcessPrng() AES-CTR-DRBG first
   if (OSVersion >= wEight) and
      DelayedProc(ProcessPrng, BCryptPrimitives, 'BCryptPrimitives.dll', 'ProcessPrng') then
     result := ProcessPrng(Buffer, Len);
@@ -2558,6 +2594,7 @@ type
     freeswap: cardinal;                  // swap space still available
     mem_unit: cardinal;                  // Memory unit size in bytes
   end;
+  PSysInfo = ^TSysInfo;
 
 function _RetrieveSysInfo(var si: TSysInfo): boolean;
 var
@@ -5308,7 +5345,8 @@ begin
     begin
       OSVersionInfoEx := wine_get_version;
       OSVersionInfoEx := TrimU(Join(['Wine ', TrimU(OSVersionInfoEx)]));
-      WindowsSpecs := WindowsSpecs + [wsWine, wsWeakDpAPI, wsWeakHttpApi];
+      WindowsSpecs := WindowsSpecs +
+        [wsWine, wsWeakDpAPI, wsWeakHttpApi, wsWeakHttpSys, wsWeakCng];
     end
     {$ifdef CPUINTEL}
     else if IsWow64Emulation then

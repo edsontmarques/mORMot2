@@ -180,22 +180,20 @@ procedure GetHeaderInfo(const Headers: RawUtf8; out ContentLength: Int64;
 /// remove an HTTP header entry as specified by its name (e.g. 'Authorization')
 function DeleteHeader(const Headers, Name: RawUtf8): RawUtf8;
 
-/// 'HEAD' and 'OPTIONS' methods would be detected and return true
-// - will check only the first four chars for efficiency  - requires method <> ''
-function HttpMethodWithNoBody(const method: RawUtf8): boolean;
-  {$ifdef HASINLINE} inline; {$endif}
+// deprecated ambiguous helper - DO NOT USE any more!
+// - use IsHead() when deciding whether an HTTP response can have content
+// - request content presence must be determined from message framing
+function HttpMethodWithNoBody(const method: RawUtf8): boolean; deprecated;
 
 /// encode some text into a mime header compatible value
 // - see https://tools.ietf.org/html/rfc2047
 function MimeHeaderEncode(const header: RawUtf8): RawUtf8;
 
 /// quick check for case-sensitive 'GET' HTTP method name - requires method <> ''
-// - see also HttpMethodWithNoBody()
 function IsGet(const method: RawUtf8): boolean;
   {$ifdef HASINLINE} inline; {$endif}
 
 /// quick check for case-sensitive 'HEAD' HTTP method name - requires method <> ''
-// - see also HttpMethodWithNoBody()
 function IsHead(const method: RawUtf8): boolean;
   {$ifdef HASINLINE} inline; {$endif}
 
@@ -349,6 +347,20 @@ type
     rfContentFileNameNeedDelete,
     rfAsynchronous,
     rfProgressiveStatic);
+
+  /// define THttpRequestContext.ContentFromStream() behavior, as supplied by
+  // THttpServerRequestAbstract.SetOutStream()
+  // - hosOwned will release the stream once the response has been sent, or the
+  // request aborted - otherwise the caller does own it, and should keep it
+  // valid until the response has been sent, i.e. after the handler returned
+  // - hosNoRange won't serve any 'Range: ' request from this stream, but
+  // return an 'Accept-Ranges: none' header instead - note that a
+  // TStreamWithNoSeek, or a stream raising on Position/Size, is detected as
+  // such by itself, so this option is only needed for other classes
+  THttpOutStreamOption = (
+    hosOwned,
+    hosNoRange);
+  THttpOutStreamOptions = set of THttpOutStreamOption;
 
   /// define THttpRequestContext.ProcessBody response
   // - hrpSend should try to send the Dest buffer content
@@ -540,6 +552,17 @@ type
     // - if CompressGz is set, would also try for a cached local FileName+'.gz'
     // - returns HTTP_SUCCESS, HTTP_NOTFOUND or HTTP_RANGENOTSATISFIABLE
     function ContentFromFile(const FileName: TFileName; CompressGz: integer): integer;
+    /// initialize ContentStream/ContentLength from a given TStream
+    // - as supplied by THttpServerRequestAbstract.SetOutStream() to a handler
+    // - aStart is the stream position of the first content byte, and the
+    // origin of any 'Range: ' request; aLength is the content size in bytes
+    // - hosOwned does set rfContentStreamNeedFree, i.e. the stream is released
+    // by ProcessDone once the response has been sent
+    // - hosNoRange serves no range: an 'Accept-Ranges: none' header is
+    // returned instead, and any Range: request is ignored
+    // - returns HTTP_SUCCESS or HTTP_RANGENOTSATISFIABLE
+    function ContentFromStream(aStream: TStream; aStart, aLength: Int64;
+      aOptions: THttpOutStreamOptions): integer;
     /// uncompress Content according to CompressContentEncoding header
     procedure UncompressData;
     /// check RangeOffset/RangeLength against ContentLength
@@ -896,10 +919,14 @@ type
     fInContent: RawByteString;
     fInContentStream: TStream;
     fOutContent: RawByteString;
+    fOutContentStream: TStream; // from SetOutStream()
+    fOutContentStreamLength: Int64;
+    fOutContentStreamPos: Int64; // stream position when SetOutStream() was set
     fConnectionID: THttpServerConnectionID;                  // 64-bit
     fConnectionFlags: THttpServerRequestFlags;               // 8-bit
     fAuthenticationStatus: THttpServerRequestAuthentication; // 8-bit
     fInternalFlags: set of (ifUrlParamPosSet);               // 8-bit
+    fOutContentStreamOpt: THttpOutStreamOptions;             // 8-bit
     fRespStatus: integer;
     fConnectionThread: TThread;
     fConnectionOpaque: PHttpServerConnectionOpaque;
@@ -913,6 +940,9 @@ type
     function GetRouteValue(const Name: RawUtf8): RawUtf8;
       {$ifdef HASINLINE} inline; {$endif}
   public
+    /// finalize this instance
+    // - will release any pending SetOutStream() owned stream
+    destructor Destroy; override;
     /// prepare an incoming request from a parsed THttpRequestContext
     // - will set input parameters URL/Method/InHeaders/InContent/InContentType
     // - won't reset other parameters: should come after a plain Create or
@@ -1037,9 +1067,67 @@ type
     // status HTTP_NOTMODIFIED (304) if it did not change
     function SetOutContent(const Content: RawByteString; Handle304NotModified: boolean;
       const ContentType: RawUtf8 = ''; CacheControlMaxAgeSec: integer = 0): cardinal;
+    /// set the response body to be read from a TStream, with no buffering
+    // - the socket-based servers do send this stream by chunks from their own
+    // sending loop, with a constant memory usage, as they already do for a
+    // static file - so a handler can serve content which is not a local file,
+    // e.g. rebuilt from database blobs, without a whole RawByteString body
+    // - aContentLength = -1 computes aStream.Size - aStream.Position, as a file
+    // would use its size: the stream is sent from its current position, which
+    // is also the origin of any Range: - so don't move it after this call
+    // - supply an explicit aContentLength if Position/Size do raise on this
+    // stream: it is then sent sequentially, and is the only length we know
+    // - a body of unknown length is NOT supported, since the send loop always
+    // emits a Content-Length: and has no chunked response encoding
+    // - if aOwned is true, the stream is released by the server once the
+    // response has been sent, or the request aborted: a handler should not
+    // free it, nor keep any reference - if aOwned is false, it shall stay
+    // valid until the response has been sent, i.e. after the handler returned
+    // - 'Range: ' is served as for a file, i.e. 206 with a Content-Range: or
+    // 416 if unsatisfiable; a stream which can not seek - a TStreamWithNoSeek
+    // like TPipeStream, or one raising on Position/Size - is detected as such
+    // and gets an 'Accept-Ranges: none' header, ignoring any Range:
+    // - a stream which does answer Position/Size but raises on the actual
+    // seek can not be detected in advance, so it returns 416 for that range:
+    // supply hosNoRange for such a stream, to serve it sequentially instead
+    // - THttpApiServer (http.sys) and REST-over-WebSockets can not stream an
+    // in-process TStream: they read it into OutContent, so that a handler is
+    // portable, with no Range: support and no memory gain on those servers -
+    // but only up to HttpContentFromFileSizeInMemory (1MB on 32-bit, 2MB on
+    // 64-bit): a bigger body does answer 500 there, so raise that global
+    // variable if your handler may run on those servers
+    // - the body is not compressed, just like a static file is not
+    // - a stream supplying less bytes than announced aborts the response and
+    // closes the connection, once the headers have been sent
+    // - a stream raising in Read() is not catched by the sending loop: as for
+    // any ContentStream, it will abort the whole THttpAsyncServer write
+    // thread, so a handler stream should return 0 rather than raise
+    // - the length is mandatory: a stream with no Size and no aContentLength
+    // is rejected with HTTP_SERVERERROR, since the send loop always emits a
+    // Content-Length: and has no chunked response encoding
+    // - calling it twice does release any previously owned stream
+    function SetOutStream(aStream: TStream;
+      aOptions: THttpOutStreamOptions = []; const aContentType: RawUtf8 = '';
+      aContentLength: Int64 = -1): cardinal;
     /// append a new line of HTTP headers to the request output
     // - just a wrapper around AppendLine(fOutCustomHeaders, Args)
     procedure SetOutCustomHeader(const Args: array of const);
+    /// read any pending SetOutStream() body into the OutContent memory buffer
+    // - to be called by the servers which can not stream a response body, e.g.
+    // THttpApiServer (http.sys) or a REST-over-WebSockets answer
+    // - returns true on success, or if there was no pending stream at all
+    // - returns false if reading the stream failed, leaving a void OutContent:
+    // those servers track their status aside, so the caller sets its own error
+    function OutContentStreamToBuffer: boolean;
+    /// release any pending SetOutStream() body without reading it
+    // - if we do own it, e.g. once the response has been sent otherwise
+    procedure OutContentStreamDiscard;
+      {$ifdef HASINLINE} inline; {$endif}
+    /// the TStream supplied to SetOutStream() as response body, or nil
+    // - published as read-only, e.g. for the servers to detect that a body
+    // has been set even if OutContent is void
+    property OutContentStream: TStream
+      read fOutContentStream;
   published
     /// input parameter containing the caller URI
     property Url: RawUtf8
@@ -2842,7 +2930,7 @@ const
 
 function PurgeHeaders(const headers: RawUtf8; trim: boolean; upIgnore: PUtf8Char): RawUtf8;
 var
-  pos, len: array[byte] of word; // delete up to 255 entries
+  pos, len: TByteToWord; // delete up to 255 entries within 0..65335 max size
   n, purged, i, l, tot: PtrInt;
   P, next, last: PUtf8Char;
   h: PUtf8Char absolute headers;
@@ -2857,7 +2945,7 @@ begin
     last := nil;
     if upIgnore = nil then
       upIgnore := TOBEPURGED;
-    if PStrLen(h - _STRLEN)^ <= high(pos[0]) then // void pos[]/len[] overflow
+    if PStrLen(P - _STRLEN)^ <= high(pos[0]) then // void pos[]/len[] overflow
       while P^ <> #0 do
       begin
         next := GotoNextLineSmall(P);
@@ -3297,14 +3385,13 @@ begin
       c := byte(P^) - 48;
       if c > 9 then
         break
-      else if (result > Qword(High(Int64)) div 10) or
-              ((result = Qword(High(Int64)) div 10) and
-               (c > Qword(High(Int64)) mod 10)) then
+      else if result > MAX_INT64_DIV10 - ord(c > 7) then
         // clamp to High(Int64): RangeOffset/RangeLength are signed Int64, and
         // a wrapped result would be negative, so would bypass ValidateRange()
-        result := Qword(High(Int64)) // no file would be so big anyway
+        result := MAX_INT64 // no file would be so big anyway
       else
-        result := result * 10 + Qword(c);
+        result := result {$ifdef HASSLOWMUL64} shl 3 + result + result
+                         {$else} * 10 {$endif} + Qword(c);
       inc(P);
     until false;
 end;
@@ -3551,6 +3638,8 @@ begin
     FastAssignNew(UserAgent);
   if Referer <> '' then
     FastAssignNew(Referer);
+  if AcceptEncoding <> '' then
+    FastAssignNew(AcceptEncoding);
   RangeOffset := 0;
   FastAssignNew(Content);
   RangeLength := -1;
@@ -3776,7 +3865,7 @@ begin
           begin
             // "Range: bytes=0-499" -> start=0, len=500
             RangeLength := Int64(GetNextRange(P1));
-            if RangeLength >= High(Int64) - RangeOffset then
+            if RangeLength >= MAX_INT64 - RangeOffset then
               // last-byte-pos above any possible size: up to end of file, as
               // RFC 9110 does expect - and no RangeLength + 1 overflow
               RangeLength := -1
@@ -4495,6 +4584,55 @@ begin
   result := hrpSend;
 end;
 
+function THttpRequestContext.ContentFromStream(aStream: TStream;
+  aStart, aLength: Int64; aOptions: THttpOutStreamOptions): integer;
+var
+  offs: Int64;
+begin
+  result := HTTP_SUCCESS;
+  // a previous ContentFromFile() may have set its own owned ContentStream:
+  // do not leak it, nor free the caller stream we may not own
+  if rfContentStreamNeedFree in ResponseFlags then
+    FreeAndNilSafe(ContentStream);
+  exclude(ResponseFlags, rfContentStreamNeedFree);
+  ContentLength := aLength;
+  if hosNoRange in aOptions then
+  begin
+    // this stream can only be read forward: no Range: support at all
+    AppendLine(ResponseHeaders, ['Accept-Ranges: none']);
+    // ignoring the range means a whole 200 response, and not a 206 without
+    // any Content-Range:, which rfWantRange would otherwise produce
+    exclude(ResponseFlags, rfWantRange);
+  end
+  else if rfWantRange in ResponseFlags then
+    if ValidateRange then
+    begin
+      if PCardinal(CommandMethod)^ <> HEAD_32 then // HEAD sends no body at all
+      try
+        offs := aStart + RangeOffset;
+        if aStream.Seek(offs, soBeginning) <> offs then
+          result := HTTP_RANGENOTSATISFIABLE;
+      except // a stream which can not actually seek
+        result := HTTP_RANGENOTSATISFIABLE;
+      end;
+    end
+    else
+      result := HTTP_RANGENOTSATISFIABLE;
+  if result <> HTTP_SUCCESS then
+  begin
+    ContentLength := 0;
+    // clear both flags, otherwise CompressContentAndFinalizeHead would
+    // validate the range once again, against the generated error page
+    ResponseFlags := ResponseFlags - [rfRange, rfWantRange];
+    exit;
+  end;
+  if not (hosNoRange in aOptions) then
+    include(ResponseFlags, rfAcceptRange);
+  ContentStream := aStream;
+  if hosOwned in aOptions then
+    include(ResponseFlags, rfContentStreamNeedFree);
+end;
+
 function THttpRequestContext.ContentFromFile(const FileName: TFileName;
   CompressGz: integer): integer;
 var
@@ -4841,6 +4979,13 @@ end;
 
 { THttpServerRequestAbstract }
 
+destructor THttpServerRequestAbstract.Destroy;
+begin
+  if hosOwned in fOutContentStreamOpt then // e.g. connection aborted before
+    FreeAndNilSafe(fOutContentStream);     // SetupResponse did hand it over
+  inherited Destroy;
+end;
+
 procedure THttpServerRequestAbstract.Prepare(var aHttp: THttpRequestContext;
   const aRemoteIP: RawUtf8; aAuthorize: THttpServerRequestAuthentication);
 begin
@@ -5150,6 +5295,87 @@ begin
     GetMimeContentTypeFromBuffer(Content, fOutContentType);
   fOutContent := Content;
   result := HTTP_SUCCESS;
+end;
+
+function THttpServerRequestAbstract.SetOutStream(aStream: TStream;
+  aOptions: THttpOutStreamOptions; const aContentType: RawUtf8;
+  aContentLength: Int64): cardinal;
+begin
+  result := HTTP_SUCCESS;
+  OutContentStreamDiscard; // release any previous SetOutStream() owned stream
+  fOutContentStream := aStream;
+  if aStream = nil then
+    exit;
+  fOutContentStreamOpt := aOptions;
+  if aStream.InheritsFrom(TStreamWithNoSeek) then
+    include(fOutContentStreamOpt, hosNoRange); // detected: no Range: support
+  // capture the initial position now: it is the origin of any later Range:,
+  // and both Position and Size may raise on a stream which has none - note
+  // that a TStreamWithNoSeek does allow to read its position, just not to
+  // change it, so a partially consumed one still reports the correct length
+  fOutContentStreamPos := 0;
+  try
+    fOutContentStreamPos := aStream.Position;
+    if aContentLength < 0 then
+      // as ContentFromFile() does with the file size: send up to the end
+      aContentLength := aStream.Size - fOutContentStreamPos;
+  except
+    // a stream with no Position/Size at all: send it sequentially, and let
+    // the caller-supplied aContentLength be the only length we know
+    include(fOutContentStreamOpt, hosNoRange);
+    fOutContentStreamPos := 0;
+  end;
+  if aContentLength < 0 then
+  begin
+    // a stream with no Size and no supplied length: the send loop always
+    // emits a Content-Length:, so fail here instead of a silent empty body
+    OutContentStreamDiscard; // release it if we own it
+    result := HTTP_SERVERERROR;
+    exit;
+  end;
+  fOutContentStreamLength := aContentLength;
+  if aContentType <> '' then
+    fOutContentType := aContentType;
+  FastAssignNew(fOutContent); // the body does come from the stream
+end;
+
+procedure THttpServerRequestAbstract.OutContentStreamDiscard;
+begin
+  if fOutContentStream <> nil then
+    if hosOwned in fOutContentStreamOpt then
+      FreeAndNilSafe(fOutContentStream)
+    else
+      fOutContentStream := nil;
+  fOutContentStreamLength := 0;
+  fOutContentStreamPos := 0;
+  fOutContentStreamOpt := [];
+end;
+
+function THttpServerRequestAbstract.OutContentStreamToBuffer: boolean;
+begin
+  result := true; // nothing to do is a success
+  if fOutContentStream = nil then
+    exit;
+  // this server can not stream a response body: read it as a regular content,
+  // but only up to the size we would keep in memory for a static file
+  if fOutContentStreamLength > HttpContentFromFileSizeInMemory then
+    result := false // too big to be buffered by this kind of server
+  else if fOutContentStreamLength <> 0 then
+    try
+      result := StreamReadAll(fOutContentStream,
+        FastNewRawByteString(fOutContent, fOutContentStreamLength),
+        fOutContentStreamLength);
+    except
+      // a handler stream may raise on Read(): those servers have already
+      // started their response, so let them send their own error status
+      result := false;
+    end;
+  if not result then
+  begin
+    FastAssignNew(fOutContent); // no body to send
+    fRespStatus := HTTP_SERVERERROR;
+  end;
+  OutContentStreamDiscard; // release the TStream once consummed
 end;
 
 procedure THttpServerRequestAbstract.SetOutCustomHeader(const Args: array of const);
@@ -5462,7 +5688,7 @@ begin
     hrtWeekly:
       begin
         needrotate := Size >= 100 shl 20; // always rotate above 100MB
-        if NextTix32 >= Tix32 then
+        if Tix32 >= NextTix32 then
         begin
           NextTix32 := Tix32 + 60 * 60; // check TriggerDate every hour
           dt := NowUtc;
@@ -5548,6 +5774,7 @@ begin
   try
     Trigger := aTrigger;
     Files := aFiles;
+    NextTix32 := 0; // force date check on next TryRotate()
     PrepareNextRotateDate(0);
   finally
     Rotating.UnLock;
@@ -5948,7 +6175,6 @@ procedure THttpLogger.SetTimeText(Tix32: cardinal; Tix64: Int64);
 var
   now: TSynSystemTime;
 begin
-  fTimeTix32 := Tix32; // acquire it asap
   // dates are all in UTC/GMT as it should on any serious server design
   FromGlobalTime(now, {local=}false, Tix64); // call OS outside of the lock
   fSafe.Lock; // update all cached text in an atomic way
@@ -5962,7 +6188,7 @@ end;
 procedure THttpLogger.Append(var Context: TOnHttpServerAfterResponseContext);
 var
   n, urllen: PtrInt;
-  tix32, crc, reqcrc, uricrc: cardinal;
+  tix32, c32, crc, reqcrc, uricrc: cardinal;
   v: ^THttpLogVariable;
   poslen: PWordArray; // pos1,len1, pos2,len2, ... 16-bit pairs
   wr: TTextDateWriter;
@@ -5986,7 +6212,9 @@ begin
   urllen := 0;
   if (fVariables * [hlvDocument_Uri, hlvUri, hlvUri_Hash] <> []) then
     urllen := UriTruncLen(RawUtf8(Context.Url)); // excludes ?params and #anchor
-  if fTimeTix32 <> tix32 then
+  c32 := fTimeTix32;
+  if (c32 <> tix32) and
+     LockedExc32(fTimeTix32, tix32, c32) then // CAS update
     SetTimeText(tix32, Context.Tix64); // update cached time texts every second
   reqcrc := 0;
   uricrc := 0;

@@ -397,6 +397,7 @@ type
     procedure DoPurgeHeaders;
     procedure ProcessErrorMessage;
     procedure ProcessStaticFile(var Context: THttpRequestContext; CompressGz: integer);
+    procedure ProcessOutStream(var Context: THttpRequestContext);
   public
     /// initialize the context, associated to a HTTP server instance
     constructor Create(aServer: THttpServerGeneric;
@@ -494,6 +495,7 @@ type
   // - hsoRejectBotUserAgent identifies and rejects Bots via IsHttpUserAgentBot()
   // - hsoTextError will return a small and non-verbose UTF-8 text in case of
   // HTTP errors, instead of the default human-friendly HTML page
+  // - hsoIocpWriteDirect try to reduce IOCP async sending contention on Windows
   THttpServerOption = (
     hsoHeadersUnfiltered,
     hsoHeadersInterning,
@@ -515,7 +517,8 @@ type
     hsoTelemetryJson,
     hsoContentTypeNoGuess,
     hsoRejectBotUserAgent,
-    hsoTextError);
+    hsoTextError,
+    hsoIocpWriteDirect);
 
   /// how a THttpServerGeneric class is expected to process incoming requests
   THttpServerOptions = set of THttpServerOption;
@@ -2145,7 +2148,7 @@ type
     procedure SetMaxConnections(aValue: cardinal);
     function GetApiVersion: RawUtf8; override;
     function Check(Api: THttpApiFunction; Error: integer;
-      Level: TSynLogLevel = sllWarning): integer;
+      Level: TSynLogLevel = sllWarning; ErrMsg: PRawUtf8 = nil): integer;
     procedure Ensure(Api: THttpApiFunction; Error: integer);
     procedure DoAfterResponse(Ctxt: THttpServerRequest; const Referer: RawUtf8;
       StatusCode: cardinal; Elapsed, Received, Sent: QWord); virtual;
@@ -2571,8 +2574,8 @@ type
   TSynThreadPoolHttpApiWebSocketServer = class(TSynThreadPool)
   protected
     fServer: THttpApiWebSocketServer;
-    procedure OnThreadStart(Sender: TThread);
-    procedure OnThreadTerminate(Sender: TThread);
+    procedure OnThreadStart(Sender: TThreadAbstract);
+    procedure OnThreadTerminate(Sender: TThreadAbstract);
     function NeedStopOnIOError: boolean; override;
     // aContext is a PHttpApiWebSocketConnection, or fServer.fServiceOverlaped
     // (SendServiceMessage) or fServer.fSendOverlaped (WriteData)
@@ -2586,7 +2589,7 @@ type
 
   /// Thread for closing deprecated WebSocket connections
   // - i.e. which have not responsed after PingTimeout interval
-  TSynWebSocketGuard = class(TThread)
+  TSynWebSocketGuard = class(TThreadAbstract)
   protected
     fServer: THttpApiWebSocketServer;
     procedure Execute; override;
@@ -3330,6 +3333,7 @@ begin
   fRespStatus := 0;
   fInContentStream := nil; // paranoid: Prepare() would set it anyway
   fOutContent := '';
+  OutContentStreamDiscard; // paranoid: SetupResponse() did hand it over
   FastAssignNew(fOutContentType);
   FastAssignNew(fOutCustomHeaders);
   fAuthenticationStatus := hraNone;
@@ -3345,7 +3349,7 @@ end;
 destructor THttpServerRequest.Destroy;
 begin
   fTempWriter.Free;
-  // inherited Destroy; is void
+  inherited Destroy; // release any pending SetOutStream() owned stream
 end;
 
 procedure THttpServerRequest.DoPurgeHeaders;
@@ -3374,6 +3378,33 @@ begin
     [fServer.ServerName, fRespStatus, fRespStatus, txt^, fOutContentType,
      XPOWEREDVALUE, OS_TEXT], RawUtf8(fOutContent));
   fOutContentType := HTML_CONTENT_TYPE; // body = human friendly HTML message
+end;
+
+procedure THttpServerRequest.ProcessOutStream(var Context: THttpRequestContext);
+begin
+  // hand a SetOutStream() body to the context, as ProcessStaticFile() does
+  if not StatusCodeIsSuccess(fRespStatus) then
+  begin
+    // a handler answering e.g. 404 or its own 416 from a stream should not
+    // have that body range-processed, nor replaced by our own error page
+    exclude(Context.ResponseFlags, rfWantRange);
+    // and should not advertise a Range: support we just disabled
+    include(fOutContentStreamOpt, hosNoRange);
+  end;
+  if Context.ContentFromStream(fOutContentStream, fOutContentStreamPos,
+       fOutContentStreamLength, fOutContentStreamOpt) = HTTP_SUCCESS then
+  begin
+    fOutContentStream := nil; // handed over: no double free by Recycle/Destroy
+    fOutContentStreamOpt := [];
+    fOutContentStreamLength := 0;
+    fOutContentStreamPos := 0;
+  end
+  else
+  begin
+    OutContentStreamDiscard; // release it: there is no body to send
+    fRespStatus := HTTP_RANGENOTSATISFIABLE;
+    fErrorMessage := 'Out of range'; // detected by ProcessErrorMessage
+  end;
 end;
 
 procedure THttpServerRequest.ProcessStaticFile(var Context: THttpRequestContext;
@@ -3447,6 +3478,11 @@ begin
     else if (fOutContent <> '') and
             (fOutContentType = STATICFILE_CONTENT_TYPE) then
       ProcessStaticFile(Context, CompressGz);
+  if fOutContentStream <> nil then
+    if fErrorMessage = '' then
+      ProcessOutStream(Context) // SetOutStream() response body
+    else
+      OutContentStreamDiscard; // return error not SetOutStream()
   if fErrorMessage <> '' then
     ProcessErrorMessage;
   // append Command
@@ -3606,8 +3642,9 @@ begin
     if hsoTelemetryJson in fOptions then
       THttpAnalyzerPersistJson.CreateOwned(fAnalyzer);
   end;
-  inherited Create(hsoCreateSuspended in fOptions, OnStart, OnStop,
-    aLog, ProcessName);
+  // Start would be done by TLoggedThread.AfterConstruction after all Creates
+  fStartAfterConstruction := not (hsoCreateSuspended in fOptions);
+  inherited Create({suspended=}true, OnStart, OnStop, aLog, ProcessName);
 end;
 
 destructor THttpServerGeneric.Destroy;
@@ -4273,6 +4310,7 @@ begin
       if cod <> 0 then
       begin
         if (Ctxt.OutContent = '') and
+           (Ctxt.OutContentStream = nil) and // SetOutStream() is a body too
            (cod <> HTTP_ASYNCRESPONSE) and
            not StatusCodeIsSuccess(cod) then
         begin
@@ -4290,7 +4328,8 @@ begin
     if cod <> 0 then
     begin
       Ctxt.RespStatus := cod;
-      if Ctxt.OutContent = '' then
+      if (Ctxt.OutContent = '') and
+         (Ctxt.OutContentStream = nil) then // SetOutStream() is a body too
         Ctxt.fErrorMessage := 'Rejected request';
       IncStat(grRejected);
     end
@@ -4585,44 +4624,21 @@ end;
 
 {$ifdef OSPOSIX}
 procedure THttpServerSocketGeneric.SetKeyTab(const aKeyTab: TFileName);
-var
-  res: RawUtf8;
 begin
-  if FileIsKeyTab(aKeyTab) then
-    if InitializeDomainAuth then
-    begin
-      fSafe.Lock;
-      if fSspiKeyTab = nil then
-        fSspiKeyTab := TServerSspiKeyTab.Create;
-      fSafe.UnLock;
-      if fSspiKeyTab.SetKeyTab(aKeyTab) then
-        res := 'ok'
-      else
-        res := 'SetKeyTab failed';
-    end
-    else
-      res := 'GSSAPI not available'
-  else
-    res := 'invalid file';
-  fLogClass.Add.Log(LOG_DEBUGERROR[res <> 'ok'],
-    'SetKeyTab(%): %', [aKeyTab, res], self);
+  TServerSspiKeyTab.FileSetter(fSspiKeyTab, aKeyTab, fLogClass.DoLog, self);
 end;
 
 function THttpServerSocketGeneric.GetKeyTab: TFileName;
 begin
-  result := '';
-  if fSspiKeyTab <> nil then
-    result := fSspiKeyTab.KeyTab;
+  result := fSspiKeyTab.KeyTab;
 end;
 {$endif OSPOSIX}
 
 function THttpServerSocketGeneric.Authorization(var Http: THttpRequestContext;
   Opaque: Int64): TAuthServerResult;
 var
-  auth, b64, b64end: PUtf8Char;
-  user, pass, url: RawUtf8;
-  bin, bout: RawByteString;
-  ctx: TSecContext;
+  auth: PUtf8Char;
+  user, pass, url, header: RawUtf8;
 begin
   // parse the 'Authorization: basic/digest/negotiate <magic>' header
   result := asrRejected;
@@ -4657,32 +4673,18 @@ begin
         end;
       hraNegotiate:
         // simple implementation assuming a two-way Negotiate/Kerberos handshake
-        // - see TRestServerAuthenticationSspi.Auth() for NTLM / three-way
         if IdemPChar(auth, 'NEGOTIATE ') then
         begin
-          b64 := auth + 10; // parse 'Authorization: Negotiate <base64 encoding>'
-          b64end := PosChar(b64, #13);
-          if (b64end = nil) or
-             not Base64ToBin(PAnsiChar(b64), b64end - auth, bin) or
-             ServerSspiDataNtlm(bin) then // two-way Kerberos only
-            exit;
+          // parse 'Authorization: Negotiate <base64 encoding>'
           {$ifdef OSPOSIX}
           if Assigned(fSspiKeyTab) then
             fSspiKeyTab.PrepareKeyTab; // do nothing if no KeyTab changed or set
           {$endif OSPOSIX}
-          InvalidateSecContext(ctx);
-          try
-            // code below raise ESynSspi/EGssApi on authentication error
-            if ServerSspiAuth(ctx, bin, bout) then
-              // CONTINUE flag = need more input from the client: unsupported
-              exit;
-            // now client is authenticated in a single roundtrip: identify user
-            ServerSspiAuthUser(ctx, user);
-            Http.ResponseHeaders := BinToBase64(bout,
-              SECPKGNAMEHTTPWWWAUTHENTICATE, #13#10, {magic=}false);
+          header := KerberosServerAuthHeader('', auth + 10, @user);
+          if header <> '' then
+          begin
+            Http.ResponseHeaders := header;
             result := asrMatch;
-          finally
-            FreeSecContext(ctx);
           end;
         end;
     else
@@ -4893,7 +4895,7 @@ var
   cltaddr: TNetAddr;
   cltservsock: THttpServerSocket;
   res: TNetResult;
-  banlen {$ifdef OSWINDOWS}, sec, acceptsec {$endif}: integer;
+  err, banlen {$ifdef OSWINDOWS} , sec, acceptsec {$endif}: integer;
   tix64: QWord;
 begin
   // THttpServerGeneric thread preparation: launch any OnHttpThreadStart event
@@ -4908,18 +4910,20 @@ begin
     if (fLogClass <> nil) and
        not (hsoLogVerbose in fOptions) then
       fSock.OnLog := nil;
-    fExecuteState := esRunning;
     if not fSock.SockIsDefined then // paranoid check
-      EHttpServer.RaiseUtf8('%.Execute: %.Bind failed', [self, fSock]);
+      EHttpServer.RaiseUtf8('%.DoExecute: %.Bind failed', [self, fSock]);
+    fExecuteState := esRunning;
     // main ACCEPT loop
     {$ifdef OSWINDOWS}
     acceptsec := 0;
     {$endif OSWINDOWS}
     while not Terminated do
     begin
-      res := Sock.Sock.Accept(cltsock, cltaddr, {async=}false);
+      res := Sock.Sock.Accept(cltsock, cltaddr, {async=}false, @err);
       if not (res in [nrOK, nrRetry]) then
       begin
+        fLogClass.Add.Log(sllDebug, 'DoExecute: accept() failed as % %',
+          [_NR[res], SystemErrorShort(err)], self);
         if Terminated then
           break;
         SleepHiRes(1); // failure (too many clients?) -> wait and retry
@@ -4996,7 +5000,7 @@ begin
           on E: Exception do
             // do not stop thread on TLS or socket error
             if Assigned(fSock.OnLog) then
-              fSock.OnLog(sllTrace, 'Execute: % [%]', [PClass(E)^, E.Message], self);
+              fSock.OnLog(sllTrace, 'DoExecute: % [%]', [PClass(E)^, E.Message], self);
         end
       else if Assigned(fThreadPool) then
       begin
@@ -5007,7 +5011,7 @@ begin
         // note: we tried to reuse the fSocketClass instance -> no perf benefit
         cltservsock.AcceptRequest(cltsock, @cltaddr);
         if Assigned(fSock.OnLog) then
-          fSock.OnLog(sllTrace, 'Execute: push %', [cltservsock], self);
+          fSock.OnLog(sllTrace, 'DoExecute: push %', [cltservsock], self);
         if not fThreadPool.Push(pointer(cltservsock), {waitoncontention=}true) then
           // was false if there is no idle thread in the pool, and queue is full
           cltservsock.Free; // will call DirectShutdown(cltsock)
@@ -5240,7 +5244,8 @@ begin
           begin
             // no Keep Alive = multi-connection -> process in the Thread Pool
             if not (hfConnectionUpgrade in Http.HeaderFlags) and
-               not HttpMethodWithNoBody(Method) then
+               ((Http.ContentLength > 0) or
+                (hfTransferChunked in Http.HeaderFlags)) then
             begin
               DownloadBody; // we need to get it now
               fServer.IncStat(grBodyReceived);
@@ -5283,7 +5288,13 @@ begin
     begin
       if not aServer.fSock.TLS.Enabled then // if not already in WaitStarted()
         aServer.InitializeTlsAfterBind;     // load certificate(s) once
-      TLS.AcceptCert := aServer.Sock.TLS.AcceptCert; // TaskProcess cstaAccept
+      if aServer.Sock.TLS.ClientCertificateAuthentication then
+      begin
+        TLS := aServer.Sock.TLS; // full mTLS policy for TaskProcess cstaAccept
+        ResetNetTlsContext(TLS); // keep AcceptCert but clear shared outputs
+      end
+      else
+        TLS.AcceptCert := aServer.Sock.TLS.AcceptCert; // historical fast path
     end;
     OnLog := aServer.Sock.OnLog;
   end;
@@ -5471,10 +5482,9 @@ begin
           exit;
         end;
       end;
-      // allow OnBodyDownload callback to supply a stream for the body
+      // OnBodyDownload callback can supply a stream for the body - even for HEAD
       if Assigned(fServer.OnBodyDownload) and
          not (hfConnectionUpgrade in Http.HeaderFlags) and
-         not HttpMethodWithNoBody(Http.CommandMethod) and
          ((Http.ContentLength > 0) or
           (hfTransferChunked in Http.HeaderFlags)) then
         if not DoOnBodyDownload then
@@ -5484,7 +5494,9 @@ begin
         end;
     end;
     // implement 'Expect: 100-Continue' Header
-    if hfExpect100 in Http.HeaderFlags then
+    if (hfExpect100 in Http.HeaderFlags) and
+       ((Http.ContentLength > 0) or
+        (hfTransferChunked in Http.HeaderFlags)) then
       // client waits for the server to parse the headers and return 100
       // before sending the request body
       SockSendFlush('HTTP/1.1 100 Continue'#13#10#13#10);
@@ -5492,7 +5504,8 @@ begin
     if withBody and
        not (hfConnectionUpgrade in Http.HeaderFlags) then
     begin
-      if not HttpMethodWithNoBody(Http.CommandMethod) then
+      if (Http.ContentLength > 0) or
+         (hfTransferChunked in Http.HeaderFlags) then // even for HEAD
         DownloadBody;
       result := grBodyReceived;
     end
@@ -5724,7 +5737,8 @@ begin
       begin
         // call from TSynThreadPoolTHttpServer -> handle first request
         if not (fBodyRetrieved in fServerSock.fFlags) and
-           not HttpMethodWithNoBody(fServerSock.Http.CommandMethod) then
+           ((fServerSock.Http.ContentLength > 0) or
+            (hfTransferChunked in fServerSock.Http.HeaderFlags)) then
           fServerSock.DownloadBody;
         fServer.Process(fServerSock, ConnectionID, self);
         if (fServer <> nil) and
@@ -5738,7 +5752,6 @@ begin
     on Exception do
       ; // just ignore unexpected exceptions here, especially during clean-up
   end;
-  TSynLog.NotifyThreadEnded; // manual TSynThread notification
 end;
 
 
@@ -5752,9 +5765,11 @@ begin
   fBigBodySize := THREADPOOL_BIGBODYSIZE;
   fMaxBodyThreadCount := THREADPOOL_MAXWORKTHREADS;
   fPoolName := 'http';
-  inherited Create(NumberOfThreads,
-    {$ifdef USE_THREADWINIOCP} INVALID_HANDLE_VALUE {$else} {queuepending=}true{$endif},
-    Server.ProcessName);
+  {$ifdef USE_THREADWINIOCP}
+  inherited Create(NumberOfThreads, INVALID_HANDLE_VALUE, Server.ProcessName);
+  {$else}
+  inherited Create(NumberOfThreads, {queuependingctx=}true, Server.ProcessName);
+  {$endif USE_THREADWINIOCP}
 end;
 
 {$ifndef USE_THREADWINIOCP}
@@ -7558,6 +7573,7 @@ begin
   if redirmax = 0 then // from DirectFileNameHead()
     include(cs.Http.Options, hroHeadersUnfiltered);
   result := cs.Head(uri.Address, 30000, hdr);
+  Ctxt.OutCustomHeaders := cs.Headers; // include e.g. Content-Type: or Location:
   if not (result in HTTP_GET_OK) then
   begin
     FreeAndNil(cs);
@@ -7567,7 +7583,6 @@ begin
     uri.Address := cs.Redirected; // follow 3xx redirection
   cs.RemoteUri := uri.Address;
   cs.RemoteHeaders := hdr;
-  Ctxt.OutCustomHeaders := cs.Headers; // to include e.g. Content-Type:
 end;
 
 function THttpPeerCache.DirectFileName(Ctxt: THttpServerRequestAbstract;
@@ -8101,14 +8116,17 @@ begin
 end;
 
 function THttpApiServer.Check(Api: THttpApiFunction; Error: integer;
-  Level: TSynLogLevel): integer;
+  Level: TSynLogLevel; ErrMsg: PRawUtf8): integer;
 var
   msg: RawUtf8;
 begin
   result := Error;
-  if Assigned(fLogClass) and
-     not HttpApiSucceed(Api, msg, Error) then
+  if HttpApiSucceed(Api, msg, Error) then
+    exit;
+  if Assigned(fLogClass) then
     fLogClass.Add.Log(Level, msg, self);
+  if ErrMsg <> nil then
+    ErrMsg^ := msg;
 end;
 
 procedure THttpApiServer.Ensure(Api: THttpApiFunction; Error: integer);
@@ -8129,10 +8147,9 @@ var
 begin
   aLog.EnterLocal(log, 'Create(%) processname=% threads=%',
     [QueueName, ProcessName, ServerThreadPoolCount], self);
-  // initialize this thread in suspended mode
-  inherited Create(OnStart, OnStop, ProcessName,
-    ProcessOptions + [hsoCreateSuspended] - [hsoThreadCpuAffinity,
-      hsoThreadSocketAffinity, hsoReusePort, hsoThreadSmooting], aLog);
+  ProcessOptions := ProcessOptions - [hsoThreadCpuAffinity,
+    hsoThreadSocketAffinity, hsoReusePort, hsoThreadSmooting];
+  inherited Create(OnStart, OnStop, ProcessName, ProcessOptions, aLog);
   // create the Request Queue
   HttpApiInitialize; // will raise an exception in case of failure
   if Assigned(log) then
@@ -8166,11 +8183,6 @@ begin
     PtrArrayAdd(fThreads, THttpApiServerThread.Create(self));
   // eventually start the main thread
   Append(fProcessName, [' #', ServerThreadPoolCount]);
-  if not (hsoCreateSuspended in ProcessOptions) then
-  begin
-    Suspended := false;
-    exclude(fOptions, hsoCreateSuspended);
-  end;
 end;
 
 function THttpApiServer.WaitStarted(Seconds: cardinal): boolean;
@@ -8322,19 +8334,20 @@ procedure THttpApiServer.DoExecute;
 var // lots of local variable so that this method is thread-safe
   req: PHTTP_REQUEST;
   resp: PHTTP_RESPONSE;
-  reqbuf, respbuf, logbuf: TBytes;
+  reqbuf, respbuf, logbuf, chunkbuf: TBytes;
   reqid: HTTP_REQUEST_ID;
   i: PtrInt;
   bytesread, bytessent, flags: cardinal;
   compressset: THttpSocketCompressSet;
   comprec: PHttpSocketCompressRec;
   err: HRESULT;
-  incontlen, rangestart, rangelen: Qword;
-  incontlenchunk, incontlenread: cardinal;
-  incontenc, inaccept, host, range, referer: RawUtf8;
+  incontlen, remain, rangestart, rangelen: Qword;
+  chunk: cardinal;
+  incontlenread: PtrInt;
+  incontenc, inaccept, host, range, referer, errmsg: RawUtf8;
   outstat, outmsg: RawUtf8;
   outstatcode, afterstatcode: cardinal;
-  respsent: boolean;
+  respsent, bodyknown: boolean;
   ctxt: THttpServerRequest;
   filehandle: THandle;
   bufread, V: PUtf8Char;
@@ -8403,6 +8416,8 @@ var // lots of local variable so that this method is thread-safe
     if not result then
       exit;
     respsent := true;
+    if not ctxt.OutContentStreamToBuffer then // kernel http.sys needs buffer
+      outstatcode := HTTP_SERVERERROR; // failed to read that stream
     resp^.SetStatus(outstatcode, outstat);
     if Terminated then
       exit;
@@ -8614,55 +8629,80 @@ begin
               end;
             end;
             // retrieve body
-            if HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS and req^.flags <> 0 then
+            incontlenread := 0; // actual number of entity-body bytes received
+            if (HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS and req^.flags) <> 0 then
             begin
+              errmsg := '';
               with req^.headers.KnownHeaders[reqContentEncoding] do
                 FastSetString(incontenc, pRawValue, RawValueLength);
-              if incontlen <> 0 then
+              bodyknown := (incontlen <> 0) and // transfer-encoding has precedence
+                (req^.headers.KnownHeaders[reqTransferEncoding].RawValueLength = 0);
+              if bodyknown then
               begin
-                // receive body chunks
-                SetLength(ctxt.fInContent, incontlen);
-                bufread := pointer(ctxt.InContent);
-                incontlenread := 0;
-                repeat
-                  bytesread := 0;
-                  if HasApi2 then
-                    // speed optimization for Vista+
-                    flags := HTTP_RECEIVE_REQUEST_ENTITY_BODY_FLAG_FILL_BUFFER
-                  else
-                    flags := 0;
-                  incontlenchunk := incontlen - incontlenread;
-                  if (fReceiveBufferSize >= 1024) and
-                     (incontlenchunk > fReceiveBufferSize) then
-                    incontlenchunk := fReceiveBufferSize;
-                  err := Http.ReceiveRequestEntityBody(fReqQueue,
-                    req^.RequestId, flags, bufread, incontlenchunk, bytesread);
-                  if Terminated then
-                    exit;
-                  inc(incontlenread, bytesread);
-                  if err = ERROR_HANDLE_EOF then
-                  begin
-                    if incontlenread < incontlen then
-                      SetLength(ctxt.fInContent, incontlenread);
-                    err := NO_ERROR;
-                    break; // should loop until returns ERROR_HANDLE_EOF
-                  end;
-                  if err <> NO_ERROR then
-                  begin
-                    Check(hReceiveRequestEntityBody, err);
-                    break;
-                  end;
-                  inc(bufread, bytesread);
-                until incontlenread = incontlen;
+                chunk := MaxPtrUInt(64 * 1024, fReceiveBufferSize); // 1MB default
+                if chunk > incontlen then
+                  chunk := incontlen;
+                bufread := FastNewRawByteString(ctxt.fInContent, incontlen);
+              end
+              else
+              begin
+                chunk := 128 shl 10; // chunked doesn't need fReceiveBufferSize
+                if chunkbuf = nil then
+                  SetLength(chunkbuf, chunk); // allocate once 128KB
+                bufread := pointer(chunkbuf);
+              end;
+              if HasApi2 then // speed optimization for Vista+ = whole chunk
+                flags := HTTP_RECEIVE_REQUEST_ENTITY_BODY_FLAG_FILL_BUFFER
+              else
+                flags := 0;
+              repeat
+                bytesread := 0;
+                err := Http.ReceiveRequestEntityBody(fReqQueue,
+                  req^.RequestId, flags, bufread, chunk, bytesread);
+                if Terminated then
+                  exit;
+                if err = ERROR_HANDLE_EOF then
+                begin
+                  if incontlenread < length(ctxt.fInContent) then
+                    SetLength(ctxt.fInContent, incontlenread);
+                  err := NO_ERROR;
+                  break; // we reached the end of this body
+                end;
                 if err <> NO_ERROR then
                 begin
-                  SendError(HTTP_NOTACCEPTABLE, WinApiErrorUtf8(err, Http.Module));
-                  continue;
+                  Check(hReceiveRequestEntityBody, err, sllDebug, @errmsg);
+                  err := HTTP_NOTACCEPTABLE;
+                  break;
                 end;
-                // optionally uncompress input body
-                if incontenc <> '' then
-                  fCompressList.UncompressContent(incontenc, ctxt.fInContent);
+                inc(incontlenread, bytesread);
+                if bodyknown then
+                begin
+                  remain := incontlen - QWord(incontlenread);
+                  if remain = 0 then
+                    break; // reached the end of Content-Length
+                  inc(bufread, bytesread);
+                  if remain < chunk then
+                    chunk := remain; // avoid buffer overflow
+                end
+                else if incontlenread > fMaximumAllowedContentLength then
+                  err := HTTP_PAYLOADTOOLARGE
+                else if ctxt.fInContent = '' then // initial maybe-single chunk
+                  FastSetRawByteString(ctxt.fInContent, bufread, bytesread)
+                else
+                begin
+                  if length(ctxt.fInContent) < incontlenread then
+                    SetLength(ctxt.fInContent, NextGrow(incontlenread));
+                  MoveFast(bufread^, PByteArray(ctxt.fInContent)[
+                    incontlenread - PtrInt(bytesread)], bytesread);
+                end;
+              until err <> NO_ERROR;
+              if err <> NO_ERROR then
+              begin
+                SendError(err, errmsg);
+                continue;
               end;
+              if incontenc <> '' then // optionally uncompress input body
+                fCompressList.UncompressContent(incontenc, ctxt.fInContent);
             end;
             QueryPerformanceMicroSeconds(started);
             try
@@ -8685,22 +8725,26 @@ begin
                 if afterstatcode > 0 then
                   outstatcode := afterstatcode;
               end;
-              // send response
-              if not respsent then
-                if not SendResponse then
-                  continue;
+              // send response - SendResponse does buffer any SetOutStream()
+              if respsent then // e.g. 202 already sent 
+                ctxt.OutContentStreamDiscard //about SetOUtStream()
+              else if not SendResponse then
+                continue;
               QueryPerformanceMicroSeconds(elapsed);
               dec(elapsed, started);
               ctxt.Host := host; // may have been reset during Request()
               DoAfterResponse(
-                ctxt, referer, outstatcode, elapsed, incontlen, bytessent);
+                ctxt, referer, outstatcode, elapsed, incontlenread, bytessent);
             except
               on E: Exception do
+              begin
+                ctxt.OutContentStreamDiscard; // release SetOutStream() ASAP
                 // handle any exception raised during process: show must go on!
                 if not respsent then
                   if not E.InheritsFrom(EHttpApiServer) or // ensure still connected
                      (EHttpApiServer(E).LastApiError <> HTTPAPI_ERROR_NONEXISTENTCONNECTION) then
                     SendError(HTTP_SERVERERROR, StringToUtf8(E.Message), E);
+              end;
             end;
           finally
             LockedDec32(@fCurrentProcess);
@@ -9555,9 +9599,10 @@ constructor THttpApiWebSocketServer.Create(
   const aOnWSThreadStart, aOnWSThreadTerminate: TOnNotifyThread;
   ProcessOptions: THttpServerOptions);
 begin
-  inherited Create(QueueName, nil, nil, '', ProcessOptions);
+  WebSocketApiInitialize;
   if not (WebSocketApi.WebSocketEnabled) then
     raise EWebSocketApi.Create('WebSocket API not supported');
+  inherited Create(QueueName, nil, nil, '', ProcessOptions);
   fPingTimeout := aPingTimeout;
   if fPingTimeout > 0 then
     fGuard := TSynWebSocketGuard.Create(Self);
@@ -9737,13 +9782,13 @@ begin
   result := false;
 end;
 
-procedure TSynThreadPoolHttpApiWebSocketServer.OnThreadStart(Sender: TThread);
+procedure TSynThreadPoolHttpApiWebSocketServer.OnThreadStart(Sender: TThreadAbstract);
 begin
   if Assigned(fServer.OnWSThreadStart) then
     fServer.OnWSThreadStart(Sender);
 end;
 
-procedure TSynThreadPoolHttpApiWebSocketServer.OnThreadTerminate(Sender: TThread);
+procedure TSynThreadPoolHttpApiWebSocketServer.OnThreadTerminate(Sender: TThreadAbstract);
 begin
   if Assigned(fServer.OnWSThreadTerminate) then
     fServer.OnWSThreadTerminate(Sender);

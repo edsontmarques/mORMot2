@@ -496,6 +496,7 @@ type
   TByteToByte = array[byte] of byte;
   TByteToAnsiChar = array[byte] of AnsiChar;
   TByteToWideChar = array[byte] of WideChar;
+  TByteToCardinal = array[byte] of cardinal;
   /// type of mormot.core.unicode TNormTable lookup table
   TAnsiCharToAnsiChar = array[AnsiChar] of AnsiChar;
   PAnsiCharToAnsiChar = ^TAnsiCharToAnsiChar;
@@ -585,6 +586,9 @@ type
   /// 128-bytes aligned ShortString - e.g. for TNetAddr.IPShort()
   TShort127 = string[127];
   PShort127 = ^TShort127;
+
+  TShort95 = string[95];
+  PShort95 = ^TShort95;
 
   /// used to serialize up to 256-bit binary as hexadecimal
   TShort64 = string[64];
@@ -1270,6 +1274,8 @@ const
      '70', '71', '72', '73', '74', '75', '76', '77', '78', '79',
      '80', '81', '82', '83', '84', '85', '86', '87', '88', '89',
      '90', '91', '92', '93', '94', '95', '96', '97', '98', '99');
+  /// 1 mod 2^32 reciprocal for unsigned div 100
+  DIV100_INV = $51eb851f;
 
 var
   /// fast lookup table for converting any decimal number from
@@ -1445,7 +1451,7 @@ function GetIntegerDef(P: PUtf8Char; Default: PtrInt): PtrInt;
 
 /// get the signed 32-bit integer value stored in P^
 // - this version return 0 in err if no error occurred, and 1 if an invalid
-// character was found, not its exact index as for the val() function
+// character or a PtrInt overflow was found, not its exact index as for val()
 function GetInteger(P: PUtf8Char; var err: integer): PtrInt; overload;
 
 /// get the unsigned 32-bit integer value stored in P^
@@ -1519,12 +1525,8 @@ function GetInt64(P: PUtf8Char; var err: integer): Int64; overload;
 // was successful (same as the standard val function)
 function GetQWord(P: PUtf8Char; var err: integer): QWord;
 
-{$ifdef WIN32DELPHI} // Delphi has its own x86/x87 asm version
-/// get the extended floating point value stored in P^
-// - set the err content to the index of any faulty character, 0 if conversion
-// was successful (same as the standard val function)
-// - this optimized function is consistent on all platforms/compilers and return
-// the decoded value even if err is not 0 (e.g. if P^ is not #0 ended)
+{$ifdef WIN32DELPHI}
+/// Delphi specific x86/x87 asm - pascal version in mormot.core.text.pas
 function GetExtended(P: PUtf8Char; out err: integer): TSynExtended; overload;
 {$endif WIN32DELPHI}
 
@@ -2411,42 +2413,48 @@ type
   THash128 = array[0..15] of byte;
   /// pointer to a 128-bit hash value
   PHash128 = ^THash128;
-
   /// store a 160-bit hash value in 20 bytes of memory
   // - e.g. a SHA-1 digest, or array[0..4] of cardinal
   THash160 = array[0..19] of byte;
   /// pointer to a 160-bit hash value
   PHash160 = ^THash160;
-
   /// store a 192-bit hash value
   // - consumes 24 bytes of memory, or array[0..5] of cardinal
   THash192 = array[0..23] of byte;
   /// pointer to a 192-bit hash value
   PHash192 = ^THash192;
-
   /// store a 224-bit hash value in 28 bytes of memory
   // - e.g. a SHA-224 digest, or array[0..6] of cardinal
   THash224 = array[0..27] of byte;
   /// pointer to a 224-bit hash value
   PHash224 = ^THash224;
-
   /// store a 256-bit hash value in 32 bytes of memory
   // - e.g. a SHA-256 digest, a TEccSignature result, or TBlock256
   THash256 = array[0..31] of byte;
   /// pointer to a 256-bit hash value
   PHash256 = ^THash256;
-
   /// store a 384-bit hash value in 48 bytes of memory
   // - e.g. a SHA-384 digest
   THash384 = array[0..47] of byte;
   /// pointer to a 384-bit hash value
   PHash384 = ^THash384;
-
   /// store a 512-bit hash value in 64 bytes of memory
   // - e.g. a SHA-512 digest, a TEccSignature result, or TBlock512
   THash512 = array[0..63] of byte;
   /// pointer to a 512-bit hash value
   PHash512 = ^THash512;
+  /// store a 1024-bit hash value in 128 bytes of memory
+  THash1024 = array[0..127] of byte;
+  /// pointer to a 1024-bit hash value
+  PHash1024 = ^THash1024;
+  /// store a 2048-bit hash value in 256 bytes of memory
+  THash2048 = array[0..255] of byte;
+  /// pointer to a 2048-bit hash value
+  PHash2048 = ^THash2048;
+  /// store a 4096-bit hash value in 512 bytes of memory
+  THash4096 = array[0..511] of byte;
+  /// pointer to a 4096-bit hash value
+  PHash4096 = ^THash4096;
 
   /// store a 128-bit buffer of 16 bytes, indexed as 32-bit items
   // - e.g. one AES block
@@ -2869,6 +2877,16 @@ type
   /// all CPU features flags, as retrieved from an Intel/AMD CPU
   TIntelCpuFeatures = set of TIntelCpuFeature;
 
+const
+  /// all AVX-512 CPUID flags, as filtered into the IntelAvx512 variable
+  CPUAVX512FEATURES = [cfAVX512F, cfAVX512DQ, cfAVX512IFMA, cfAVX512PF, cfAVX512ER,
+    cfAVX512CD, cfAVX512BW, cfAVX512VL, cfAVX512VBMI, cfAVX512VBMI2,
+    cfAVX512NNI, cfAVX512BITALG, cfAVX512VPC, cfAVX512NNIW, cfAVX512MAPS,
+    cfAVX512VP2I, cfAVX512FP16, cfAVX512BF16];
+  /// the AVX-512 subset expected by x86-64-v4, i.e. Skylake-X/Zen4 level
+  CPUAVX512X64V4 = [cfAVX512F, cfAVX512BW, cfAVX512CD, cfAVX512DQ, cfAVX512VL];
+
+type
   /// recognize the main Intel/AMD CPU manufacturers
   TIntelCpuManufacturer = (icmOther, icmIntel, icmAmd);
 
@@ -2955,6 +2973,14 @@ function HasHWAes: boolean;
 var
   /// the available Intel/AMD CPU features retrieved using CPUID
   CpuFeatures: TIntelCpuFeatures;
+
+  /// the AVX-512 features of this CPU which can actually be used
+  // - CpuFeatures reflects the raw CPUID bits, so AVX-512 flags may be set even
+  // if the OS does not save the opmask/ZMM registers at context switch (e.g.
+  // on old Windows or within some VMs) - this also checks XCR0 via XGETBV
+  // - contains CpuFeatures * CPUAVX512FEATURES, or [] if not enabled by the OS
+  // - e.g. CPUAVX512X64V4 - IntelAvx512 = [] identifies x86-64-v4 support
+  IntelAvx512: TIntelCpuFeatures;
 
   // additional low-level Intel/AMD CPU information retrieved using CPUID
   CpuManufacturer: TIntelCpuManufacturer;
@@ -3084,8 +3110,8 @@ procedure LockedDec(var Target: PtrUInt; Decrement: PtrUInt);
 procedure LockedAdd32(var Target: cardinal; Increment: cardinal);
   {$ifndef ASMINTEL} inline; {$endif}
 
-/// fast atomic "result := Target^; Target^ := 0;" on a 32-bit integer value
-function LockedGet32(Target: PInteger): integer;
+/// fast atomic "result := Target^; Target^ := New;" on a 32-bit integer value
+function LockedReset32(Target: PInteger; New: integer = 0): integer;
 
 {$ifdef ISDELPHI}
 
@@ -3109,8 +3135,10 @@ type
   // - cpuHaswell identifies Intel/AMD AVX2+BMI support at Haswell level
   // as expected e.g. by IsValidUtf8Avx2/Base64EncodeAvx2 dedicated asm
   // - won't include ERMSB flag because it is not propagated within some VMs
+  // - cpuAVX512 identifies x86-64-v4 AVX-512 support, also enabled by the OS
+  // - cpuAESGCM identifies cfCLMUL, cfSSE41 and cfAESNI flags
   TX64CpuFeatures = set of (
-    cpuAVX, cpuAVX2, cpuHaswell);
+    cpuAVX, cpuAVX2, cpuHaswell, cpuAVX512, cpuAESGCM);
 
 var
   /// internal flags used by FillCharFast - easier from asm that CpuFeatures
@@ -3120,6 +3148,13 @@ var
 const
   // identify Intel/AMD AVX2+BMI support at Haswell level
   CPUAVX2HASWELL = [cfAVX2, cfSSE42, cfBMI1, cfBMI2, cfCLMUL];
+
+/// x86_64 asm with SSSE3 SIMD process - pascal version in mormot.core.text.pas
+function GetExtendedSsse3(P: PUtf8Char; out err: integer): TSynExtended; overload;
+
+/// x86_64 asm with SSSE3 SIMD process - pascal version in mormot.core.variants.pas
+function GetNumericVariantSsse3(Json: PUtf8Char;
+  var Value: TVarData; AllowVarDouble: boolean): PUtf8Char;
 
 {$ifdef ASMX64AVX1}
 /// simdjson asm as used by mormot.core.unicode on Haswell for FPC IsValidUtf8()
@@ -3568,7 +3603,7 @@ var
   _Fill256FromOs: procedure(out e: THash256Rec);
 
 /// convert the endianness of a given unsigned 16-bit integer
-function bswap16(const a: cardinal): cardinal;
+function bswap16(a: cardinal): cardinal;
   {$ifdef HASINLINE}inline;{$endif}
 
 /// internal function to swap 16-bit LE/BE endianess of a buffer
@@ -3665,7 +3700,7 @@ procedure MultiEventMerge(var DestList; const ToBeAddedList);
 
 /// compare two TMethod instances
 function EventEquals(const eventA, eventB): boolean;
-  {$ifdef HASINLINE}inline;{$endif}
+  {$ifdef FPC}inline;{$endif}
 
 
 { ************ Buffers (e.g. Hashing and SynLZ compression) Raw Functions }
@@ -3679,6 +3714,8 @@ type
   TTemp24  = array[0..23] of AnsiChar;
   TTemp32  = array[0..31] of AnsiChar;
   TTemp64  = array[0..63] of AnsiChar;
+  TTemp128 = array[0..127] of AnsiChar;
+  TTemp256 = array[0..255] of AnsiChar;
   TTemp512 = array[0..511] of AnsiChar;
 
   /// define a buffer of 1KB of data
@@ -3691,6 +3728,8 @@ type
   TBuffer8K = array[0 .. pred(8 shl 10)] of AnsiChar;
   /// define a buffer of 16KB of data
   TBuffer16K = array[0 .. pred(16 shl 10)] of AnsiChar;
+  /// define a buffer of 32KB of data
+  TBuffer32K = array[0 .. pred(32 shl 10)] of AnsiChar;
   /// define a buffer of 64KB of data
   TBuffer64K = array[word] of AnsiChar;
   /// define a buffer of 128KB of data
@@ -4223,32 +4262,6 @@ procedure DynArrayHashTableAdjust16(P: PWordArray; deleted: cardinal; count: Ptr
 
 { ************ Efficient Variant Values Conversion }
 
-type
-  PVarType = ^TVarType;
-
-  /// a variant/TVarData overlapped structure with a 32-bit VType field
-  // - 32-bit VType is faster for initialization than 16-bit TVarData.VType
-  // - it is safe to transtype this as plain variant or TVarData
-  TSynVarData = packed record
-    case integer of
-      0: (
-        VType: cardinal;
-        case padding: cardinal of // access the most used TVarData value members
-          varInteger:  (VInteger:  integer);
-          varDouble:   (VDouble:   double);
-          varCurrency: (VCurrency: currency);
-          varDate:     (VDate:     TDateTime);
-          varInt64:    (VInt64:    Int64);
-          varString:   (VString:   pointer);
-          varAny:      (VAny:      pointer);
-          );
-      1: (
-        Data: TVarData); // access to all standard value members
-  end;
-  PSynVarData = ^TSynVarData;
-  TSynVarDataArray = array[0 .. MaxInt div SizeOf(TSynVarData) - 1] of TSynVarData;
-  PSynVarDataArray = ^TSynVarDataArray;
-
 const
   /// variant type holding a PtrInt value
   varPtrInt = {$ifdef CPU32} varInteger {$else} varInt64 {$endif};
@@ -4311,6 +4324,34 @@ const
   NullVarData:  TVarData = (VType: varNull{%H-});
   FalseVarData: TVarData = (VType: varBoolean{%H-});
   TrueVarData:  TVarData = (VType: varBoolean; VInteger: {%H-}-1);
+
+type
+  PVarType = ^TVarType;
+
+  /// a variant/TVarData overlapped structure with a 32-bit VType field
+  // - 32-bit VType is faster for initialization than 16-bit TVarData.VType
+  // - it is safe to transtype this as plain variant or TVarData
+  TSynVarData = packed record
+    case integer of
+      0: (
+        VType: cardinal;
+        case padding: cardinal of // access the most used TVarData value members
+          varInteger:  (VInteger:  integer);
+          varOleUInt:  (VCardinal: cardinal);
+          varOleInt:   (VPtrInt:   PtrInt);
+          varDouble:   (VDouble:   double);
+          varCurrency: (VCurrency: currency);
+          varDate:     (VDate:     TDateTime);
+          varInt64:    (VInt64:    Int64);
+          varString:   (VString:   pointer);
+          varAny:      (VAny:      pointer);
+          );
+      1: (
+        Data: TVarData); // access to all standard value members
+  end;
+  PSynVarData = ^TSynVarData;
+  TSynVarDataArray = array[0 .. MaxInt div SizeOf(TSynVarData) - 1] of TSynVarData;
+  PSynVarDataArray = ^TSynVarDataArray;
 
 var
   /// a slightly faster alternative to Variants.Null function
@@ -4769,7 +4810,7 @@ type
   // - match class procedure TSynLog.DoLog
   // - used e.g. by global variables like WindowsServiceLog in mormot.core.os
   // or TCrtSocket.OnLog in mormot.net.sock
-  TSynLogProc = procedure(Level: TSynLogLevel; Fmt: PUtf8Char;
+  TSynLogProc = procedure(Level: TSynLogLevel; const Format: RawUtf8;
      const Args: array of const; Instance: TObject = nil) of object;
 
 {$ifndef PUREMORMOT2}
@@ -4864,6 +4905,12 @@ type
   TUnixMSTimeDynArray = array of TUnixMSTime;
 
 const
+  /// equals 9223372036854775807
+  MAX_INT64 = high(Int64);
+  /// equals 922337203685477580
+  MAX_INT64_DIV10 = MAX_INT64 div 10;
+  /// equals -9223372036854775808
+  MIN_INT64 = low(Int64);
   /// maximum number stored in a JavaScript-compatible Int53 value
   MAX_SAFE_JS_INTEGER  = (Int64(1) shl 53) - 1;
 
@@ -5705,7 +5752,7 @@ const
 
 procedure AppendShortByteHex(value: PtrUInt; var dest: ShortString);
 var
-  len: PtrInt;
+  len, v: PtrInt;
   d, hex: PAnsiChar;
 begin
   d := @dest;
@@ -5713,7 +5760,8 @@ begin
   if len + 2 > high(dest) then
     exit;
   hex := @HexCharsUpper;
-  d[len + 1] := hex[value shr 4];
+  v := value shr 4;
+  d[len + 1] := hex[v and $0f];
   inc(len, 2);
   value := value and $0f;
   d[len] := hex[value];
@@ -5801,12 +5849,12 @@ begin
   l := @tmp[31] - p;
   if (l > 5) and
      (p[l - 5] = '.') then
-    if PCardinal(@p[l - 4])^ = $30303030 then
+    if PCardinal(p + l - 4)^ = $30303030 then // not PCardinal(@p[]) for Delphi 10.x
       dec(l, 5)  // x.0000 -> x
     else
       case fixeddecimals of
         0:
-          if PWord(@p[l - 2])^ = $3030 then
+          if PWord(p + l - 2)^ = $3030 then
             dec(l, 2); // x.xx00 -> x.xx
         1:
           if p[l - 4] = '0' then
@@ -6215,8 +6263,8 @@ end;
 
 function GetInteger(P: PUtf8Char): PtrInt;
 var
-  c: byte;
-  minus: boolean;
+  c, d: cardinal; // good enough even on i386
+  minus: boolean; // better than * PtrInt 1/-1
 begin
   result := 0;
   if P = nil then
@@ -6250,14 +6298,22 @@ begin
   dec(c, 48);
   if c > 9 then
     exit;
+  inc(P);
   result := c;
-  repeat
-    inc(P);
-    c := byte(P^);
-    dec(c, 48);
+  repeat // two digits per iteration (used by JL_Byte/SmallInt/Integer/Int64)
+    c := cardinal(byte(P[0]))  - ord('0');
     if c > 9 then
       break;
+    d := cardinal(byte(P[1])) - ord('0');
+    if d <= 9 then
+    begin
+      inc(d, c * 10);
+      result := result * 100 + PtrInt(d);
+      inc(P, 2);
+      continue;
+    end;
     result := result * 10 + PtrInt(c);
+    break;
   until false;
   if minus then
     result := -result;
@@ -6324,10 +6380,10 @@ end;
 
 function GetInteger(P: PUtf8Char; var err: integer): PtrInt;
 var
-  c: byte;
-  minus: boolean;
+  {$ifdef CPU64} digits, {$endif} c, minus: PtrUInt;
 begin
   result := 0;
+  minus := 0;
   err := 1; // don't return the exact index, just 1 as error flag
   if P = nil then
     exit;
@@ -6342,38 +6398,61 @@ begin
   until false;
   if c = ord('-') then
   begin
-    minus := true;
+    inc(minus);
+    repeat
+      inc(P);
+      c := byte(P^);
+    until c <> ord(' ')
+  end
+  else if c = ord('+') then
     repeat
       inc(P);
       c := byte(P^);
     until c <> ord(' ');
-  end
-  else
+  while (c = ord('0')) and
+        (P[1] in ['0' .. '9']) do
   begin
-    minus := false;
-    if c = ord('+') then
-      repeat
-        inc(P);
-        c := byte(P^);
-      until c <> ord(' ');
+    inc(P);
+    c := byte(P^);
   end;
   dec(c, 48);
   if c > 9 then
     exit;
   result := c;
+  {$ifdef CPU64}
+  digits := 19;
+  {$endif CPU64}
   repeat
     inc(P);
     c := byte(P^);
     dec(c, 48);
     if c <= 9 then
-      result := result * 10 + PtrInt(c)
-    else if c <> 256 - 48 then
+    begin
+      {$ifdef CPU64}
+      dec(digits);
+      if digits = 0 then
+        exit; // clearly out of range
+      {$else}
+      if (PtrUInt(result) >= PtrUInt(High(PtrInt)) div 10) and
+         ((PtrUInt(result) > PtrUInt(High(PtrInt)) div 10) or
+          (c > High(PtrInt) mod 10 + minus)) then
+        exit; // on 32-bit we need explicit compare due to the overflow
+      {$endif CPU64}
+      result := PtrInt(PtrUInt(result) * 10 + c);
+    end
+    else if c <> PtrUInt(-48) then
       exit
     else
       break;
   until false;
+  {$ifdef CPU64}
+  if (digits = 1) and
+     (PtrUInt(result) > PtrUInt(High(PtrInt)) + minus) then
+       exit;
+  {$endif CPU64}
   err := 0; // success
-  if minus then
+  if (minus <> 0) and
+     (result <> Low(PtrInt)) then // $8000000000000000 is already the good value
     result := -result;
 end;
 
@@ -6468,7 +6547,7 @@ end;
 
 function GetCardinal(P: PUtf8Char): PtrUInt;
 var
-  c: byte;
+  c, d: cardinal; // good enough even on i386
 begin
   result := 0;
   if P = nil then
@@ -6485,14 +6564,22 @@ begin
   dec(c, 48);
   if c > 9 then
     exit;
+  inc(P);
   result := c;
-  repeat
-    inc(P);
-    c := byte(P^);
-    dec(c, 48);
+  repeat // two digits per iteration (used by JL_Byte/Word/Cardinal/QWord)
+    c := cardinal(byte(P[0]))  - ord('0');
     if c > 9 then
       break;
-    result := result * 10 + PtrUInt(c);
+    d := cardinal(byte(P[1])) - ord('0');
+    if d <= 9 then
+    begin
+      inc(d, c * 10);
+      result := result * 100 + d;
+      inc(P, 2);
+      continue;
+    end;
+    result := result * 10 + c;
+    break;
   until false;
 end;
 
@@ -6684,7 +6771,7 @@ begin
       c := byte(P^) - 48;
       if c > 9 then
         break;
-      result := result shl 3 + result + result; // fast result := result*10
+      result := result {$ifdef HASSLOWMUL64} shl 3 + result + result {$else} * 10 {$endif};
       inc(result, c);
       inc(P);
     until false;
@@ -6727,7 +6814,7 @@ begin
       c := byte(P^) - 48;
       if c > 9 then
         break;
-      result := result shl 3 + result + result; // fast result := result*10
+      result := result {$ifdef HASSLOWMUL64} shl 3 + result + result {$else} * 10 {$endif};
       inc(result, c);
       inc(P);
     until false;
@@ -6776,7 +6863,7 @@ begin
         c := byte(P^) - 48;
         if c > 9 then
           break;
-        result := result shl 3 + result + result; // fast result := result*10
+        result := result {$ifdef HASSLOWMUL64} shl 3 + result + result {$else} * 10 {$endif};
         inc(result, c);
         inc(P);
       until false;
@@ -6845,11 +6932,7 @@ begin
         inc(err);
         if c > 9 then
           exit;
-        {$ifdef HASSLOWMUL64}
-        result := result shl 3 + result + result;
-        {$else}
-        result := result * 10; // FPC generates fast imul + mul
-        {$endif HASSLOWMUL64}
+        result := result {$ifdef HASSLOWMUL64} shl 3 + result + result {$else} * 10 {$endif};
         inc(result, c);
         if result < 0 then
           exit; // overflow (>$7FFFFFFFFFFFFFFF)
@@ -6903,11 +6986,7 @@ begin
         inc(err);
         if c > 9 then
           exit;
-        {$ifdef HASSLOWMUL64}
-        result := result shl 3 + result + result;
-        {$else}
-        result := result * 10; // FPC generates fast imul + mul
-        {$endif HASSLOWMUL64}
+        result := result {$ifdef HASSLOWMUL64} shl 3 + result + result {$else} * 10 {$endif};
         inc(result, c);
       until false;
     end;
@@ -10335,9 +10414,10 @@ begin
   Dest.Hi := Dest.Hi xor Source.Hi;
 end;
 
-function bswap16(const a: cardinal): cardinal; // inlining is good enough
+function bswap16(a: cardinal): cardinal; // inlining is good enough
 begin
-  result := ((a and 255) shl 8) or (a shr 8);
+  result := ToByte(a); // better in two steps, especially on FPC
+  result := (result shl 8) or (a shr 8);
 end;
 
 procedure bswap16array(buf: PWord; len: PtrInt);
@@ -10386,9 +10466,11 @@ begin
   CoCreateGuid(e.h);
 end; // seldom called: RtlGenRandom/SystemFunction036 is not worth it
 {$else}
+{$ifdef FPC} // only used below with FPC - and the Delphi linker has no 'c' lib
 {$ifdef OSDARWIN} // lighter than sysutil's fpgettimeofday(), and in nanoseconds
 function GetTickCount64: UInt64; cdecl external 'c' name 'mach_absolute_time';
 {$endif OSDDARWIN}
+{$endif FPC}
 procedure __Fill256FromOs(out e: THash256Rec);
 begin
   {$ifdef FPC}
@@ -10472,8 +10554,11 @@ begin
 end;
 
 procedure TLecuyer.SeedGenerator(fixedseed: QWord);
+var
+  tmp: QWord; // for FPC arm32
 begin
-  SeedGenerator(@fixedseed, SizeOf(fixedseed));
+  tmp := fixedseed;
+  SeedGenerator(@tmp, SizeOf(tmp));
 end;
 
 procedure TLecuyer.SeedGenerator(fixedseed: pointer; fixedseedbytes: integer);
@@ -10912,6 +10997,12 @@ begin
      not IsXmmYmmOSEnabled then
     // AVX is available on the CPU, but not supported at OS context switch
     CpuFeatures := CpuFeatures - [cfAVX, cfAVX2, cfAVX10, cfFMA];
+  IntelAvx512 := CpuFeatures * CPUAVX512FEATURES;
+  if (IntelAvx512 <> []) and
+     not ((cfOSXS in CpuFeatures) and
+          IsZmmOSEnabled) then // XGETBV is only valid with OSXSAVE
+    // AVX-512 is available on the CPU, but opmask/ZMM are not saved by the OS
+    IntelAvx512 := [];
   if cfSSE42 in CpuFeatures then
     try
       if crc32cby4sse42(0, 1) <> 3712330424 then
@@ -10928,6 +11019,8 @@ begin
     end;
   {$ifdef ASMX64NOTPIC}
   // note: cfERMS has no cpuid within some VMs -> ignore and assume present
+  if (cfSSSE3 in CpuFeatures) and not (cfSSE3 in CpuFeatures) then
+    exclude(CpuFeatures, cfSSSE3); // paranoid
   if cfAVX in CpuFeatures then
   begin
     include(X64CpuFeatures, cpuAVX);
@@ -10935,7 +11028,13 @@ begin
       include(X64CpuFeatures, cpuAVX2);
     if CpuFeatures * CPUAVX2HASWELL = CPUAVX2HASWELL then
       include(X64CpuFeatures, cpuHaswell);
+    if IntelAvx512 * CPUAVX512X64V4 = CPUAVX512X64V4 then
+      include(X64CpuFeatures, cpuAVX512);
   end;
+  if (cfCLMUL in CpuFeatures) and
+     (cfSSE41  in CpuFeatures) and
+     (cfAESNI  in CpuFeatures) then
+    include(X64CpuFeatures, cpuAESGCM);
   {$endif ASMX64NOTPIC}
   // redirect some CPU-aware functions
   if cfSSE42 in CpuFeatures then // for both i386 and x86_64
@@ -11418,7 +11517,7 @@ begin
   {$else}
   with PInt64Rec(int64)^ do
     if InterlockedIncrement(Lo) = 0 then
-      InterlockedIncrement(Hi); // collission is highly unprobable
+      LockedInc32(@Hi); // collission is highly unprobable
   {$endif FPC_64}
 end;
 
@@ -11658,11 +11757,11 @@ end;
 
 {$endif ASMINTEL}
 
-function LockedGet32(Target: PInteger): integer;
+function LockedReset32(Target: PInteger; New: integer): integer;
 begin
   repeat
     result := Target^;
-  until LockedExc32(PCardinal(Target)^, 0, result);
+  until LockedExc32(PCardinal(Target)^, New, result);
 end;
 
 function NextSpin(spin: PtrUInt): PtrUInt;
@@ -13218,8 +13317,12 @@ var
   tab: PWordArray;
 begin
   tab := @TwoDigitLookupW;
-  d100 := Y div 100; // FPC will use fast reciprocal
-  PWordArray(P)[0] := tab[d100];
+  {$ifdef WIN64DELPHI}
+  d100 := (QWord(Y) * DIV100_INV) shr 37; // we can avoid div on Delphi Win64
+  {$else}
+  d100 := Y div 100; // FPC will use fast reciprocal (and x86 has its own asm)
+  {$endif WIN64DELPHI}
+  PCardinal(P)^ := tab[d100];
   PWordArray(P)[1] := tab[Y - (d100 * 100)];
 end;
 
@@ -13286,7 +13389,7 @@ begin
   else
   begin
     result := StrUInt64(P - 1, c);
-    d := PCardinal(P - 5)^; // in two explit steps for CPUARM (alf)
+    d := PCardinal(P - 5)^; // in two explicit steps for CPUARM (alf)
     PCardinal(P - 4)^ := d;
     P[-5] := '.'; // insert '.' just before last 4 decimals
   end;
@@ -13651,12 +13754,16 @@ begin
   result := true;
   vd := VarDataFromVariant(V); // handle varVariantByRef
   case cardinal(vd^.VType) of
-    varEmpty,
+    varEmpty,                  // include most common integer types
     varNull:
       Value := 0;
+    varInteger:
+      Value := vd^.VInteger;
+    varInt64:
+      Value := vd^.VInt64;
     varDouble,
     varDate:
-      Value := vd^.VDouble;
+      Value := vd^.VDouble;    // direct assignment of FP types
     varSingle:
       Value := vd^.VSingle;
     varCurrency:

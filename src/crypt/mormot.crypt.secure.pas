@@ -176,7 +176,8 @@ type
     /// the associated server name (or file, for SQLite3) to be connected to
     property ServerName: RawUtf8
       read fServerName write fServerName;
-    /// the associated database name (if any), or additional options
+    /// the associated database name (if any), or URI-encoded additional options
+    // - e.g. TRestHttpClientGeneric.DefinitionTo() URI-encoded HTTP parameters
     property DatabaseName: RawUtf8
       read fDatabaseName write fDatabaseName;
     /// the associated User Identifier (if any)
@@ -2653,6 +2654,9 @@ const
   /// the known asymmetric algorithms which implement RSA cryptography
   CAA_RSA = [caaRS256, caaRS384, caaRS512, caaPS256, caaPS384, caaPS512];
 
+  /// the known asymmetric algorithms which implement RSA-PSS cryptography
+  CAA_PSS = [caaPS256 .. caaPS512];
+
   /// the known asymmetric algorithms which expects no ASN1_SEQ in JWT/JWS
   CAA_RAWSIGNATURE = CAA_RSA + [caaEdDSA];
 
@@ -3140,14 +3144,16 @@ type
   public
     /// main factory to create a new Certificate instance with this algorithm
     // - return a new void instance, ready to call e.g. ICryptCert.Load
-    function New: ICryptCert; virtual; abstract;
+    // - return nil by design e.g. for TCryptCertAlgoCng or TCryptCertAlgoPkcs11
+    function New: ICryptCert; virtual;
     /// low-level factory directly from the raw implementation handle
     // - e.g. a PX509 for OpenSsl, or TEccCertificate for mormot.crypt.ecc
     // - warning: ensure Handle is of the expected type, otherwise it will GPF
     // - includes the private key for TEccCertificate, or not for OpenSsl
-    // - note that this Handle will be owned by the new ICryptCert instance,
-    // so you should not make FromHandle(another.Handle)
-    function FromHandle(Handle: pointer): ICryptCert; virtual; abstract;
+    // - return nil by design e.g. for TCryptCertAlgoCng or TCryptCertAlgoPkcs11
+    // - note that this Handle will be owned (and eventually released) by the
+    // new ICryptCert instance, so you should not make FromHandle(another.Handle)
+    function FromHandle(Handle: pointer): ICryptCert; virtual;
     /// factory to load a Certificate from a ICryptCert.Save() content
     // - PrivatePassword is needed if the input contains a private key
     // - will only recognize and support the ccfBinary and ccfPem formats
@@ -3170,6 +3176,7 @@ type
     // - by default, this class returns a self-signed certificate as CSR, but
     // will be overriden by our X.509 engines (OpenSSL and mormot.crypt.x509) to
     // return a proper PKCS#10 standard CSR, in a Let's Encrypt compatible way
+    // - return '' by design e.g. for TCryptCertAlgoCng or TCryptCertAlgoPkcs11
     function CreateSelfSignedCsr(const Subjects: RawUtf8;
       const PrivateKeyPassword: SpiUtf8; var PrivateKeyPem: RawUtf8;
       Usages: TCryptCertUsages = [];
@@ -3770,7 +3777,7 @@ var
 
   /// direct access to the mormot.crypt.x509.pas ICryptCert factories
   // - may be nil if this unit was not included
-  // - to get a new ICryptCert using OpenSSL RSA 2048 key over SHA-256, use e.g.
+  // - to get a void ICryptCert instance for RSA 2048 key over SHA-256, use e.g.
   // ! CryptCertX509[caaRS256].New
   CryptCertX509: array[TCryptAsymAlgo] of TCryptCertAlgo;
 
@@ -8316,8 +8323,8 @@ type
 constructor TCryptRandomEntropy.Create(const name: RawUtf8);
 begin
   fSource := TAesPrngGetEntropySource(InternalResolve(name, RndAlgosText));
-  Random128(fNonce);
-  inherited Create(name);       // should be done after InternalResolve()
+  RandomBytes(FastNewRawByteString(fNonce, 16), 16); // good enough
+  inherited Create(name); // should be done after InternalResolve()
 end;
 
 procedure TCryptRandomEntropy.Get(dst: pointer; dstlen: PtrInt);
@@ -9246,33 +9253,48 @@ end;
 
 { TCryptCertAlgo }
 
+function TCryptCertAlgo.New: ICryptCert;
+begin
+  result := nil; // unsupported
+end;
+
+function TCryptCertAlgo.FromHandle(Handle: pointer): ICryptCert;
+begin
+  result := nil; // unsupported
+end;
+
 function TCryptCertAlgo.Load(const Saved: RawByteString;
   Content: TCryptCertContent; const PrivatePassword: SpiUtf8): ICryptCert;
 begin
   result := New;
-  if not result.Load(Saved, Content, PrivatePassword) then
-    result := nil;
+  if Assigned(result) then // some classes may return nil
+    if not result.Load(Saved, Content, PrivatePassword) then
+      result := nil;
 end;
 
 function TCryptCertAlgo.Generate(Usages: TCryptCertUsages;
   const Subjects: RawUtf8; const Authority: ICryptCert; ExpireDays: integer;
   ValidDays: integer; Fields: PCryptCertFields): ICryptCert;
 begin
-  result := New.
-    Generate(Usages, Subjects, Authority, ExpireDays, ValidDays, Fields);
+  result := New;
+  if Assigned(result) then // some classes may return nil
+    result.Generate(Usages, Subjects, Authority, ExpireDays, ValidDays, Fields);
 end;
 
 function TCryptCertAlgo.CreateSelfSignedCsr(const Subjects: RawUtf8;
   const PrivateKeyPassword: SpiUtf8; var PrivateKeyPem: RawUtf8;
   Usages: TCryptCertUsages; Fields: PCryptCertFields): RawUtf8;
 var
-  csr: ICryptCert;
+  csr: ICryptCert; // temporary certificate instance
 begin
+  FastAssignNew(result);
   if PrivateKeyPem <> '' then
     ECryptCert.RaiseUtf8('%.CreateSelfSignedCsr % does not support ' +
       'a custom private key', [self, AlgoName]);
   // by default, just generate a self-signed certificate as CSR
   csr := New;
+  if not Assigned(csr) then
+    exit; // e.g. from TCryptCertAlgoCng or TCryptCertAlgoPkcs11
   csr.Generate(Usages, Subjects, nil, 365, -1, Fields);
   PrivateKeyPem := csr.Save(cccPrivateKeyOnly, PrivateKeyPassword);
   result := csr.Save(cccCertOnly, '', ccfPem);
@@ -9282,7 +9304,9 @@ end;
 function TCryptCertAlgo.GenerateFromCsr(const Csr: RawByteString;
   const Authority: ICryptCert; ExpireDays, ValidDays: integer): ICryptCert;
 begin
-  result := New.GenerateFromCsr(Csr, Authority, ExpireDays, ValidDays);
+  result := New;
+  if Assigned(result) then // some classes may return nil
+    result.GenerateFromCsr(Csr, Authority, ExpireDays, ValidDays);
 end;
 
 function TCryptCertAlgo.JwtName: RawUtf8;
@@ -9353,9 +9377,9 @@ begin
       ccmBinary:
         found := EqualBuf(Cert^.Save, Value);
       ccmSha1:
-        found := PropNameEquals(Cert^.GetDigest(hfSha1), Value);
+        found := HumanHexCompare(Cert^.GetDigest(hfSha1), Value) = 0;
       ccmSha256:
-        found := PropNameEquals(Cert^.GetDigest(hfSha256), Value);
+        found := HumanHexCompare(Cert^.GetDigest(hfSha256), Value) = 0;
     else
       found := false; // unsupported search method (e.g. ccmUsage)
     end;
@@ -9443,9 +9467,9 @@ begin
         result := CompareBuf(Save(cccCertOnly, '', ccfBinary),
                              Another.Save(cccCertOnly, '', ccfBinary));
       ccmSha1:
-        result := CompareBuf(GetDigest(hfSHA1), Another.GetDigest(hfSHA1));
+        result := HumanHexCompare(GetDigest(hfSHA1), Another.GetDigest(hfSHA1));
       ccmSha256:
-        result := CompareBuf(GetDigest(hfSHA256), Another.GetDigest(hfSHA256));
+        result := HumanHexCompare(GetDigest(hfSHA256), Another.GetDigest(hfSHA256));
       ccmIssuedBy:
         result := CompareBuf(GetAuthorityKey, Another.GetSubjectKey);
     else // e.g. ccmInstance
@@ -11037,8 +11061,7 @@ begin
   result := rawsignature;
   if (result = '') or
      (algo in CAA_RAWSIGNATURE) then
-     // no need to be encoded, since RSA and EdDSA have no SEQ
-    exit;
+    exit; // no need to be encoded, since RSA and EdDSA have no SEQ
   eccbytes := CAA_SIZE[algo];
   if length(result) = eccbytes * 2 then
     result := Asn(ASN1_SEQ, [
@@ -11391,48 +11414,46 @@ begin
   vers := AsnNextInteger(pos, seq, vt);
   if vt = ASN1_INT then
     case vers of
-      0: // PKCS#8 format
+      0: // PKCS#8 PrivateKeyInfo
         if (AsnNext(pos, seq) = ASN1_SEQ) and // privateKeyAlgorithm
            (AsnNext(pos, seq, @oid) = ASN1_OBJID) then
-        begin
-          // CkaToSeq() decoding
           case cka of
-            ckaEcc256 .. ckaEcc256k:
-              if (oid <> ASN1_OID_X962_PUBLICKEY) or
-                 (AsnNext(pos, seq, @oid) <> ASN1_OBJID) then
-                exit;
-            ckaEdDSA:
-              ;
+            ckaEcc256 .. ckaEcc256k: // RFC 5480 id-ecPublicKey + namedCurve OID
+              if (oid = ASN1_OID_X962_PUBLICKEY) and
+                 (AsnNext(pos, seq, @oid) = ASN1_OBJID) and
+                 (oid = CKA_OID[cka]) and
+                 // RFC 5915 ECPrivateKey inside PKCS#8 privateKey OCTET STRING:
+                 (AsnNextBuffer(pos, seq, oct) = ASN1_OCTSTR) and
+                 (AsnNextBuffer(oct) = ASN1_SEQ) and             // SEQ
+                 (AsnNextBuffer(oct) = ASN1_INT) and             // version
+                 (AsnNextBuffer(oct, @key) = ASN1_OCTSTR) then   // privateKey
+                result := key;
+            ckaEdDSA: // RFC 8410 algorithm identifier is directly id-Ed25519
+              if (oid = CKA_OID[cka]) and
+                 (AsnNextBuffer(pos, seq, oct) = ASN1_OCTSTR) and
+                 (AsnNextBuffer(oct, @key) = ASN1_OCTSTR) then
+                result := key;
           else
             exit; // this function is dedicated to ECC
           end;
-          if oid <> CKA_OID[cka] then
-            exit;
-          // private key raw binary extraction
-          if (AsnNextBuffer(pos, seq, oct) = ASN1_OCTSTR) and // privateKey
-             (AsnNextBuffer(oct{%H-}) = ASN1_SEQ) and
-             (AsnNextBuffer(oct) = ASN1_INT) and
-             (AsnNextBuffer(oct, @key) = ASN1_OCTSTR) then
+      1: // RFC 5915 EC key pair alternate format
+        if (cka in CKA_ECC) and
+           (AsnNextRaw(pos, seq, key) = ASN1_OCTSTR) then
+        begin
+          vt := AsnNext(pos, seq);
+          if vt = ASN1_NULL then
+            result := key
+          else if (vt = ASN1_CTC0) and // [0] ECparameters (optional)
+                  (AsnNext(pos, seq, @oid) = ASN1_OBJID) and
+                  {%H-}(oid = CKA_OID[cka]) then
+          begin
             result := key;
+            if (rfcpub <> nil) and     // [1] publicKey (optional)
+               (AsnNext(pos, seq) = ASN1_CTC1) and
+               (AsnNextRaw(pos, seq, key) = ASN1_BITSTR) then
+              rfcpub^ := key;
+          end;
         end;
-      1: // https://www.rfc-editor.org/rfc/rfc5915 EC key pair alternate format
-       if (cka in CKA_ECC) and                           // Elliptic Curve only
-          (AsnNextRaw(pos, seq, key) = ASN1_OCTSTR) then // privateKey
-       begin
-         vt := AsnNext(pos, seq);
-         if vt = ASN1_NULL then
-           result := key // just privateKey, without optional constructed fields
-         else if (vt = ASN1_CTC0) and  // [0] ECparameters (optional)
-                 (AsnNext(pos, seq, @oid) = ASN1_OBJID) and
-                 {%H-}(oid = CKA_OID[cka]) then
-         begin
-           result := key;
-           if (rfcpub <> nil) and       // [1] publicKey (optional)
-              (AsnNext(pos, seq) = ASN1_CTC1) and
-              (AsnNextRaw(pos, seq, key) = ASN1_BITSTR) then
-             rfcpub^ := key;
-        end;
-      end;
     end;
   FillZero(key);
 end;

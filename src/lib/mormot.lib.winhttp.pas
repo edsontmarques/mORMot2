@@ -1693,6 +1693,8 @@ type
   TWebSocketApi = packed record
     /// acces to the loaded library handle
     LibraryHandle: THandle;
+    /// flag for WebSocketApiInitialize single resolution
+    Tested: boolean;
     /// depends on Windows version
     WebSocketEnabled: boolean;
     /// aborts a WebSocket session handle created by WebSocketCreateClientHandle
@@ -1858,7 +1860,7 @@ var
 /// is HTTP.SYS web socket API available on the target system Windows 8 and UP
 function WinHttp_WebSocketEnabled: boolean;
 
-/// low-level loading of the WebSockets API
+/// low-level thread-safe loading of the WebSockets API
 procedure WebSocketApiInitialize;
 
 const
@@ -2215,6 +2217,9 @@ const
     'CONTENT-MD5:|CONTENT-RANGE:|EXPIRES:|LAST-MODIFIED:|ACCEPT-RANGES:|AGE:|' +
     'ETAG:|LOCATION:|PROXY-AUTHENTICATE:|RETRY-AFTER:|SERVER:|SET-COOKIE:|' +
     'VARY:|WWW-AUTHENTICATE:|';
+  MULTI_HEADERS = [reqConnection, respSetCookie,
+    // todo: need HTTP.sys API v2 HTTP_MULTIPLE_KNOWN_HEADERS for those ?
+    respWwwAuthenticate, respProxyAuthenticate];
 
 function HTTP_RESPONSE.AddCustomHeader(P: PUtf8Char;
   var UnknownHeaders: HTTP_UNKNOWN_HEADERS;
@@ -2230,8 +2235,9 @@ begin
   else
     i := IdemPCharSep(P, KNOWNHEADERS);
   if (i >= 0) and
-     // WebSockets need reqConnection / CONNECTION: as unknown header
-     (THttpApiHeader(i) <> reqConnection) then
+     // WebSockets require reqConnection / CONNECTION: as unknown header
+     // and there could be several respSetCookie / Set-Cookie: values
+     not (THttpApiHeader(i) in MULTI_HEADERS) then
   begin
     while P^ <> ':' do
       inc(P);
@@ -2488,25 +2494,36 @@ var
   api: TWebSocketApis;
   P: PPointer;
 begin
-  if WebSocketApi.LibraryHandle <> 0 then
-    exit; // already loaded
-  WebSocketApi.WebSocketEnabled := false;
-  WebSocketApi.LibraryHandle := LibraryOpen(WEBSOCKET_DLL);
-  if WebSocketApi.LibraryHandle = 0 then
+  if wsWine in WindowsSpecs then // Wine only implements some minimal stubs
     exit;
-  P := @@WebSocketApi.AbortHandle;
-  for api := low(api) to high(api) do
-  begin
-    P^ := LibraryResolve(WebSocketApi.LibraryHandle, WebSocketNames[api]);
-    if P^ = nil then
-    begin
-      FreeLibrary(WebSocketApi.LibraryHandle);
-      WebSocketApi.LibraryHandle := 0;
+  // Keep the handle and all function pointers private until fully initialized.
+  // This lock is reentrant because WinHttpApiInitialize already owns it.
+  mormot.core.os.GlobalLock;
+  try
+    if (WebSocketApi.LibraryHandle <> 0) or // inside the lock for safety
+       WebSocketAPI.Tested then
+      exit; // already loaded or at least tested
+    WebSocketAPI.Tested := true;
+    WebSocketApi.WebSocketEnabled := false;
+    WebSocketApi.LibraryHandle := LibraryOpen(WEBSOCKET_DLL);
+    if WebSocketApi.LibraryHandle = 0 then
       exit;
+    P := @@WebSocketApi.AbortHandle;
+    for api := low(api) to high(api) do
+    begin
+      P^ := LibraryResolve(WebSocketApi.LibraryHandle, WebSocketNames[api]);
+      if P^ = nil then
+      begin
+        FreeLibrary(WebSocketApi.LibraryHandle);
+        WebSocketApi.LibraryHandle := 0;
+        exit;
+      end;
+      inc(P);
     end;
-    inc(P);
+    WebSocketApi.WebSocketEnabled := true;
+  finally
+    mormot.core.os.GlobalUnlock;
   end;
-  WebSocketApi.WebSocketEnabled := true;
 end;
 
 function WinHttp_WebSocketEnabled: boolean;

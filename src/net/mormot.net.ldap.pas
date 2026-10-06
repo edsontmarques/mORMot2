@@ -214,8 +214,8 @@ type
 // e.g. on Windows, you need to run also the function on cLocalHost, and on
 // POSIX it seems to require a specific broadcast per interface network mask
 // otherwise only a single interface is broadcasted
-// - is useful only for low-level forensic tools: to find out which LDAP
-// client ot use, rather call CldapGetLdapController/CldapMyLdapController
+// - is useful only for low-level forensic tools: to properly locate a LDAP
+// server, rather call CldapGetLdapController/CldapMyLdapController
 function CldapBroadcast(var Servers: TCldapServers; TimeOutMS: integer = 100;
   const Address: RawUtf8 = cBroadcast; const Port: RawUtf8 = LDAP_PORT): integer;
 
@@ -738,6 +738,7 @@ type
     atsIntegerAccountType,
     atsIntegerMsdsSupportedEncryptionTypes,
     atsFileTime,
+    atsTimeSpan,
     atsTextTime,
     atsSid,
     atsGuid,
@@ -4003,6 +4004,12 @@ begin
           exit;
         end;
       end;
+    atsTimeSpan:
+      if ToInt64(s, ts.Value) then      // as 100 ns ticks
+      begin
+        TimeSpanToTextVar(ts.Value, s); // display as 'dd.hh:mm:ss.xxx'
+        exit;
+      end;
     atsUnicodePwd:
       begin
         s := 'xxxxxxxx'; // anti-forensic measure (paranoid)
@@ -6562,7 +6569,7 @@ begin
   fResponseDN := '';
   if AsnNext(Pos, Asn1Response) <> ASN1_SEQ then
   begin
-    SetUnknownError('Malformated response: missing ASN.1 SEQ');
+    SetUnknownError('Malformed response: missing ASN.1 SEQ');
     exit;
   end;
   seqend := AsnNextInteger(Pos, Asn1Response, asntype);
@@ -7552,6 +7559,8 @@ begin
       SetUnknownError('Stopped by SearchAllAbort');
       result := false;
       exclude(fFlags, fAborted);
+      if fSearchRange <> nil then
+        FreeAndNil(fSearchRange);
     end
     else if fSearchRange <> nil then
       // additional requests to fill any "paging attributes" auto-range results
@@ -8520,13 +8529,14 @@ begin
   InvalidateSecContext(client);
   try
     try
-      if (aFullUserName = nil)
-         {$ifdef OSWINDOWS} and (fGroupSid = nil) {$endif} then
+      {$ifdef OSPOSIX} // this 'onlypass' single pass trick is GSSAPI only
+      if aFullUserName = nil then
         // simple aUser/aPassword credential check needs no server side
         // - see as reference mag_auth_basic() in NGINX's mod_auth_gssapi.c
         result := ClientSspiAuthWithPassword(client, 'onlypass',
                     aUser, aPassword, fKerberosSpn, dataout)
       else
+      {$endif OSPOSIX}
       begin
         // more user information currently requires a ServerSspiAuth() context
         InvalidateSecContext(server);

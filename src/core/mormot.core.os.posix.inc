@@ -157,7 +157,7 @@ begin
   result := FpOpendir(PosixFN(DirName, tmp));
 end;
 
-function PosixStatFS(const Path: TFileName; Info: PStatfs): cint;
+function PosixStatFS(const Path: TFileName; Info: pointer{PStatfs}): cint;
 var
   tmp: TFNTemp;
 begin
@@ -242,7 +242,7 @@ begin
   result := FpOpendir(pointer(DirName));
 end;
 
-function PosixStatFS(const Path: TFileName; Info: PStatfs): cint; inline;
+function PosixStatFS(const Path: TFileName; Info: pointer): cint; inline;
 begin
   result := FpStatFS(pointer(Path), Info);
 end;
@@ -535,6 +535,16 @@ begin
           icui18n := LibraryOpen(fn);
         end;
       end;
+      {$ifdef OSANDROID}
+      if icu = 0 then
+      begin
+        // current Android has no libicudata.so (its data is part of the i18n
+        // APEX) but still publishes libicuuc.so/libicui18n.so to the apps
+        icu := LibraryOpen('libicuuc.so');
+        if icu <> 0 then
+          icui18n := LibraryOpen('libicui18n.so');
+      end;
+      {$endif OSANDROID}
       {$endif OSDARWIN}
       if icui18n = 0 then
       begin
@@ -563,7 +573,7 @@ begin
           break;
         end;
       end;
-      if vers <> '' then
+      if vers = '' then // no official version number matched
       {$endif OSANDROID}
       if LibraryResolve(icu, 'ucnv_open') = nil then
         for i := ICU_MAX downto ICU_MIN do
@@ -995,34 +1005,39 @@ end;
 
 
 const
-  // Date Translation - see http://en.wikipedia.org/wiki/Julian_day
-  D0 = 1461;
-  D1 = 146097;
-  D2 = 1721119;
+  // very fast Gregorian date translation - see TSynSystemTime.FromJulianDay
+  D0    = 1461;
+  D1    = 146097;
+  D2    = 153;
+  CGREG = 1721119;
   C1970 = 2440588;
+  DaysFromMarch: array[0 .. 11] of word = (
+    0, 31, 61, 92, 122, 153, 184, 214, 245, 275, 306, 337);
 
-procedure JulianToGregorian(JulianDN: PtrUInt; out result: TSystemTime);
-  {$ifdef HASINLINE}inline;{$endif}
+procedure DaysToGregorian(t: cardinal; var result: TSystemTime);
 var
-  YYear, XYear, Temp, TempMonth: PtrUInt;
+  t2, t3: cardinal;
 begin
-  Temp := ((JulianDN - D2) * 4) - 1;
-  JulianDN := Temp div D1;
-  XYear := (Temp - (JulianDN * D1)) or 3;
-  YYear := XYear div D0;
-  Temp := (((XYear - (YYear * D0) + 4) shr 2) * 5) - 3;
-  TempMonth := Temp div 153;
-  result.Day := PtrUInt((Temp - (TempMonth * 153)) + 5) div 5;
-  if TempMonth >= 10 then
-  begin
-    inc(YYear);
-    dec(TempMonth, 12 - 3);
-  end
+  t := t * 4 - 1;
+  t3 := t div D1;
+  t2 := (t - t3 * D1) and not 3;
+  t := (t2 + 3) div D0;
+  result.Year := t3 * 100 + t;
+  t3 := t * D0;
+  inc(t2, 7);
+  dec(t2, t3);
+  t2 := t2 shr 2;
+  t3 := t2 * 535;
+  dec(t3, 202);
+  t3 := t3 shr 14;
+  result.Day := t2 - DaysFromMarch[t3]; // pre-computed (Month * D2 + 2) div 5
+  if t3 < 10 then
+    result.Month := t3 + 3
   else
-    inc(TempMonth, 3);
-  result.Month := TempMonth;
-  result.Year := YYear + (JulianDN * 100);
-  // initialize fake dayOfWeek - as used by FromGlobalTime()
+  begin
+    result.Month := t3 - 9;
+    inc(result.Year);
+  end;
   result.DayOfWeek := 0;
 end;
 
@@ -1031,7 +1046,7 @@ var
   t: PtrUInt;
 begin
   t := epoch div SecsPerDay;
-  JulianToGregorian(t + C1970, result);
+  DaysToGregorian(t + (C1970 - CGREG), result);
   dec(epoch, t * SecsPerDay);
   t := epoch div SecsPerHour;
   result.Hour := t;
@@ -1145,16 +1160,16 @@ function mach_timebase_info(var TimebaseInfoData: TTimebaseInfoData): integer;
 
 function host_processor_info(host, flavor: cint; var proccount: cardinal;
   var info: pointer; var infocount: cardinal): cint;
-  cdecl external 'host_processor_info';
+  cdecl external clib name 'host_processor_info';
 
 function mach_host_self: cint;
-  cdecl external 'mach_host_self';
+  cdecl external clib name 'mach_host_self';
 
 function vm_deallocate(task: cint; add: pointer; size: PtrUInt): cint;
-  cdecl external 'vm_deallocate';
+  cdecl external clib name 'vm_deallocate';
 
 function mach_task_self: cint;
-  cdecl external 'mach_task_self';
+  cdecl external clib name 'mach_task_self';
 
 var
   mach_timeinfo: TTimebaseInfoData;
@@ -1641,11 +1656,18 @@ end;
 {$ifndef NOEXCEPTIONINTERCEPT}
 
 var
+  // RaiseProc/RaiseExceptObjProc redirection in the main mormot.core.os.pas
   _RawLogException: TOnRawLogException;
 
-// FPC: intercept via the RaiseProc global variable
-{$define WITH_RAISEPROC}
-// RaiseProc redirection is implemented in main mormot.core.os.pas
+{$ifdef FPC}
+  // FPC: intercept via the RaiseProc global variable
+  {$define WITH_RAISEPROC}
+{$else}
+  {$ifdef HASRAISEEXCEPTOBJPROC}
+    // Delphi POSIX: intercept via the RaiseExceptObjProc global variable
+    {$define WITH_RAISEEXCEPTOBJPROC}
+  {$endif HASRAISEEXCEPTOBJPROC}
+{$endif FPC}
 
 {$endif NOEXCEPTIONINTERCEPT}
 
@@ -1920,7 +1942,15 @@ begin
   if not result then
     exit;
   if FileId <> nil then
+    {$ifdef OSANDROID}
+    {$ifdef DELPHIPOSIX}
+    FileId^ := lp.__st_ino; // as named by the Delphi Android64 RTL
+    {$else}
     FileId^ := lp.st_ino;
+    {$endif DELPHIPOSIX}
+    {$else}
+    FileId^ := lp.st_ino;
+    {$endif OSANDROID}
   if FileSize <> nil then
     FileSize^ := lp.st_size;
   if (LastWriteAccess = nil) and
@@ -2068,7 +2098,7 @@ begin
             (PosixSymlink(Target, SymLink) = 0);
 end;
 
-function WaitReadPending(fd, timeout: integer): boolean;
+function WaitReadPending(fd, timeout: integer): integer;
 var
   p: TPollFD; // select() limits process to 1024 sockets in POSIX -> use poll()
   // https://moythreads.com/wordpress/2009/12/22/select-system-call-limitation
@@ -2076,7 +2106,12 @@ begin
   p.fd := fd;
   p.events := POLLIN or POLLPRI;
   p.revents := 0;
-  result := FpPoll(@p, 1, timeout) > 0;
+  result := FpPoll(@p, 1, timeout);
+  if result > 0 then
+    if p.revents and (POLLIN or POLLPRI) <> 0 then
+      result := 1   // something is available
+    else
+      result := -1; // HUP/ERR/NVAL: not readable console input
 end;
 
 procedure ConsoleErrorWrite(const text: RawUtf8);
@@ -2289,7 +2324,7 @@ const
   // missing definitions from uapi\linux\futex.h
   FUTEX_WAIT         = 0;
   FUTEX_WAKE         = 1;
-  FUTEX_PRIVATE_FLAG = 128; // since Linux 2.6.22
+  FUTEX_PRIVATE_FLAG = 128; // since Linux 2.6.22 (Jul 2007)
   FUTEX_WAIT_PRIVATE = FUTEX_WAIT or FUTEX_PRIVATE_FLAG;
   FUTEX_WAKE_PRIVATE = FUTEX_WAKE or FUTEX_PRIVATE_FLAG;
 
@@ -2693,7 +2728,7 @@ end;
 
 function LinuxEventFDWait(fd: integer; ms: integer): boolean;
 begin
-  result := WaitReadPending(fd, ms); // call FpPoll()
+  result := WaitReadPending(fd, ms) > 0; // call FpPoll()
 end;
 {$else}
 function LinuxEventFD(nonblocking, semaphore: boolean): integer;
@@ -2810,9 +2845,21 @@ begin
   tmp.Store.Done;
 end;
 
+procedure WaitForDaemonTermination;
+begin
+  if SynDaemonTerminated = 0 then
+    {$ifdef FPC} // SynDaemonTerminated is a function on Delphi POSIX
+    if Assigned(OsWaitOnValue) then
+      OsWaitOnValue(@SynDaemonTerminated, 0, 1000) // e.g. from Linux futex
+    else
+    {$endif FPC}
+      SleepHiRes(1000);
+end;
+
 procedure ConsoleWaitForEnterKey(doCheckSynchronize: boolean);
 var
   c: AnsiChar;
+  res: integer;
 begin
   if GetCurrentThreadID = MainThreadID then
     SynDaemonIntercept // intercept ^C and SIGQUIT - do nothing if already set
@@ -2823,18 +2870,30 @@ begin
     if doCheckSynchronize then
     begin
       CheckSynchronize(1000);
-      if not WaitReadPending(StdInputHandle, 0) then
+      if WaitReadPending(StdInputHandle, 0) <= 0 then
         continue;
     end
-    else if not WaitReadPending(StdInputHandle, 10000) then
-      continue;
-    repeat
+    else
+    begin
+      res := WaitReadPending(StdInputHandle, 10000);
+      if res < 0 then // HUP/ERR/NVAL -> wait to avoid 100% cpu burn
+        WaitForDaemonTermination;
+      if res <= 0 then
+        continue;
+    end;
+    while SynDaemonTerminated = 0 do
+    begin
       c := #0;
-      if FpRead(StdInputHandle, @c, 1) <> 1 then
+      res := FpRead(StdInputHandle, @c, 1);
+      if res <> 1 then
+      begin // EOF/error e.g. under systemd /dev/null -> always wait
+        if not doCheckSynchronize then
+          WaitForDaemonTermination;
         break;
+      end;
       if c in [#10, #13] then
-        exit;
-    until false;
+        exit; // [Enter] key pressed
+    end;
   end;
 end;
 
@@ -3509,6 +3568,7 @@ type
     freeswap: cardinal;                  // swap space still available
     mem_unit: cardinal;                  // Memory unit size in bytes
   end;
+  PSysInfo = ^TSysInfo;
 
 function _RetrieveSysInfo(var si: TSysInfo): boolean;
 var
@@ -4020,14 +4080,15 @@ begin // single syscall gives enough information on Linux
   result := SysInfo(@si) = 0;
 end;
 
-function RetrieveSysInfo(var si: TSysInfo): boolean; forward; // 1 second cache
+// 1 sec cache or single syscall (faster than /proc/loadavg)
+function RetrieveSysInfo(si: PSysInfo; txt: PAnsiChar; max: PtrInt): boolean; forward;
 
 function RetrieveLoadAvg: TShort23;
 var
   si: TSysInfo;  // Linuxism
 begin
   result[0] := #0;
-  if not RetrieveSysInfo(si) then // cache or syscall faster than /proc/loadavg
+  if not RetrieveSysInfo(@si, nil, 0) then
     exit;
   AppendShort(TwoDigits(si.loads[0] / double(65536.0)), result);
   AppendShortChar(' ', @result);
@@ -4955,6 +5016,8 @@ begin
       [text, Sig, si_code], nil);
   end;
   SynDaemonTerminated := Sig;
+  if Assigned(OsWakeAllOnValue) then
+    OsWakeAllOnValue(@SynDaemonTerminated); // wake e.g. all Linux futexes
 end;
 
 procedure SynDaemonIntercept(const onlog: TSynLogProc);
@@ -4982,12 +5045,7 @@ begin
   end;
 end;
 
-procedure DoNothing(Sig: integer; Info: PSigInfo; Context: PSigContext); cdecl;
-begin
-end;
-
-// TO INVESTIGATE: we may use per-thread signal masking instead
-// http://www.microhowto.info/howto/ignore_sigpipe_without_affecting_other_threads_in_a_process.html
+// per-thread signal masking is no solution for OpenSSL - rather upgrade to 4+
 procedure SigPipeIntercept;
 var
   sa: SigactionRec;
@@ -4999,9 +5057,9 @@ begin
     if fSigPipeDisabled in _F1 then
       exit;
     FillCharFast(sa, SizeOf(sa), 0);
-    sa.sa_handler := @DoNothing;
-    fpSigaction(SIGPIPE, @sa, nil);
-    include(_F1, fSigPipeDisabled); // set AFTER disabling it
+    sa.sa_handler := SigActionHandler(SIG_IGN);
+    if fpSigaction(SIGPIPE, @sa, nil) = 0 then
+      include(_F1, fSigPipeDisabled); // set once AFTER disabling it
   finally
     OSSafe.UnLock;
   end;
@@ -5228,10 +5286,15 @@ begin
       onlog(sllNewRun, 'Start % /% %',
         [servicename, TXT[dofork], Executable.Version.DetailedOrVoid], nil);
     Start;
-    while SynDaemonTerminated = 0 do
-      if GetCurrentThreadID = MainThreadID then
+    if GetCurrentThreadID = MainThreadID then
+      while SynDaemonTerminated = 0 do
         CheckSynchronize(100)
-      else
+    {$ifdef FPC} // SynDaemonTerminated is a function on Delphi POSIX
+    else if Assigned(OsWaitOnValue) then // use clean futex on Linux to wait
+      OsWaitOnValue(@SynDaemonTerminated, 0, INFINITE)
+    {$endif FPC}
+    else
+      while SynDaemonTerminated = 0 do
         SleepHiRes(100);
   finally
     if Assigned(onlog) then
@@ -5478,7 +5541,7 @@ var
     u: RawUtf8;
   begin
     result := false; // return false on pipe closed
-    if WaitReadPending(fd, wait) then
+    if WaitReadPending(fd, wait) > 0 then
     begin
       n := fpread(fd, @tmp, SizeOf(tmp));
       if n <= 0 then
@@ -6087,7 +6150,9 @@ var
   {$ifndef NODIRECTTHREADMANAGER}
   tm: TThreadManager;
   {$endif NODIRECTTHREADMANAGER}
-  {$ifndef OSDARWIN}
+  {$ifdef OSDARWIN}
+  kern: PtrUInt;
+  {$else}
   tpfail: integer;
   tp: array[0 .. 1{$ifdef OSLINUX} + 2{$endif}] of TTimeSpec;
   {$endif OSDARWIN}
@@ -6337,15 +6402,13 @@ begin
   {$ifdef OSDARWIN}
   temp1 := 'macOS ';
   modname := fpsysctlbynamestr('kern.osproductversion', temp2); // '15.7.3'
-  if OSVersion32.utsrelease[2] in [low(MACOS_NUM) .. high(MACOS_NUM)] then
-  begin
-    if modname = nil then // '15' number from kernel revision
-      AppendShort(MACOS_NUM[OSVersion32.utsrelease[2]], temp1)
-    else                  // '15.7.3'
-      AppendShortBuffer(pointer(modname), StrLen(modname), high(temp1), @temp1);
-    AppendShortCharSafe(' ', temp1);
-    AppendShort(MACOS_NAME[OSVersion32.utsrelease[2]], temp1);
-  end;
+  kern := MacKernel(OSVersion32);
+  if modname = nil then // '15' main number from kernel revision
+    AppendShort(MACOS_NUM[kern], temp1)
+  else                  // '15.7.3'
+    AppendShortBuffer(pointer(modname), StrLen(modname), high(temp1), @temp1);
+  AppendShortCharSafe(' ', temp1);
+  AppendShort(MACOS_NAME[kern], temp1);
   ShortStringToAnsi7String(temp1, OSVersionShort); // 'macOS 15.7.3 Sequoia'
   OSVersionText := Join([OSVersionShort, ' (', OSVersionText, ')']);
   mach_timebase_info(mach_timeinfo);

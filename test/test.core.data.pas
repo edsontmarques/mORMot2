@@ -4602,10 +4602,10 @@ begin
   NotifyTestSpeed('TDocVariant FromResults not exp', c, lennexp * ITER, @timer, ONLYLOG);
   // TDocVariant FromResults not exp in 242.29ms i.e. 6.4M/s, 355.9 MB/s
   Check(dv.InitArrayFromResults(people));
-  CheckEqual(peoplehash, Hash32(dv.ToJson));
+  CheckHash(dv.ToJson, peoplehash, 'dv.ToJson1');
   dv.Clear; // to reuse dv
   Check(dv.InitArrayFromResults(notexpanded));
-  CheckEqual(peoplehash, Hash32(dv.ToJson));
+  CheckHash(dv.ToJson, peoplehash, 'dv.ToJson2');
   dv.Clear; // to reuse dv
   timer.Start;
   for i := 1 to ITER do
@@ -9557,6 +9557,57 @@ begin
   XmlWalk(p, xtText, '', '  ');
   XmlWalk(p, xtElementEnd, 'a');
   Check(p.ParseNext = xtEof);
+  // simple DOCTYPE is ignored by default
+  s := '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '#10 +
+       '  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">'#10 +
+       '<svg/>';
+  p.Init(s);
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  // XML declaration, whitespace and DOCTYPE
+  s := '<?xml version="1.0" encoding="UTF-8"?>'#10 +
+       '<!DOCTYPE svg SYSTEM "svg.dtd">'#10 +
+       '<svg/>';
+  p.Init(s);
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  // quoted '>' doesn't terminate the declaration
+  p.Init('<!DOCTYPE svg SYSTEM "foo>bar.dtd"><svg/>');
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  // works even when prolog whitespace is explicitly returned
+  p.Init('  <!DOCTYPE svg><svg/>', [xpoKeepWhiteSpace]);
+  XmlWalk(p, xtText, '', '  ');
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  // exercises the prolog state choice directly
+  p.Init('<!--before--><!DOCTYPE svg><svg/>', [xpoKeepComments]);
+  XmlWalk(p, xtComment, '', 'before');
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  // DOCTYPE should be properly supported after Save/Restore
+  p.Init('<!DOCTYPE svg><svg/>');
+  p.Save;
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  p.Restore;
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  Check(p.ParseNext = xtEof);
+  p.Init('<!--before--><!DOCTYPE svg><svg/>', [xpoKeepComments]);
+  XmlWalk(p, xtComment, '', 'before');
+  p.Save;
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
+  p.Restore;
+  XmlWalk(p, xtElementStart, 'svg');
+  XmlWalk(p, xtElementEnd, 'svg');
 end;
 
 procedure TTestCoreProcess.XmlSaxErrors;
@@ -9597,6 +9648,18 @@ begin
   XmlExpectRaise(xpeTooMuchNesting, 'too much nesting', deep);
   deep := '<' + RawUtf8OfChar('n', 300) + '/>';
   XmlExpectRaise(xpeTagNameTooLong, 'name too long', deep);
+  XmlExpectRaise(xpeUnsupportedMarkup, 'dtd internal subset',
+    '<!DOCTYPE foo [<!ENTITY x "y">]><foo>&x;</foo>');
+  XmlExpectRaise(xpeUnsupportedMarkup, 'dtd nested definition',
+    '<!DOCTYPE foo <!ENTITY x "y">><foo/>');
+  XmlExpectRaise(xpeUnsupportedMarkup, 'doctype after root',
+    '<foo/><!DOCTYPE foo>');
+  XmlExpectRaise(xpeUnsupportedMarkup, 'doctype explicitly rejected',
+    '<!DOCTYPE svg SYSTEM "svg.dtd"><svg/>',
+    [xpoRejectDocType]);
+  // A simple DOCTYPE never defines or loads entities.
+  XmlExpectRaise(xpeXmlUnescapeFailed, 'doctype entity is never resolved',
+    '<!DOCTYPE foo SYSTEM "foo.dtd"><foo>&custom;</foo>');
 end;
 
 procedure TTestCoreProcess.XmlSaxBoundaries;
@@ -11078,7 +11141,7 @@ end;
 
 const
   // regression tests use a const table instead of our runtime-computed array
-  c32t: array[byte] of cardinal = ($00000000, $77073096, $EE0E612C,
+  c32t: TByteToCardinal = ($00000000, $77073096, $EE0E612C,
     $990951BA, $076DC419, $706AF48F, $E963A535, $9E6495A3, $0EDB8832, $79DCB8A4,
     $E0D5E91E, $97D2D988, $09B64C2B, $7EB17CBD, $E7B82D07, $90BF1D91, $1DB71064,
     $6AB020F2, $F3B97148, $84BE41DE, $1ADAD47D, $6DDDE4EB, $F4D4B551, $83D385C7,
@@ -11234,6 +11297,19 @@ begin
   end;
 end;
 
+function W(p: PAnsiChar; value, bytes: PtrUInt): PAnsiChar;
+  {$ifdef HASINLINE} inline; {$endif}
+begin
+  PCardinal(p)^ := value; // little-endian, as the .zip format
+  result := @p[bytes];
+end;
+
+function WS(p: PAnsiChar; const text: RawUtf8): PAnsiChar;
+begin
+  MoveFast(pointer(text)^, p^, length(text));
+  result := @p[length(text)];
+end;
+
 procedure TTestCoreCompression.ZipFormat;
 var
   FN, FN2: TFileName;
@@ -11326,6 +11402,83 @@ var
     end;
   end;
 
+  procedure DataDescriptorLastEntry;
+  // some tools (e.g. LibreOffice for .xlsx) set FLAG_DATADESCRIPTOR on all
+  // entries: retrieving the last one from a memory buffer should not need fSource
+  const
+    DATA: array[0..1] of RawUtf8 = ('first content', 'second stored content');
+  var
+    crc, offs: array[0..1] of cardinal;
+    cdoffs, v: cardinal;
+    i: PtrInt;
+    p: PAnsiChar;
+    tmp: TTemp512;
+  begin
+    p := @tmp;
+    for i := 0 to 1 do
+    begin
+      offs[i] := p - PAnsiChar(@tmp);
+      crc[i] := crc32(0, pointer(DATA[i]), length(DATA[i]));
+      p := W(p, $04034b50, 4);           // local file header with no crc/sizes
+      p := W(p, 20, 2);
+      p := W(p, 8, 2);                   // FLAG_DATADESCRIPTOR
+      p := W(p, 0, 2);                   // stored
+      p := W(p, 0, 4);                   // time+date
+      p := W(p, 0, 4);
+      p := W(p, 0, 4);
+      p := W(p, 0, 4);
+      p := W(p, 5, 2);                   // name length
+      p := W(p, 0, 2);
+      p := WS(p, FormatUtf8('f%.tx', [i]));
+      p := WS(p, DATA[i]);
+      p := W(p, $08074b50, 4);           // data descriptor
+      p := W(p, crc[i], 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, length(DATA[i]), 4);
+    end;
+    cdoffs := p - PAnsiChar(@tmp);
+    for i := 0 to 1 do
+    begin
+      p := W(p, $02014b50, 4);           // central directory with crc/sizes
+      p := W(p, 20, 2);
+      p := W(p, 20, 2);
+      p := W(p, 8, 2);                   // FLAG_DATADESCRIPTOR
+      p := W(p, 0, 2);
+      p := W(p, 0, 4);
+      p := W(p, crc[i], 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, length(DATA[i]), 4);
+      p := W(p, 5, 2);
+      p := W(p, 0, 4);                   // extra + comment length
+      p := W(p, 0, 4);                   // disk + internal attr
+      p := W(p, 0, 4);                   // external attr
+      p := W(p, offs[i], 4);
+      p := WS(p, FormatUtf8('f%.tx', [i]));
+    end;
+    v := cardinal(p - PAnsiChar(@tmp)) - cdoffs;
+    p := W(p, $06054b50, 4);             // last header
+    p := W(p, 0, 4);
+    p := W(p, 2, 2);
+    p := W(p, 2, 2);
+    p := W(p, v, 4);
+    p := W(p, cdoffs, 4);
+    p := W(p, 0, 2);
+    CheckHash(@tmp, p - PAnsiChar(@tmp), $032B1637);
+    try
+      with TZipRead.Create(@tmp, p - PAnsiChar(@tmp)) do
+      try
+        CheckEqual(Count, 2, 'datadesc count');
+        for i := 0 to Count - 1 do
+          CheckEqual(UnZip(i), DATA[i], 'datadesc unzip');
+      finally
+        Free;
+      end;
+    except
+      on E: Exception do
+        FailedRaised(E);
+    end;
+  end;
+
 var
   i, m: integer;
   mem: QWord;
@@ -11351,12 +11504,13 @@ begin
       end;
   except
     on E: Exception do
-      Check(false, E.Message);
+      FailedRaised(E);
   end;
   Check(DeleteFile(FN));
   TZipWrite.Create(FN).Free;
   CheckEqual(FileSize(FN), SizeOf(minim), 'TZipWrite void .zip');
   Check(DeleteFile(FN));
+  DataDescriptorLastEntry;
   // onprog := TStreamRedirect.ProgressInfoToConsole;
   onprog := TSynLog.ProgressInfo;
   for m := 1 to 2 do

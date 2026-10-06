@@ -2767,7 +2767,8 @@ begin
   if fTimeoutSeconds = 0 then
     exit;
   tix := GetTickSec;
-  if fTimeoutTix > tix then
+  if (fTimeoutTix <> 0) and
+     (tix >= fTimeoutTix) then
     Reset;
   fTimeoutTix := tix + fTimeoutSeconds;
 end;
@@ -3086,7 +3087,7 @@ begin
     {$endif UNICODE}
     if FileInfoByName(dir + d^.Name, d^.Size, ts, @d^.Attr) then // = fpStat()
     begin
-      d^.Timestamp := UnixTimeToLocal(ts div MSecsPerSec);
+      d^.Timestamp := UnixTimeToLocal(ts div MilliSecsPerSec);
       inc(d); // will leave d^.Attr = 0
       inc(r);
     end;

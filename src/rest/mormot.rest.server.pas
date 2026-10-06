@@ -116,7 +116,7 @@ type
     /// the thread which launched the request
     // - is set by TRestServer.BeginCurrentThread from multi-thread server
     // handlers - e.g. TRestHttpServer
-    RunningThread: TThread;
+    RunningThread: TThreadAbstract;
   end;
 
   /// kind of (static) database server implementation available
@@ -1293,6 +1293,12 @@ type
   // as plain password value
   // - this class is not available on some targets (e.g. Android)
   TRestServerAuthenticationSspi = class(TRestServerAuthenticationSignedUri)
+  protected
+    {$ifdef OSPOSIX} // keytab files is a POSIX/GSSAPI specific feature
+    fSspiKeyTab: TServerSspiKeyTab;
+    procedure SetKeyTab(const aKeyTab: TFileName);
+    function GetKeyTab: TFileName;
+    {$endif OSPOSIX}
   public
     /// initialize this SSPI/GSSAPI authentication scheme
     constructor Create(aServer: TRestServer); override;
@@ -1301,6 +1307,11 @@ type
     // to a Windows SSPI API secure challenge
     function Auth(Ctxt: TRestServerUriContext;
       const aUserName: RawUtf8): boolean; override;
+    {$ifdef OSPOSIX}
+    /// the keytab file name propagated to all server threads (POSIX only)
+    property KeyTab: TFileName
+      read GetKeyTab write SetKeyTab;
+    {$endif OSPOSIX}
   end;
 
   {$endif DOMAINRESTAUTH}
@@ -1845,8 +1856,8 @@ type
     function StatusCodeToText(Code: cardinal): PRawUtf8; virtual;
     procedure HandleUriError(Ctxt: TRestServerUriContext; E: Exception);
     /// ensure the thread will be taken into account during process
-    procedure OnBeginCurrentThread(Sender: TThread); override;
-    procedure OnEndCurrentThread(Sender: TThread); override;
+    procedure OnBeginCurrentThread(Sender: TThreadAbstract); override;
+    procedure OnEndCurrentThread(Sender: TThreadAbstract); override;
     // called by Stat() and Info() method-based services
     procedure InternalStat(Ctxt: TRestServerUriContext; W: TJsonWriter); virtual;
     procedure AddStat(Flags: TRestServerAddStats; W: TJsonWriter);
@@ -2984,7 +2995,7 @@ function TRestServerUriContext.Authenticate: boolean;
 var
   s: TAuthSession;
   a: ^TRestServerAuthentication;
-  tix32, bearerid: cardinal;
+  tix32, c32, bearerid: cardinal;
   n: PtrInt;
 begin
   result := true;
@@ -3029,7 +3040,9 @@ begin
     end;
     // first check for deprecated sessions (every second is enough)
     tix32 := TickCount64 shr 10;
-    if Server.fSessionsDeprecatedTix <> tix32 then
+    c32 := Server.fSessionsDeprecatedTix;
+    if (c32 <> tix32) and
+       LockedExc32(Server.fSessionsDeprecatedTix, tix32, c32) then
       Server.SessionDeleteDeprecated(tix32);
     // TAuthSession instance may have been stored at connection level
     if (rsoSessionInConnectionOpaque in Server.Options) and
@@ -4931,7 +4944,7 @@ end;
 procedure TAuthSession.ComputeProtectedValues(tix: Int64);
 begin
   // here User.GroupRights and fPrivateKey should have been set
-  fTimeOutShr10 := User.GroupRights.SessionTimeout * (MilliSecsPerMin shr 10);
+  fTimeOutShr10 := (QWord(User.GroupRights.SessionTimeout) * MilliSecsPerMin) shr 10;
   fTimeOutTix := tix shr 10 + fTimeOutShr10;
   fAccessRights := User.GroupRights.OrmAccessRights;
   Make([fID, '+', fPrivateKey], fPrivateSalt); // 'SessionID+PrivateKey'
@@ -5337,7 +5350,8 @@ end;
 function TRestServerAuthenticationSignedUri.RetrieveSession(
   Ctxt: TRestServerUriContext): TAuthSession;
 var
-  ts, sign, minticks, expectedsign: cardinal;
+  ts, sign, last, expectedsign: cardinal;
+  delta: integer;
   P: PAnsiChar;
   reslen: PtrInt;
 begin
@@ -5358,33 +5372,38 @@ begin
   if result = nil then
     exit; // unknown Session
   P := @P[reslen + (19 + 8)]; // points to Hexa8(Timestamp)
-  minticks := result.fLastClientTimestamp - fTimestampCoherencyTicks;
-  if HexDisplayToCardinal(P, ts) and
-     (fNoTimestampCoherencyCheck or
-      (integer(minticks) < 0) or // <0 just after computer startup
-      ({%H-}ts >= minticks)) then
+  last := result.fLastClientTimestamp;
+  if HexDisplayToCardinal(P, ts) then
   begin
-    expectedsign := fComputeSignature(result.fPrivateSaltHash,
-      P, pointer(Ctxt.Call^.Url), reslen);
-    if HexDisplayToCardinal(P + 8, sign) and // Hexa8(Signature)
-       ({%H-}sign = expectedsign) then
+    // signed modular distance between two 32-bit timestamps:
+    // > 0 = newer, < 0 = older, also across cardinal rollover
+    delta := integer(ts - last);
+    if fNoTimestampCoherencyCheck or
+       (last = 0) or
+       (delta >= -integer(fTimestampCoherencyTicks)) then
     begin
-      if not fNoTimestampCoherencyCheck then
-        if ts > result.fLastClientTimestamp then
-          result.fLastClientTimestamp := ts;
-      Ctxt.SessionAssign(result); // set TimeOutTix and fill Ctxt.Session*
-      exit; // success
+      expectedsign := fComputeSignature(result.fPrivateSaltHash,
+        P, pointer(Ctxt.Call^.Url), reslen);
+      if HexDisplayToCardinal(P + 8, sign) and // Hexa8(Signature)
+         ({%H-}sign = expectedsign) then
+      begin
+        if not fNoTimestampCoherencyCheck then
+          if (last = 0) or
+             (delta > 0) then
+            result.fLastClientTimestamp := ts;
+        Ctxt.SessionAssign(result); // set TimeOutTix and fill Ctxt.Session*
+        exit;                       // success
+      end
+      else if Assigned(Ctxt.fLog) and
+              (sllUserAuth in fServer.fLogLevel) then
+        Ctxt.fLog.Log(sllUserAuth, 'Invalid Signature: expected %, got %',
+          [CardinalToHexShort(expectedsign), CardinalToHexShort(sign)], self);
     end
     else if Assigned(Ctxt.fLog) and
             (sllUserAuth in fServer.fLogLevel) then
-      Ctxt.fLog.Log(sllUserAuth, 'Invalid Signature: expected %, got %',
-        [CardinalToHexShort(expectedsign),
-         CardinalToHexShort(sign)], self);
-  end
-  else if Assigned(Ctxt.fLog) and
-          (sllUserAuth in fServer.fLogLevel) then
-    Ctxt.fLog.Log(sllUserAuth, 'Invalid Timestamp: expected >=%, got %',
-      [Int64(minticks), Int64(ts)], self);
+      Ctxt.fLog.Log(sllUserAuth, 'Invalid Timestamp: delta=% tolerance=%',
+        [delta, fTimestampCoherencyTicks], self);
+  end;
   result := nil; // indicates invalid signature
 end;
 
@@ -5729,6 +5748,18 @@ begin
   inherited Create(aServer);
 end;
 
+{$ifdef OSPOSIX}
+procedure TRestServerAuthenticationSspi.SetKeyTab(const aKeyTab: TFileName);
+begin
+  TServerSspiKeyTab.FileSetter(fSspiKeyTab, aKeyTab, fServer.LogClass.DoLog, self);
+end;
+
+function TRestServerAuthenticationSspi.GetKeyTab: TFileName;
+begin
+  result := fSspiKeyTab.KeyTab;
+end;
+{$endif OSPOSIX}
+
 // about Browser support and SPNEGO handshake via HTTP headers, see e.g.
 // https://learn.microsoft.com/en-us/previous-versions/ms995330(v=msdn.10)
 
@@ -5795,6 +5826,11 @@ begin
   InvalidateSecContext(sec);
   try
     try
+      // optional TRestServerAuthenticationSspi.KeyTab support with GSSAPI
+      {$ifdef OSPOSIX}
+      if Assigned(fSspiKeyTab) then
+        fSspiKeyTab.PrepareKeyTab; // do nothing if no KeyTab changed or set
+      {$endif OSPOSIX}
       // code below raise ESynSspi/EGssApi on authentication error
       if ServerSspiAuth(sec, data, outdata) then
       begin
@@ -7379,7 +7415,6 @@ var
   a: PAuthSession;
 begin
   // TRestServer.Uri() runs this method at most every second
-  fSessionsDeprecatedTix := tix32; // = TickCount64 shr 10
   result := 0;
   if (self = nil) or
      (fSessions = nil) or
@@ -7391,17 +7426,16 @@ begin
     for i := fSessions.Count - 1 downto 0 do // backward for deletion
     begin
       dec(a);
-      if tix32 > a^.fTimeOutTix then // remove this session
+      if tix32 <= a^.fTimeOutTix then
+        continue; // keep this session
+      if result = 0 then // first deprecated session identified
       begin
-        if result = 0 then // first deprecated session identified
-        begin
-          fLogClass.EnterLocal(log, self, 'SessionDeleteDeprecated');
-          fSessions.Safe.WriteLock; // upgrade the lock (only if needed)
-        end;
-        WriteLockedSessionDelete(i, a^, nil); // with full clean-up
-        a := @fSessions.List[i]; // List[] may have moved in memory
-        inc(result);
+        fLogClass.EnterLocal(log, self, 'SessionDeleteDeprecated');
+        fSessions.Safe.WriteLock; // upgrade the lock (only if needed)
       end;
+      WriteLockedSessionDelete(i, a^, nil); // with full clean-up
+      a := @fSessions.List[i]; // List[] may have moved in memory
+      inc(result);
     end;
   finally
     if result <> 0 then
@@ -7813,7 +7847,7 @@ begin
     DeleteFile(aFileName);
 end;
 
-procedure TRestServer.OnBeginCurrentThread(Sender: TThread);
+procedure TRestServer.OnBeginCurrentThread(Sender: TThreadAbstract);
 var
   tc: integer;
   id: TThreadID;
@@ -7841,7 +7875,7 @@ begin
   inherited OnBeginCurrentThread(Sender);
 end;
 
-procedure TRestServer.OnEndCurrentThread(Sender: TThread);
+procedure TRestServer.OnEndCurrentThread(Sender: TThreadAbstract);
 var
   tc: integer;
   i: PtrInt;
@@ -7899,7 +7933,7 @@ var
   ctxt: TRestServerUriContext;
   node: TRestTreeNode;
   i: PtrInt;
-  idletix32: cardinal;
+  idletix32, c32: cardinal;
   m: TUriMethod;
 begin
   // 1. reject ASAP if not worth processing
@@ -8083,12 +8117,12 @@ begin
     ctxt.Free;
   end;
   // 12. trigger post-request periodic process
-  if (idletix32 <> 0) and
-     (fOnIdleLastTix <> idletix32) then
-  begin
-    fOnIdleLastTix := idletix32;
+  if idletix32 = 0 then
+    exit;
+  c32 := fOnIdleLastTix;
+  if (c32 <> idletix32) and
+     LockedExc32(fOnIdleLastTix, idletix32, c32) then
     OnIdle(self);
-  end;
 end;
 
 procedure TRestServer.Stat(Ctxt: TRestServerUriContext);
@@ -8450,7 +8484,7 @@ end;
 initialization
   // should match TPerThreadRunningContext definition in mormot.core.interfaces
   assert(SizeOf(TServiceRunningContext) =
-    SizeOf(TObject) + SizeOf(TObject) + SizeOf(TThread));
+    SizeOf(TObject) + SizeOf(TObject) + SizeOf(TThreadAbstract));
   GetEnumTrimmedNames(TypeInfo(TOnAuthenticationFailedReason), @OAFR_TXT, scUnCamelCase);
 
 end.

@@ -4,9 +4,10 @@
 program mormot2tests;
 
 // ---------------------------------------------------------------------
-//  NOTE: on FPC, please first install src/packages/lazarus/mormot2.lpk
+//  NOTE: on FPC/Lazarus, please first install packages/lazarus/mormot2*.lpk
 // ---------------------------------------------------------------------
 
+{.$define NO_UI} // disable UI/PDF coverage
 {$I ..\src\mormot.defines.inc}
 
 {$ifdef OSWINDOWS}
@@ -32,12 +33,12 @@ uses
   mormot.core.rtti,
   mormot.core.json,
   mormot.core.datetime,
+  mormot.core.fmt,
   mormot.core.search,
   mormot.core.threads,
   mormot.core.log,
   mormot.core.test,
   mormot.db.raw.sqlite3, // for the SQLite3 version below
-
   {$ifdef USEZEOS}
   mormot.db.sql.zeos,
   {$endif USEZEOS}
@@ -68,6 +69,12 @@ uses
   {$ifdef LIBQUICKJSSTATIC}
   test.core.script         in '.\test.core.script.pas',
   {$endif LIBQUICKJSSTATIC}
+  {$ifdef HAS_UI_PDF}
+  {$ifdef FPC}
+  Interfaces, // initialize the LCL widgetset used by test.ui.pdf
+  {$endif FPC}
+  test.ui.pdf            in '.\test.ui.pdf.pas',
+  {$endif HAS_UI_PDF}
   test.net.proto           in '.\test.net.proto.pas',
   test.orm.core            in '.\test.orm.core.pas',
   test.orm.sqlite3         in '.\test.orm.sqlite3.pas',
@@ -90,6 +97,9 @@ type
     procedure CoreUnits;
     procedure ORM;
     procedure SOA;
+    {$ifdef HAS_UI_PDF}
+    procedure UI;
+    {$endif HAS_UI_PDF}
   end;
 
 class procedure TIntegrationTests.DescribeCommandLine;
@@ -185,6 +195,13 @@ begin
     TTestBidirectionalRemoteConnection
   ]);
 end;
+
+{$ifdef HAS_UI_PDF}
+procedure TIntegrationTests.UI;
+begin
+  AddCase(TTestUiPdf);
+end;
+{$endif HAS_UI_PDF}
 
 
 begin

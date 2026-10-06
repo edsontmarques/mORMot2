@@ -33,7 +33,8 @@ uses
   mormot.crypt.jwt,
   mormot.crypt.ecc,
   mormot.crypt.rsa,
-  mormot.crypt.x509;
+  mormot.crypt.x509,
+  mormot.crypt.win;
 
 type
   /// regression tests for mormot.crypt.core and mormot.crypt.jwt features
@@ -730,6 +731,33 @@ end;
 
 procedure TTestCoreCrypto._SHA3;
 
+  procedure Keccak(const data, expected: RawByteString);
+  var
+    instance: TSha3;
+    dig: THash256;
+    split, i: PtrInt;
+  begin
+    CheckEqual(Keccak256(data), expected);
+    Keccak256Full(pointer(data), length(data), dig);
+    CheckEqual(Sha256DigestToString(dig), expected);
+    CheckEqual(instance.FullStr(KECCAK_256, pointer(data), length(data)), UpperCase(expected));
+    for split := 0 to length(data) do
+    begin
+      instance.Init(KECCAK_256);
+      Check(instance.Algorithm = KECCAK_256);
+      instance.Update(pointer(data), split);
+      instance.Update(nil, 0);
+      instance.Update(PAnsiChar(pointer(data)) + split, length(data) - split);
+      instance.Final(dig);
+      CheckEqual(Sha256DigestToString(dig), expected);
+    end;
+    instance.Init(KECCAK_256);
+    for i := 1 to length(data) do
+      instance.Update(@data[i], 1);
+    instance.Final(dig);
+    CheckEqual(Sha256DigestToString(dig), expected);
+  end;
+
   procedure DoTest;
   const
     HASH1 = '79f38adec5c20307a98ef76e8324afbfd46cfd81b22e3973c65fa1bd9de31787';
@@ -743,6 +771,18 @@ procedure TTestCoreCrypto._SHA3;
     s, i: PtrInt;
     sign: TSynSigner;
   begin
+    // Original Keccak-256 vectors, independently checked with PyCryptodome
+    Keccak('', 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470');
+    Keccak('abc', '4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45');
+    SetLength(data, 1024);
+    for i := 1 to length(data) do
+      data[i] := AnsiChar((i - 1) and 255);
+    // One less than, exactly, and one more than the 136-byte absorption rate.
+    Keccak(copy(data, 1, 135), 'cbdfd9dee5faad3818d6b06f95a219fd290b0e1706f6a82e5a595b9ce9faca62');
+    Keccak(copy(data, 1, 136), '7ce759f1ab7f9ce437719970c26b0a66ff11fe3e38e17df89cf5d29c7d7f807e');
+    Keccak(copy(data, 1, 137), 'ac73d4fae68b8453f764007c1a20ce95994187861f0c3227a3a8e99a73a3b1db');
+    Keccak(copy(data, 1, 272), 'fdf2ec49e749960d3c8521a0219af8d03e30e2b3bf19bd16150ee0eaf133d66e');
+    Keccak(data, '5902e53903be0d0f9656bdbd5b9f0d8c2d815f865645d629eef77f5185f6cd7f');
     // validate against official NIST vectors
     // taken from http://csrc.nist.gov/groups/ST/toolkit/examples.html#aHashing
     // see also https://www.di-mgt.com.au/sha_testvectors.html
@@ -849,7 +889,7 @@ procedure TTestCoreCrypto._SHA3;
 begin
   DoTest;
   {$ifdef ASMX64AVX1}
-  if cpuAVX2 in X64CpuFeatures then // validate without KeccakPermutationAvx2()
+  if HasKeccakAvx2 then // validate without KeccakPermutationAvx2()
   begin
     Exclude(X64CpuFeatures, cpuAVX2);
     DoTest;
@@ -1952,7 +1992,6 @@ var
   hasher: TSynHasher;
   timer: TPrecisionTimer;
   {$ifdef USE_OPENSSL}
-  i: PtrInt;
   e: TRawUtf8DynArray;
   {$endif USE_OPENSSL}
 begin
@@ -3420,7 +3459,7 @@ const
     avx: boolean;
     pt, ct: array[0..511] of byte;
   begin
-    for avx := false to true do
+    for avx := false to HasAesGcmAvx do
     begin
       FillCharFast(pt, SizeOf(pt), 0);
       CheckUtf8(ctxt.FullDecryptAndVerify(key, kbits, pIV, pAAD, ctp, @pt, ptag,
@@ -3431,26 +3470,24 @@ const
         IV_Len, aLen, cLen, tag, avx), 'FullEncryptAndAuthenticate #%', [tn]);
       CheckUtf8(CompareMem(@tag, ptag, tlen), 'Tag #%', [tn]);
       CheckUtf8(CompareMem(@ct, ctp, cLen), 'Encoded #%', [tn]);
-      {$ifndef ASMX64AVX0}
-      break;
-      {$endif ASMX64AVX0}
     end;
   end;
 
 var
   ctxt: TAesGcmEngine;
   key, tag: TAesBlock;
-  buf: THash512;
+  buf, cipher, plain: THash512;
+  aad: THash256;
   n: integer;
   avx: boolean;
 begin
-  for avx := false to true do
+  for avx := false to HasAesGcmAvx do
   begin
     key := PAesBlock(@hex32)^;
     FillZero(buf);
     FillZero(tag);
-    check(ctxt.FullEncryptAndAuthenticate(key, 128,
-      @hex32, nil, @buf, @buf, 12, 0, SizeOf(buf), tag, avx));
+    check(ctxt.FullEncryptAndAuthenticate(key, 128, @hex32, nil,
+      @buf, @buf, 12, 0, SizeOf(buf), tag, avx));
     CheckEqual(CardinalToHex(crc32c(0, @buf, SizeOf(buf))), 'AC3DDD17');
     CheckEqual(Md5DigestToString(tag), '0332c40f9926bd3cdadf33148912c672');
   end;
@@ -3485,6 +3522,49 @@ begin
        @C10, SizeOf(C10), @P10, 10);
   test(@T11, 16, K11, 8 * SizeOf(K11), @I11, SizeOf(I11), @H11, SizeOf(H11),
        @C11, SizeOf(C11), @P11, 11);
+  for n := 1 to SizeOf(buf) do // 64 bytes - AVX is used only if n mod 16 = 0
+    for avx := false to HasAesGcmAvx do
+    begin
+      FillZero(cipher);
+      Check(ctxt.FullEncryptAndAuthenticate(key, 128, @hex32, @hex32,
+        @buf, @cipher, 12, 16, n, tag, avx));
+      FillZero(plain);
+      CheckUtf8(ctxt.FullDecryptAndVerify(key, 128, @hex32, @hex32,
+        @cipher, @plain, @tag, 12, 16, n, 16, avx),
+        'verify n=% avx=%', [n, avx]);
+      Check(CompareMem(@buf, @plain, n));
+      inc(cipher[0]); // should detect a forged ciphertext, tag or AAD
+      CheckUtf8(not ctxt.FullDecryptAndVerify(key, 128, @hex32, @hex32,
+        @cipher, @plain, @tag, 12, 16, n, 16, avx),
+        'forged ctp n=% avx=%', [n, avx]);
+      dec(cipher[0]);
+      inc(tag[15]);
+      CheckUtf8(not ctxt.FullDecryptAndVerify(key, 128, @hex32, @hex32,
+        @cipher, @plain, @tag, 12, 16, n, 16, avx),
+        'forged tag n=% avx=%', [n, avx]);
+      dec(tag[15]);
+      CheckUtf8(not ctxt.FullDecryptAndVerify(key, 128, @hex32, @hex32,
+        @cipher, @plain, @tag, 12, 15, n, 16, avx),
+        'truncated aad n=% avx=%', [n, avx]);
+      FillZero(plain);
+      aad := hex32;
+      CheckUtf8(ctxt.FullDecryptAndVerify(key, 128, @hex32, @aad,
+        @cipher, @plain, @tag, 12, 16, n, 16, avx),
+        'verify again n=% avx=%', [n, avx]);
+      Check(CompareMem(@buf, @plain, n));
+      inc(aad[15]);
+      CheckUtf8(not ctxt.FullDecryptAndVerify(key, 128, @hex32, @aad,
+        @cipher, @plain, @tag, 12, 16, n, 16, avx),
+        'forged aad n=% avx=%', [n, avx]);
+      FillZero(cipher);
+      Check(ctxt.FullEncryptAndAuthenticate(key, 128, @hex32, @hex32,
+        @buf, @cipher, 12, 10, n, tag, avx));
+      FillZero(plain);
+      CheckUtf8(ctxt.FullDecryptAndVerify(key, 128, @hex32, @hex32,
+        @cipher, @plain, @tag, 12, 10, n, 16, avx),
+        'trunc aad n=% avx=%', [n, avx]);
+      Check(CompareMem(@buf, @plain, n));
+    end;
 end;
 
 {$ifndef PUREMORMOT2}

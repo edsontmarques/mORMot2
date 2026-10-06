@@ -497,8 +497,9 @@ type
     /// encrypt a buffer with AES-GCM, updating the associated authentication data
     function Encrypt(ptp, ctp: pointer; ILen: PtrInt): boolean;
     /// decrypt a buffer with AES-GCM, updating the associated authentication data
-    // - also validate the GMAC with the supplied ptag/tlen if ptag<>nil,
-    // and skip the AES-CTR phase if the authentication doesn't match
+    // - also validate the GMAC with the supplied ptag/tlen if ptag<>nil, and
+    // return false if the authentication doesn't match - the AES-CTR phase is
+    // skipped by the dual pass process only, not by the single pass branches
     function Decrypt(ctp, ptp: pointer; ILen: PtrInt;
       ptag: pointer = nil; tlen: PtrInt = 0): boolean;
     /// append some data to be authenticated, but not encrypted
@@ -1339,99 +1340,6 @@ type
     function AesGcmFinal(var Tag: TAesBlock; TagLen: integer): boolean; override;
   end;
 
-{$ifdef USE_PROV_RSA_AES}
-
-type
-  /// handle AES cypher/uncypher using Windows CryptoApi and the
-  // official Microsoft AES Cryptographic Provider (PROV_RSA_AES)
-  // - see @http://msdn.microsoft.com/en-us/library/windows/desktop/aa386979
-  // - timing of our optimized asm versions, for small (<=8KB) block processing
-  // (similar to standard web pages or most typical JSON/XML content),
-  // benchmarked on a Core i7 notebook and compiled as Win32 platform:
-  // ! AES128 - ECB:79.33ms CBC:83.37ms CFB:80.75ms OFB:78.98ms CTR:80.45ms
-  // ! AES192 - ECB:91.16ms CBC:96.06ms CFB:96.45ms OFB:92.12ms CTR:93.38ms
-  // ! AES256 - ECB:103.22ms CBC:119.14ms CFB:111.59ms OFB:107.00ms CTR:110.13ms
-  // - timing of the same process, using CryptoApi official PROV_RSA_AES provider:
-  // ! AES128 - ECB_API:102.88ms CBC_API:124.91ms
-  // ! AES192 - ECB_API:115.75ms CBC_API:129.95ms
-  // ! AES256 - ECB_API:139.50ms CBC_API:154.02ms
-  // - but the CryptoApi does not supports AES-NI, whereas our classes handle it,
-  // with a huge speed benefit
-  // - under Win64, the official CryptoApi is slower our x86_64 asm version,
-  // and the Win32 version of CryptoApi itself, but slower than our AES-NI code
-  // ! AES128 - ECB:107.95ms CBC:112.65ms CFB:109.62ms OFB:107.23ms CTR:109.42ms
-  // ! AES192 - ECB:130.30ms CBC:133.04ms CFB:128.78ms OFB:127.25ms CTR:130.22ms
-  // ! AES256 - ECB:145.33ms CBC:147.01ms CFB:148.36ms OFB:145.96ms CTR:149.67ms
-  // ! AES128 - ECB_API:89.64ms CBC_API:100.84ms
-  // ! AES192 - ECB_API:99.05ms CBC_API:105.85ms
-  // ! AES256 - ECB_API:107.11ms CBC_API:118.04ms
-  // - in practice, you could forget about using the CryptoApi, unless you are
-  // required to do so, for legal/corporate reasons
-  TAesAbstractApi = class(TAesAbstract)
-  protected
-    fKeyHeader: packed record
-      bType: byte;
-      bVersion: byte;
-      reserved: word;
-      aiKeyAlg: cardinal;
-      dwKeyLength: cardinal;
-    end;
-    fKeyHeaderKey: TAesKey; // should be just after fKeyHeader record
-    fKeyCryptoApi: pointer;
-    fInternalMode: cardinal;
-    procedure AfterCreate; override;
-    procedure InternalSetMode; virtual; abstract;
-    procedure EncryptDecrypt(BufIn, BufOut: pointer; Count: cardinal;
-      DoEncrypt: boolean);
-  public
-    /// release the AES execution context
-    destructor Destroy; override;
-    /// perform the AES cypher in the ECB mode
-    // - if Count is not a multiple of a 16 bytes block, the IV will be used
-    // to XOR the trailing bytes - so it won't be compatible with our
-    // TAesAbstractSyn classes: you should better use PKC7 padding instead
-    procedure Encrypt(BufIn, BufOut: pointer; Count: cardinal); override;
-    /// perform the AES un-cypher in the ECB mode
-    // - if Count is not a multiple of a 16 bytes block, the IV will be used
-    // to XOR the trailing bytes - so it won't be compatible with our
-    // TAesAbstractSyn classes: you should better use PKC7 padding instead
-    procedure Decrypt(BufIn, BufOut: pointer; Count: cardinal); override;
-  end;
-
-  /// handle AES cypher/uncypher without chaining (ECB) using Windows CryptoApi
-  TAesEcbApi = class(TAesAbstractApi)
-  protected
-    /// will set fInternalMode := CRYPT_MODE_ECB
-    procedure InternalSetMode; override;
-  end;
-
-  /// handle AES cypher/uncypher Cipher-block chaining (CBC) using Windows CryptoApi
-  TAesCbcApi = class(TAesAbstractApi)
-  protected
-    /// will set fInternalMode := CRYPT_MODE_CBC
-    procedure InternalSetMode; override;
-  end;
-
-  /// handle AES cypher/uncypher Cipher feedback (CFB) using Windows CryptoApi
-  // - NOT TO BE USED: the current PROV_RSA_AES provider does not return
-  // expected values for CFB
-  TAesCfbApi = class(TAesAbstractApi)
-  protected
-    /// will set fInternalMode := CRYPT_MODE_CFB
-    procedure InternalSetMode; override;
-  end;
-
-  /// handle AES cypher/uncypher Output feedback (OFB) using Windows CryptoApi
-  // - NOT TO BE USED: the current PROV_RSA_AES provider does not implement
-  // this mode, and returns a NTE_BAD_ALGID error
-  TAesOfbApi = class(TAesAbstractApi)
-  protected
-    /// will set fInternalMode := CRYPT_MODE_OFB
-    procedure InternalSetMode; override;
-  end;
-
-{$endif USE_PROV_RSA_AES}
-
   /// abstract parent class to TAesPkcs7Writer and TAesPkcs7Reader
   TAesPkcs7Abstract = class(TStreamWithNoSeek)
   protected
@@ -1574,6 +1482,9 @@ var
     daAesNiSse42,
     daAesGcmAvx,
     daKeccakAvx2);
+
+function HasKeccakAvx2: boolean;
+function HasAesGcmAvx: boolean;
 
 function ToText(algo: TAesMode): PShortString; overload;
 
@@ -2151,7 +2062,7 @@ type
     Index: PtrUInt;
     MLen: QWord;
     Hash: TSha512Hash;
-    Data: array[0..127] of byte;
+    Data: THash1024;
     procedure Init(InitHashes: pointer);
       {$ifdef HASINLINE} inline; {$endif}
     /// perform the final step into Hash private field
@@ -2278,16 +2189,18 @@ type
   PSha512 = ^TSha512;
 
 type
-  /// SHA-3 instances, as defined by NIST Standard for Keccak sponge construction
+  /// SHA-3, SHAKE and original Keccak instances
   // - SHA3_224..SHA3_512 output 224, 256, 384 and 512 bits of cryptographic hash
   // - SHAKE_128 and SHAKE_256 implements a XOF/cipher generator
+  // - KECCAK_256 uses the original padding, as required e.g. by Ethereum
   TSha3Algo = (
     SHA3_224,
     SHA3_256,
     SHA3_384,
     SHA3_512,
     SHAKE_128,
-    SHAKE_256);
+    SHAKE_256,
+    KECCAK_256);
 
   /// implements SHA-3 (Keccak) hashing
   // - Keccak was the winner of the NIST hashing competition for a new hashing
@@ -2756,10 +2669,17 @@ function Sha3(Algo: TSha3Algo; const s: RawByteString;
 function Sha3(Algo: TSha3Algo; Buffer: pointer; Len: integer;
   DigestBits: integer = 0): RawUtf8; overload;
 
-/// SHA-256 hash calculation with length padding if shorter than 255 bytes
+/// compute an original Keccak-256 binary digest (distinct from SHA3-256)
+procedure Keccak256Full(Buffer: pointer; Len: integer; out Digest: THash256);
+
+/// compute an original Keccak-256 lowercase hexadecimal digest
+function Keccak256(const s: RawByteString): RawUtf8;
+
+/// SHA-256 hash calculation with length padding if shorter than 256 bytes
 // - WARNING: this algorithm is DEPRECATED, and supplied only for backward
-// compatibility of existing code (CryptDataForCurrentUser or TProtocolAes)
-// - use TSynSigner or Pbkdf2HmacSha256() for safer password derivation
+// compatibility with mORMot 1 code (CryptDataForCurrentUser or TProtocolAes)
+// - DO NOT use for new code or newly generated data
+// - see TSynSigner.Pbkdf2 or "Modular Crypt" for safer password derivation
 procedure Sha256Weak(const s: RawByteString; out Digest: TSha256Digest);
 
 
@@ -2779,6 +2699,10 @@ procedure Random128(var Value: RawByteString); overload;
 /// initialize a Pierre L'Ecuyer gsl_rng_taus2 Tausworthe/LFSR generator
 // - used e.g. as a local thread-safe source of uniformly distributed randomness
 function RandomLecuyer(var rnd: TLecuyer): PLecuyer;
+
+/// get a random 100000000..999999999, i.e. exactly 9 digits with no leading zero
+// - returns 0 if our Random128() unpredictable generator is clearly broken
+function Random9Digits: cardinal;
 
 /// compute a random UUid value from the Random128() generator and RFC 4122
 // - to derivate a Uuid from a name see IdentifierGuid()/DotNetIdentifierGuid()
@@ -2953,7 +2877,7 @@ var
   AesNiHashKey: PHash512; // = AesNiHashAntiFuzzTable
   {$endif USEAESNIHASH}
   // filled by ComputeAesStaticTables if needed - don't change the order below
-  Td0, Td1, Td2, Td3, Te0, Te1, Te2, Te3: array[byte] of cardinal;
+  Td0, Td1, Td2, Td3, Te0, Te1, Te2, Te3: TByteToCardinal;
   SBox, InvSBox: TByteToByte;
 
 {$ifdef ASMX64}
@@ -4213,7 +4137,7 @@ begin // note: we can't use Random128() here to avoid endless recursion
   if MainAesPrng <> nil then
     MainAesPrng.FillRandom(rnd)         // favor our CSPRNG if available
   else
-    FillSystemRandom(@rnd, Bits shr 3, false); // seed from OS
+    FillSystemRandom(@rnd, Bits shr 3, false); // seed from OS as fallback
   EncryptInit(rnd, Bits);               // transient AES-128/256 secret
   FillZero(TAesContext(Context).iv.b);  // as per NIST SP 800-90A
   FillZero(rnd);                        // anti-forensic
@@ -4859,13 +4783,21 @@ begin
     inc(BufOut, onepass);
   until false;
 end;
+
+function HasAesGcmAvx: boolean;
+begin
+  result := (cpuAESGCM in X64CpuFeatures) and
+            not (daAesGcmAvx in DisabledAsm);
+end;
+
+{$else}
+function HasAesGcmAvx: boolean;
+begin
+  result := false;
+end;
 {$endif USEGCMAVX}
 
 function TAesGcmEngine.Init(const Key; KeyBits: PtrInt; AllowAvx: boolean): boolean;
-{$ifdef USEGCMAVX}
-var
-  cf: ^TIntelCpuFeatures;
-{$endif USEGCMAVX}
 begin
   FillCharFast(state, SizeOf(state), 0);
   result := aes.EncryptInit(Key, KeyBits);
@@ -4873,12 +4805,8 @@ begin
     exit;
   aes.Encrypt(state.ghash_h, state.ghash_h);
   {$ifdef USEGCMAVX}
-  cf := @CpuFeatures;
   if AllowAvx and
-     (cfCLMUL in cf^) and
-     (cfSSE41 in cf^) and
-     (cfAESNI in cf^) and
-     not (daAesGcmAvx in DisabledAsm) then
+     HasAesGcmAvx then
   begin
     // 8x interleaved aesni + pclmulqdq x86_64 asm - using 256 bytes in gf_t4k[]
     state.flags := [flagAVX, flagCLMUL];
@@ -5031,7 +4959,7 @@ begin
   {$ifdef USEGCMAVX}
   if (flagAVX in state.flags) and
      (ILen <> 0) then
-    AvxProcess(ctp, ptp, ILen, {encrypt=}false)
+    AvxProcess(ctp, ptp, ILen, {encrypt=}false) // single pass GMAC + AES-CTR
   else
   {$endif USEGCMAVX}
   if (ILen <> 0) and
@@ -5054,14 +4982,6 @@ begin
       inc(PAesBlock(ctp));
       dec(ILen);
     until ILen = 0;
-    if (ptag <> nil) and
-       (tlen > 0) then
-    begin
-      Final(tag, {anddone=}false);
-      if not IsEqual(tag, ptag^, tlen) then
-        // check authentication after single pass encryption + auth
-        exit;
-    end;
   end
   else
   begin
@@ -5074,8 +4994,17 @@ begin
       if not IsEqual(tag, ptag^, tlen) then
         // check authentication before decryption
         exit;
+      tlen := 0; // already verified
     end;
     internal_crypt(ctp, ptp, iLen);
+  end;
+  if (ptag <> nil) and
+     (tlen > 0) then
+  begin
+    Final(tag, {anddone=}false);
+    if not IsEqual(tag, ptag^, tlen) then
+      // check authentication after single pass decryption
+      exit;
   end;
   result := true;
 end;
@@ -6792,141 +6721,6 @@ begin
   end;
   fStarted := stNone; // allow reuse of this fGcm instance
 end;
-
-
-{$ifdef USE_PROV_RSA_AES}
-
-var
-  CryptoApiAesProvider: HCRYPTPROV = HCRYPTPROV_NOTTESTED;
-
-procedure EnsureCryptoApiAesProviderAvailable;
-begin
-  if CryptoApiAesProvider = nil then
-    ESynCrypto.RaiseU('PROV_RSA_AES provider not installed')
-  else if CryptoApiAesProvider = HCRYPTPROV_NOTTESTED then
-  begin
-    CryptoApiAesProvider := nil;
-    if CryptoApi.Available then
-    begin
-      if not CryptoApi.AcquireContextA(CryptoApiAesProvider, nil, nil,
-              PROV_RSA_AES, CRYPT_VERIFYCONTEXT) then
-        if (HRESULT(GetLastError) <> NTE_BAD_KEYSET) or
-           not CryptoApi.AcquireContextA(CryptoApiAesProvider, nil, nil,
-             PROV_RSA_AES, CRYPT_NEWKEYSET) then
-          ESynCrypto.RaiseLastOSError('in AcquireContext', []);
-    end;
-  end;
-end;
-
-
-{ TAesAbstractApi }
-
-procedure TAesAbstractApi.AfterCreate;
-begin
-  EnsureCryptoApiAesProviderAvailable;
-  InternalSetMode;
-  fKeyHeader.bType := PLAINTEXTKEYBLOB;
-  fKeyHeader.bVersion := CUR_BLOB_VERSION;
-  case fKeySize of
-    128:
-      fKeyHeader.aiKeyAlg := CALG_AES_128;
-    192:
-      fKeyHeader.aiKeyAlg := CALG_AES_192;
-    256:
-      fKeyHeader.aiKeyAlg := CALG_AES_256;
-  end;
-  fKeyHeader.dwKeyLength := fKeySizeBytes;
-  fKeyHeaderKey := fKey;
-end;
-
-destructor TAesAbstractApi.Destroy;
-begin
-  if fKeyCryptoApi <> nil then
-    CryptoApi.DestroyKey(fKeyCryptoApi);
-  FillCharFast(fKeyHeaderKey, SizeOf(fKeyHeaderKey), 0);
-  inherited;
-end;
-
-procedure TAesAbstractApi.EncryptDecrypt(BufIn, BufOut: pointer; Count: cardinal;
-  DoEncrypt: boolean);
-var
-  n: cardinal;
-begin
-  if Count = 0 then
-    exit; // nothing to do
-  if fKeyCryptoApi <> nil then
-  begin
-    CryptoApi.DestroyKey(fKeyCryptoApi);
-    fKeyCryptoApi := nil;
-  end;
-  if not CryptoApi.ImportKey(CryptoApiAesProvider, @fKeyHeader,
-     SizeOf(fKeyHeader) + fKeySizeBytes, nil, 0, fKeyCryptoApi) then
-    ESynCrypto.RaiseLastOSError('in CryptImportKey for %', [self]);
-  if not CryptoApi.SetKeyParam(fKeyCryptoApi, KP_IV, @fIV, 0) then
-    ESynCrypto.RaiseLastOSError('in CryptSetKeyParam(KP_IV) for %', [self]);
-  if not CryptoApi.SetKeyParam(fKeyCryptoApi, KP_MODE, @fInternalMode, 0) then
-    ESynCrypto.RaiseLastOSError('in CryptSetKeyParam(KP_MODE,%) for %',
-       [fInternalMode, self]);
-  if BufOut <> BufIn then
-    MoveFast(BufIn^, BufOut^, Count);
-  n := Count and not AesBlockMod;
-  if DoEncrypt then
-  begin
-    if not CryptoApi.Encrypt(fKeyCryptoApi, nil, false, 0, BufOut, n, Count) then
-      ESynCrypto.RaiseLastOSError('in Encrypt() for %', [self]);
-  end
-  else if not CryptoApi.Decrypt(fKeyCryptoApi, nil, false, 0, BufOut, n) then
-    ESynCrypto.RaiseLastOSError('in Decrypt() for %', [self]);
-  dec(Count, n);
-  if Count > 0 then // remaining bytes will be XORed with the supplied IV
-    XorMemoryTrailer(@PByteArray(BufOut)[n], @PByteArray(BufIn)[n], @fIV, Count);
-end;
-
-procedure TAesAbstractApi.Encrypt(BufIn, BufOut: pointer; Count: cardinal);
-begin
-  EncryptDecrypt(BufIn, BufOut, Count, true);
-end;
-
-procedure TAesAbstractApi.Decrypt(BufIn, BufOut: pointer; Count: cardinal);
-begin
-  EncryptDecrypt(BufIn, BufOut, Count, false);
-end;
-
-{ TAesEcbApi }
-
-procedure TAesEcbApi.InternalSetMode;
-begin
-  fInternalMode := CRYPT_MODE_ECB;
-  fAlgoMode := mEcb;
-end;
-
-{ TAesCbcApi }
-
-procedure TAesCbcApi.InternalSetMode;
-begin
-  fInternalMode := CRYPT_MODE_CBC;
-  fAlgoMode := mCbc;
-end;
-
-{ TAesCfbApi }
-
-procedure TAesCfbApi.InternalSetMode;
-begin
-  ESynCrypto.RaiseUtf8('%: CRYPT_MODE_CFB is not compliant', [self]);
-  fInternalMode := CRYPT_MODE_CFB;
-  fAlgoMode := mCfb;
-end;
-
-{ TAesOfbApi }
-
-procedure TAesOfbApi.InternalSetMode;
-begin
-  ESynCrypto.RaiseUtf8('%: CRYPT_MODE_OFB not implemented by PROV_RSA_AES', [self]);
-  fInternalMode := CRYPT_MODE_OFB;
-  fAlgoMode := mOfb;
-end;
-
-{$endif USE_PROV_RSA_AES}
 
 
 { TAesPkcs7Abstract }
@@ -8749,6 +8543,16 @@ const
     QWord($000000000000800A), QWord($800000008000000A), QWord($8000000080008081),
     QWord($8000000000008080), QWord($0000000080000001), QWord($8000000080008008));
 
+function HasKeccakAvx2: boolean;
+begin
+  {$ifdef ASMX64AVX1}
+  result := (cpuAVX2 in X64CpuFeatures) and
+            not (daKeccakAvx2 in DisabledAsm);
+  {$else}
+  result := false;
+  {$endif ASMX64AVX1}
+end;
+
 {$ifdef ASMINTELNOTPIC}
 
 procedure KeccakPermutation(A: PQWordArray);
@@ -8964,7 +8768,7 @@ type
 
 const
   SHA3_DEF_LEN: array[TSha3Algo] of integer = (
-    224, 256, 384, 512, 256, 512);
+    224, 256, 384, 512, 256, 512, 256);
 
 procedure TSha3Context.Init(aAlgo: TSha3Algo);
 var
@@ -8972,7 +8776,8 @@ var
 begin
   FillCharFast(self, SizeOf(self), 0);
   bits := SHA3_DEF_LEN[aAlgo];
-  if aAlgo < SHAKE_128 then
+  if (aAlgo < SHAKE_128) or
+     (aAlgo = KECCAK_256) then
     bits := bits shl 1;
   Rate := cKeccakPermutationBits - bits;
   Capacity := bits;
@@ -9119,7 +8924,9 @@ begin
   else
     lw := bits and Pred(cardinal(1) shl bitlen);
   // append the domain separation bits
-  if Algo >= SHAKE_128 then
+  if Algo = KECCAK_256 then
+    ll := bitlen // original Keccak: pad10*1 without SHA-3 domain bits
+  else if Algo >= SHAKE_128 then
   begin
     // SHAKE: append four MSB bits 1111
     lw := lw or (cardinal($0f) shl bitlen);
@@ -10495,6 +10302,21 @@ begin
   result := sha.FullStr(Algo, Buffer, Len, DigestBits);
 end;
 
+procedure Keccak256Full(Buffer: pointer; Len: integer; out Digest: THash256);
+var
+  sha: TSha3;
+begin
+  sha.Full(KECCAK_256, Buffer, Len, @Digest, 256);
+end;
+
+function Keccak256(const s: RawByteString): RawUtf8;
+var
+  dig: THash256;
+begin
+  Keccak256Full(pointer(s), length(s), dig);
+  BinToHexLower(@dig, SizeOf(dig), result);
+end;
+
 // required by read_h -> deprecated even if available with PUREMORMOT2
 procedure Sha256Weak(const s: RawByteString; out Digest: TSha256Digest);
 var
@@ -10505,7 +10327,7 @@ var
 begin
   l := length(s);
   P := pointer(s);
-  if l < SizeOf(tmp) then // add some salt to unweak password < 256 bytes
+  if l < SizeOf(tmp) then // add some padding up to 256 bytes
   begin
     FillcharFast(tmp, SizeOf(tmp), l);
     if l > 0 then
@@ -10554,6 +10376,21 @@ begin
   Random128(@rnd);   // 88-bit seed from our CSPRNG
   rnd.SeedGenerator; // inlined TLecuyer.Seed
   result := @rnd;
+end;
+
+function Random9Digits: cardinal;
+var
+  rnd: THash128Rec;
+begin
+  Random128(@rnd); // unpredictable
+  result := rnd.c0 mod 900000000;
+  if result = 0 then
+    result := rnd.c1 mod 900000000;
+  if result = 0 then
+    result := rnd.c2 mod 900000000;
+  FillZero(rnd.b); // anti forensic
+  if result <> 0 then // only 1 in 7 x 10^26 probability
+    inc(result, 100000000);
 end;
 
 function IsRandomGuid(u: PHash128): boolean;
@@ -10943,11 +10780,6 @@ begin
   if AesNiHashKey <> nil then
     FreeMemAligned(AesNiHashKey, SizeOf(AesNiHashKey^));
   {$endif USEAESNIHASH}
-  {$ifdef USE_PROV_RSA_AES}
-  if (CryptoApiAesProvider <> nil) and
-     (CryptoApiAesProvider <> HCRYPTPROV_NOTTESTED) then
-    CryptoApi.ReleaseContext(CryptoApiAesProvider, 0);
-  {$endif USE_PROV_RSA_AES}
   FillZero(_h.k); // anti-forensic of the dead process
 end;
 

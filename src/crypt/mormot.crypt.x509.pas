@@ -678,6 +678,7 @@ type
     function FingerPrint(algo: THashAlgo = hfSha1): RawUtf8;
     /// check if a FingerPrint() hexa hash match a supplied value
     // - will inline the hash computation to avoid temporary string allocation
+    // and use case-insensitive hexadecimal hash comparison
     function FingerPrintCompare(const Value: RawUtf8;
       Algo: THashAlgo = hfSha1): integer; overload;
       {$ifdef HASINLINE} inline; {$endif}
@@ -1209,8 +1210,8 @@ procedure RegisterX509;
 type
   /// abstract parent class implementing ICryptCert using our TX509 class
   // - will store a certificate as TX509 and an abstract ICryptPrivateKey
-  // - is the parent of both TCryptCertX509 in this unit and TCryptCertPkcs11
-  // in mormot.crypt.pkcs11.pas
+  // - is the parent of TCryptCertX509 in this unit, TCryptCertPkcs11 in
+  // mormot.crypt.pkcs11.pas and TCryptCertCng in mormot.crypt.win.pas
   TCryptCertX509Abstract = class(TCryptCert)
   protected
     fX509: TX509;
@@ -2786,7 +2787,7 @@ function TX509.FingerPrintCompare(const Value: RawUtf8; Algo: THashAlgo): intege
 begin
   if fCachedHash[Algo] = '' then
     ComputeCachedHash(Algo);
-  result := SortDynArrayAnsiString(fCachedHash[Algo], Value);
+  result := HumanHexCompare(pointer(fCachedHash[Algo]), pointer(Value));
 end;
 
 function TX509.FingerPrintCompare(Another: TX509; Algo: THashAlgo): integer;

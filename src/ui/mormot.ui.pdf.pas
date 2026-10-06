@@ -20,9 +20,9 @@ interface
 
 {$I ..\mormot.defines.inc}
 
-{$ifdef OSPOSIX}
+{$ifndef HAS_UI_PDF}
 
-// do-nothing-unit on non Windows system
+// do-nothing unit without Delphi VCL or FPC/Lazarus LCL on Windows
 
 implementation
 
@@ -12494,7 +12494,7 @@ end;
 {$endif USE_METAFILE}
 
 
-{$endif OSPOSIX}
+{$endif HAS_UI_PDF}
 
 end.
 
